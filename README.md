@@ -94,26 +94,16 @@ The harness keeps the summary convention while allowing each step to use the Tem
 
 This example shows a reusable customer confirmation guard. `CUSTOMER_CHANGE` is an example company-specific tool category: the point is that a class of tools can require the same guard, while the guard chooses the right confirmation path from the tool context.
 
-The confirmation workflow is shown in the same file for readability, but it is intentionally reusable. In a real app it could live in a shared `guards/customer_confirmation.py` module and be used by tools such as `substitute_item`, `change_shipping_address`, or `cancel_order`.
+The customer confirmation workflow is reusable infrastructure:
 
 ```python
-# customer_change_tools.py
+# workflows/customer_confirmation_workflow.py
 import asyncio
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Literal
 
 from temporalio import activity, workflow
-
-with workflow.unsafe.imports_passed_through():
-    from claude_harness.tools import (
-        GuardContext,
-        GuardResult,
-        ToolContext,
-        ToolResult,
-        ToolType,
-    )
-    from my_agent.registry import TOOLS
 
 
 ConfirmationStatus = Literal["accepted", "rejected", "timed_out"]
@@ -199,18 +189,23 @@ class CustomerConfirmationWorkflow:
             accepted=True,
             email=email,
         )
+```
 
+The guard is reusable policy. It maps the current tool call to a confirmation template and starts the child workflow:
 
-async def _apply_substitution(
-    order_id: str,
-    unavailable_sku: str,
-    substitute_sku: str,
-) -> dict[str, str]:
-    return {
-        "order_id": order_id,
-        "removed": unavailable_sku,
-        "added": substitute_sku,
-    }
+```python
+# guards/customer_confirmation_guard.py
+from dataclasses import asdict
+
+from temporalio import workflow
+
+with workflow.unsafe.imports_passed_through():
+    from claude_harness.tools import GuardContext, GuardResult, ToolType
+    from my_agent.registry import TOOLS
+    from my_agent.workflows.customer_confirmation_workflow import (
+        CustomerConfirmationRequest,
+        CustomerConfirmationWorkflow,
+    )
 
 
 def _customer_confirmation_request(ctx: GuardContext) -> CustomerConfirmationRequest:
@@ -262,6 +257,32 @@ async def confirm_customer_change(ctx: GuardContext) -> GuardResult:
         passed=True,
         internal_payload={"confirmation": asdict(result)},
     )
+```
+
+The tool stays focused on the actual mutation:
+
+```python
+# tools/substitute_item_tool.py
+from datetime import timedelta
+
+from temporalio import workflow
+
+with workflow.unsafe.imports_passed_through():
+    from claude_harness.tools import ToolContext, ToolResult, ToolType
+    from my_agent.guards.customer_confirmation_guard import confirm_customer_change
+    from my_agent.registry import TOOLS
+
+
+async def _apply_substitution(
+    order_id: str,
+    unavailable_sku: str,
+    substitute_sku: str,
+) -> dict[str, str]:
+    return {
+        "order_id": order_id,
+        "removed": unavailable_sku,
+        "added": substitute_sku,
+    }
 
 
 @TOOLS.tool(
@@ -298,11 +319,9 @@ async def substitute_item(
     )
 ```
 
-The app endpoint behind the email link is product code, not part of the tool file. It uses `confirmation_workflow_id` from the email payload to signal `CustomerConfirmationWorkflow.confirm`.
+The app endpoint behind the email link is product code. It uses `confirmation_workflow_id` from the email payload to signal `CustomerConfirmationWorkflow.confirm`.
 
-This is the kind of thing the harness is meant to unlock. From Claude's point of view, `substitute_item` is one tool call. From the application's point of view, the guard performs durable policy orchestration: a reusable child workflow sends an email and waits for a customer signal or a five-day timer. The tool only runs after that guard passes, and its code is limited to the order mutation.
-
-Splitting this file is not technically required. It becomes useful when activity implementations need heavy imports, client setup, or separate ownership. In that case, keep the tool, guard, and workflow shape the same and move the activity functions behind importable module-level functions.
+This is the kind of thing the harness is meant to unlock. From Claude's point of view, `substitute_item` is one tool call. From the application's point of view, the reusable guard performs durable policy orchestration: a child workflow sends an email and waits for a customer signal or a five-day timer. The tool only runs after that guard passes, and its code is limited to the order mutation.
 
 Adding `change_shipping_address` would be another tool with `tool_type=ToolType.CUSTOMER_CHANGE` and `pre_guards=[confirm_customer_change]`; the guard would choose the address-change template from `ctx.tool_name`.
 
@@ -372,7 +391,7 @@ Applications using this harness should register the Claude activity plus the gen
 ```python
 from claude_harness.claude_agent import call_claude
 from claude_harness.tools import run_guard_activity, run_tool_activity
-from my_agent.tools.customer_change_tools import (
+from my_agent.workflows.customer_confirmation_workflow import (
     CustomerConfirmationWorkflow,
     send_customer_confirmation_email,
 )
