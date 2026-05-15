@@ -92,16 +92,16 @@ The harness keeps the summary convention while allowing each step to use the Tem
 
 ## Complete Long-Running Tool Example
 
-This can live in one tool file. The worker still needs to import that file and register the child workflow class, but the tool, request/response types, child workflow, signal handler, and activity functions can be owned together.
+This can live in one tool file. The worker still needs to import that file and register the child workflow class plus the direct activities used by that child workflow, but the tool, request/response types, child workflow, signal handler, and activity functions can be owned together.
 
 ```python
 # substitute_item_tool.py
 import asyncio
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import timedelta
 from typing import Literal
 
-from temporalio import workflow
+from temporalio import activity, workflow
 
 with workflow.unsafe.imports_passed_through():
     from claude_harness.tools import ToolContext, ToolResult, ToolType
@@ -120,9 +120,41 @@ class SubstitutionConfirmationRequest:
 
 
 @dataclass
+class SubstitutionEmail:
+    message_id: str
+    confirmation_workflow_id: str
+
+
+@dataclass
 class SubstitutionConfirmationResult:
     status: ConfirmationStatus
     accepted: bool
+    email: SubstitutionEmail
+    applied: dict[str, str] | None = None
+
+
+@activity.defn
+async def send_substitution_email(
+    request: SubstitutionConfirmationRequest,
+    confirmation_workflow_id: str,
+) -> SubstitutionEmail:
+    # The email should link to an app endpoint that signals
+    # SubstitutionConfirmationWorkflow.confirm_substitution on this workflow id.
+    return SubstitutionEmail(
+        message_id="email-message-id",
+        confirmation_workflow_id=confirmation_workflow_id,
+    )
+
+
+@activity.defn
+async def apply_substitution(
+    request: SubstitutionConfirmationRequest,
+) -> dict[str, str]:
+    return {
+        "order_id": request.order_id,
+        "removed": request.unavailable_sku,
+        "added": request.substitute_sku,
+    }
 
 
 @workflow.defn
@@ -138,6 +170,14 @@ class SubstitutionConfirmationWorkflow:
     async def run(
         self, request: SubstitutionConfirmationRequest
     ) -> SubstitutionConfirmationResult:
+        confirmation_workflow_id = workflow.info().workflow_id
+        email = await workflow.execute_activity(
+            send_substitution_email,
+            args=[request, confirmation_workflow_id],
+            start_to_close_timeout=timedelta(minutes=1),
+            summary="substitute_item:email_customer",
+        )
+
         try:
             await workflow.wait_condition(
                 lambda: self._accepted is not None,
@@ -148,38 +188,28 @@ class SubstitutionConfirmationWorkflow:
             return SubstitutionConfirmationResult(
                 status="timed_out",
                 accepted=False,
+                email=email,
             )
 
-        if self._accepted:
-            return SubstitutionConfirmationResult(status="accepted", accepted=True)
-        return SubstitutionConfirmationResult(status="rejected", accepted=False)
+        if not self._accepted:
+            return SubstitutionConfirmationResult(
+                status="rejected",
+                accepted=False,
+                email=email,
+            )
 
-
-async def _send_substitution_email(
-    order_id: str,
-    unavailable_sku: str,
-    substitute_sku: str,
-    customer_email: str,
-    confirmation_workflow_id: str,
-) -> dict[str, str]:
-    # The email should link to an app endpoint that signals
-    # SubstitutionConfirmationWorkflow.confirm_substitution on this workflow id.
-    return {
-        "message_id": "email-message-id",
-        "confirmation_workflow_id": confirmation_workflow_id,
-    }
-
-
-async def _apply_substitution(
-    order_id: str,
-    unavailable_sku: str,
-    substitute_sku: str,
-) -> dict[str, str]:
-    return {
-        "order_id": order_id,
-        "removed": unavailable_sku,
-        "added": substitute_sku,
-    }
+        applied = await workflow.execute_activity(
+            apply_substitution,
+            request,
+            start_to_close_timeout=timedelta(minutes=2),
+            summary="substitute_item:apply_substitution",
+        )
+        return SubstitutionConfirmationResult(
+            status="accepted",
+            accepted=True,
+            email=email,
+            applied=applied,
+        )
 
 
 @TOOLS.tool(
@@ -197,11 +227,7 @@ async def substitute_item(
     substitute_sku: str,
     customer_email: str,
 ) -> ToolResult:
-    confirmation_workflow_id = (
-        f"{workflow.info().workflow_id}-substitution-{workflow.uuid4()}"
-    )
-
-    confirmation = await workflow.start_child_workflow(
+    result = await workflow.execute_child_workflow(
         SubstitutionConfirmationWorkflow.run,
         SubstitutionConfirmationRequest(
             order_id=order_id,
@@ -209,62 +235,17 @@ async def substitute_item(
             substitute_sku=substitute_sku,
             customer_email=customer_email,
         ),
-        id=confirmation_workflow_id,
+        id=f"{workflow.info().workflow_id}-substitution-{workflow.uuid4()}",
         static_summary=f"{ctx.tool_name}:customer_confirmation",
     )
-
-    email = await ctx.activity(
-        _send_substitution_email,
-        step="email_customer",
-        args={
-            "order_id": order_id,
-            "unavailable_sku": unavailable_sku,
-            "substitute_sku": substitute_sku,
-            "customer_email": customer_email,
-            "confirmation_workflow_id": confirmation_workflow_id,
-        },
-        start_to_close_timeout=timedelta(minutes=1),
-    )
-
-    result = await confirmation
-    if not result.accepted:
-        return ToolResult(
-            payload={
-                "status": result.status,
-                "email": email,
-                "confirmation_workflow_id": confirmation_workflow_id,
-                "substitution_applied": False,
-            },
-            error=False,
-        )
-
-    applied = await ctx.activity(
-        _apply_substitution,
-        step="apply_substitution",
-        args={
-            "order_id": order_id,
-            "unavailable_sku": unavailable_sku,
-            "substitute_sku": substitute_sku,
-        },
-        start_to_close_timeout=timedelta(minutes=2),
-    )
-    return ToolResult(
-        payload={
-            "status": result.status,
-            "email": email,
-            "confirmation_workflow_id": confirmation_workflow_id,
-            "substitution_applied": True,
-            "applied": applied,
-        },
-        error=False,
-    )
+    return ToolResult(payload=asdict(result), error=False)
 ```
 
 The app endpoint behind the email link is product code, not part of the tool file. It uses `confirmation_workflow_id` from the email payload to signal `SubstitutionConfirmationWorkflow.confirm_substitution`.
 
-This is the kind of thing the harness is meant to unlock. From Claude's point of view, `substitute_item` is one tool call. From the application's point of view, it is durable orchestration: send an email, wait for a customer signal or a five-day timer, then conditionally mutate the order.
+This is the kind of thing the harness is meant to unlock. From Claude's point of view, `substitute_item` is one tool call. From the application's point of view, it is durable orchestration: a child workflow sends an email, waits for a customer signal or a five-day timer, then conditionally mutates the order.
 
-Splitting this file is not technically required. It becomes useful when activity implementations need heavy imports, client setup, or separate ownership. In that case, keep the tool and workflow shape the same and move the activity functions behind importable module-level functions.
+Splitting this file is not technically required. It becomes useful when activity implementations need heavy imports, client setup, or separate ownership. In that case, keep the tool and workflow shape the same and move the direct activity functions behind importable module-level functions.
 
 ## Guards
 
@@ -332,12 +313,18 @@ Applications using this harness should register the Claude activity plus the gen
 ```python
 from claude_harness.claude_agent import call_claude
 from claude_harness.tools import run_guard_activity, run_tool_activity
-from my_agent.tools.substitute_item_tool import SubstitutionConfirmationWorkflow
+from my_agent.tools.substitute_item_tool import (
+    SubstitutionConfirmationWorkflow,
+    apply_substitution,
+    send_substitution_email,
+)
 
 activities = [
     call_claude,
     run_tool_activity,
     run_guard_activity,
+    send_substitution_email,
+    apply_substitution,
 ]
 
 workflows = [
