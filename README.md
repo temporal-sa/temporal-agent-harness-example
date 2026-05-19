@@ -59,8 +59,8 @@ from datetime import timedelta
 
 from temporalio.common import RetryPolicy
 
+from claude_harness.activity_options import ActivityOptions
 from claude_harness.claude_agent import ClaudeAgent
-from claude_harness.tools import ActivityOptions
 
 agent = ClaudeAgent(
     "You are an internal operations agent.",
@@ -200,7 +200,8 @@ from dataclasses import asdict
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from claude_harness.tools import GuardContext, GuardResult, ToolType
+    from claude_harness.guards import GuardContext, GuardResult
+    from claude_harness.tool_types import ToolType
     from my_agent.registry import TOOLS
     from my_agent.workflows.customer_confirmation_workflow import (
         CustomerConfirmationRequest,
@@ -268,7 +269,8 @@ from datetime import timedelta
 from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
-    from claude_harness.tools import ToolContext, ToolResult, ToolType
+    from claude_harness.tool_types import ToolType
+    from claude_harness.tools import ToolContext, ToolResult
     from my_agent.guards.customer_confirmation_guard import confirm_customer_change
     from my_agent.registry import TOOLS
 
@@ -390,7 +392,8 @@ Applications using this harness should register the Claude activity plus the gen
 
 ```python
 from claude_harness.claude_agent import call_claude
-from claude_harness.tools import run_guard_activity, run_tool_activity
+from claude_harness.guards import run_guard_activity
+from claude_harness.tools import run_tool_activity
 from my_agent.workflows.customer_confirmation_workflow import (
     CustomerConfirmationWorkflow,
     send_customer_confirmation_email,
