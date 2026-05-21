@@ -1,0 +1,15 @@
+[project]
+name = "temporal-agent-harness-example"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.102.0",
+    "fastapi>=0.136.1",
+    "mcp>=1.27.1",
+    "prompt-toolkit>=3.0.52",
+    "pydantic>=2.13.4",
+    "temporalio>=1.27.2",
+    "uvicorn>=0.47.0",
+]

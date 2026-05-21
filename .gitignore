@@ -36,6 +36,10 @@ env/
 venv/
 ENV/
 
+# local simple chat runtime data
+.simple_chat_agent/
+.simple_chat_streams/
+
 # IDE
 .vscode/
 .idea/
