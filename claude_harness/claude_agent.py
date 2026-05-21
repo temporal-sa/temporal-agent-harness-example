@@ -43,6 +43,7 @@ InterruptPartialResponsePolicy = Literal["discard"]
 DEFAULT_CLAUDE_ACTIVITY_OPTIONS = ActivityOptions(
     start_to_close_timeout=timedelta(minutes=2)
 )
+FINE_GRAINED_TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14"
 
 
 @dataclass(frozen=True)
@@ -548,6 +549,15 @@ class ClaudeResponse:
     guard_reason: str | None = None
 
 
+@dataclass
+class _ToolInputStreamState:
+    content_block_index: int
+    tool_use_id: str | None
+    tool_name: str | None
+    tool_type: str | None
+    partial_json: str = ""
+
+
 def _claude_request_to_dict(request: ClaudeRequest) -> dict[str, Any]:
     return {
         "system_prompt": request.system_prompt,
@@ -699,21 +709,25 @@ async def _stream_claude_message(
     stream = StreamContext(stream_id=stream_id, tool_name="claude")
     await stream.emit({"sequence": stream_sequence}, kind="claude_start")
 
-    async with client.messages.stream(**create_params) as message_stream:
+    async with client.messages.stream(
+        **create_params,
+        extra_headers=_streaming_extra_headers(create_params),
+    ) as message_stream:
         cancel_task = asyncio.create_task(activity.wait_for_cancelled())
-        text_iterator = message_stream.text_stream.__aiter__()
+        event_iterator = message_stream.__aiter__()
+        tool_input_blocks: dict[int, _ToolInputStreamState] = {}
         try:
             while True:
-                next_text_task = asyncio.create_task(anext(text_iterator))
+                next_event_task = asyncio.create_task(anext(event_iterator))
                 done, _pending = await asyncio.wait(
-                    {next_text_task, cancel_task},
+                    {next_event_task, cancel_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
 
                 if cancel_task in done:
-                    next_text_task.cancel()
+                    next_event_task.cancel()
                     with suppress(asyncio.CancelledError):
-                        await next_text_task
+                        await next_event_task
                     await stream.emit(
                         {"sequence": stream_sequence},
                         kind="claude_cancelled",
@@ -721,15 +735,16 @@ async def _stream_claude_message(
                     raise asyncio.CancelledError()
 
                 try:
-                    text = next_text_task.result()
+                    event = next_event_task.result()
                 except StopAsyncIteration:
                     break
 
-                if text:
-                    await stream.emit(
-                        {"sequence": stream_sequence, "text": text},
-                        kind="claude_text_delta",
-                    )
+                await _emit_claude_raw_stream_event(
+                    stream=stream,
+                    event=event,
+                    stream_sequence=stream_sequence,
+                    tool_input_blocks=tool_input_blocks,
+                )
         finally:
             cancel_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -749,6 +764,100 @@ async def _stream_claude_message(
         kind="claude_complete",
     )
     return response
+
+
+def _streaming_extra_headers(create_params: dict[str, Any]) -> dict[str, str] | None:
+    if not create_params.get("tools"):
+        return None
+    return {"anthropic-beta": FINE_GRAINED_TOOL_STREAMING_BETA}
+
+
+async def _emit_claude_raw_stream_event(
+    *,
+    stream: StreamContext,
+    event: Any,
+    stream_sequence: int | None,
+    tool_input_blocks: dict[int, _ToolInputStreamState],
+) -> None:
+    event_type = getattr(event, "type", None)
+
+    if event_type == "content_block_start":
+        block_index = cast(int, getattr(event, "index"))
+        block = _object_to_dict(getattr(event, "content_block", None))
+        block_type = block.get("type")
+        if block_type in ("tool_use", "server_tool_use"):
+            state = _ToolInputStreamState(
+                content_block_index=block_index,
+                tool_use_id=cast(str | None, block.get("id")),
+                tool_name=cast(str | None, block.get("name")),
+                tool_type=cast(str | None, block_type),
+            )
+            tool_input_blocks[block_index] = state
+            await stream.emit(
+                {
+                    "sequence": stream_sequence,
+                    "content_block_index": block_index,
+                    "tool_use_id": state.tool_use_id,
+                    "tool_name": state.tool_name,
+                    "tool_type": state.tool_type,
+                },
+                kind="claude_tool_input_start",
+            )
+        return
+
+    if event_type == "content_block_delta":
+        delta = _object_to_dict(getattr(event, "delta", None))
+        delta_type = delta.get("type")
+        if delta_type == "text_delta":
+            text = delta.get("text")
+            if isinstance(text, str) and text:
+                await stream.emit(
+                    {"sequence": stream_sequence, "text": text},
+                    kind="claude_text_delta",
+                )
+            return
+
+        if delta_type == "input_json_delta":
+            block_index = cast(int, getattr(event, "index"))
+            state = tool_input_blocks.get(block_index)
+            partial_json = delta.get("partial_json")
+            if state is None or not isinstance(partial_json, str):
+                return
+
+            state.partial_json += partial_json
+            await stream.emit(
+                {
+                    "sequence": stream_sequence,
+                    "content_block_index": block_index,
+                    "tool_use_id": state.tool_use_id,
+                    "tool_name": state.tool_name,
+                    "tool_type": state.tool_type,
+                    "partial_json": partial_json,
+                },
+                kind="claude_tool_input_delta",
+            )
+        return
+
+    if event_type == "content_block_stop":
+        block_index = cast(int, getattr(event, "index"))
+        state = tool_input_blocks.pop(block_index, None)
+        if state is None:
+            return
+
+        block = _object_to_dict(getattr(event, "content_block", None))
+        input_value = block.get("input", state.partial_json)
+        await stream.emit(
+            {
+                "sequence": stream_sequence,
+                "content_block_index": block_index,
+                "tool_use_id": state.tool_use_id,
+                "tool_name": state.tool_name,
+                "tool_type": state.tool_type,
+                "input": input_value,
+                "input_preview": _json_preview(input_value),
+            },
+            kind="claude_tool_input_complete",
+        )
 
 
 def _tool_use_blocks(message: MessageParam) -> list[dict[str, Any]]:
@@ -794,9 +903,19 @@ def _tool_param_to_dict(tool: dict[str, Any]) -> dict[str, Any]:
 
 
 def _block_to_dict(block: Any) -> dict[str, Any]:
-    if isinstance(block, dict):
-        return dict(cast(Mapping[str, Any], block))
-    return cast(dict[str, Any], block.to_dict())
+    return _object_to_dict(block)
+
+
+def _object_to_dict(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(cast(Mapping[str, Any], value))
+    if hasattr(value, "to_dict"):
+        return cast(dict[str, Any], value.to_dict())
+    if hasattr(value, "model_dump"):
+        return cast(dict[str, Any], value.model_dump(mode="json"))
+    return {}
 
 
 def _text_from_content_blocks(content: Any) -> str:
@@ -817,7 +936,7 @@ def _json_preview(value: Any, *, max_chars: int = 2_000) -> str:
         encoded = repr(value)
     if len(encoded) <= max_chars:
         return encoded
-    return f"{encoded[:max_chars]}...[truncated]"
+    return encoded[-max_chars:]
 
 
 def _formatted_control_message(
