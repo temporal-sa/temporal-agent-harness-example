@@ -70,6 +70,7 @@ class CreateChatRequest:
     available_tool_names: list[str] = field(default_factory=list)
     github_connection_id: str | None = None
     mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
+    good_place_censor: bool = False
 
 
 @dataclass
@@ -188,6 +189,7 @@ class UserChatsWorkflow:
                 mcp_servers=list(request.mcp_servers),
                 transcript=transcript,
                 pending_messages=pending_messages,
+                good_place_censor=request.good_place_censor,
             ),
             id=workflow_id,
             task_queue=TASK_QUEUE,

@@ -19,6 +19,10 @@ with workflow.unsafe.imports_passed_through():
         ApprovalDecision,
         ChildToolApprovalRequest,
     )
+    from simple_chat_agent.good_place_guards import (
+        good_place_post_guard,
+        good_place_pre_guard,
+    )
 
 
 ChatRole = Literal["user", "assistant", "system"]
@@ -67,6 +71,7 @@ class SimpleChatInput:
     active_message_index: int | None = None
     approval_memory: list[str] = field(default_factory=list)
     approval_counter: int = 0
+    good_place_censor: bool = False
 
 
 @dataclass
@@ -317,6 +322,8 @@ class SimpleChatWorkflow:
             max_tokens=chat_input.max_tokens,
             thinking=chat_input.thinking,
             stream_id=chat_input.stream_id or workflow.info().workflow_id,
+            pre_llm_guards=[good_place_pre_guard] if chat_input.good_place_censor else None,
+            post_llm_guards=[good_place_post_guard] if chat_input.good_place_censor else None,
         )
         self._status = "idle"
         resume_agent_state = chat_input.agent_state
@@ -348,6 +355,17 @@ class SimpleChatWorkflow:
                             result.continuation_state,
                         )
                     )
+                if (
+                    chat_input.good_place_censor
+                    and self._active_message_index is not None
+                ):
+                    effective = await self._agent.effective_user_prompt()
+                    if effective is not None:
+                        original = self._transcript[self._active_message_index]
+                        self._transcript[self._active_message_index] = ChatMessage(
+                            role=original.role,
+                            content=effective,
+                        )
                 self._transcript.append(
                     ChatMessage(
                         role="assistant",
@@ -464,6 +482,7 @@ class SimpleChatWorkflow:
             active_message_index=self._active_message_index,
             approval_memory=sorted(self._approval_memory),
             approval_counter=self._approval_counter,
+            good_place_censor=chat_input.good_place_censor,
         )
 
 

@@ -4,7 +4,7 @@ import asyncio
 import json
 from collections.abc import Iterable
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import Any, Literal, Mapping, cast
 
@@ -122,6 +122,7 @@ class ClaudeAgent:
         self._pending_interrupts: list[str] = []
         self._interrupt_requested = False
         self._claude_call_sequence = 0
+        self._turn_user_prompt_index: int | None = None
         self._terminated = False
         self._termination_reason: str | None = None
         self._llm_guard_state: dict[str, Any] = {}
@@ -173,11 +174,13 @@ class ClaudeAgent:
             else:
                 await self._context.initialize(user_prompt)
                 self._context_initialized = True
+            self._turn_user_prompt_index = self._context.message_count() - 1
             completed_turns = 0
         else:
             self._context.restore(state.context_snapshot)
             self._context_initialized = True
             self._llm_guard_state = dict(state.llm_guard_state)
+            self._turn_user_prompt_index = None
             completed_turns = state.turns
 
         tool_schemas = self._tools.tool_schemas(self._tool_names)
@@ -258,6 +261,21 @@ class ClaudeAgent:
             turns=max_turns,
         )
 
+    async def effective_user_prompt(self) -> str | None:
+        """The post-pre-guard text of this turn's initiating user message.
+
+        Read back from the persisted (censored) history so the UI can snap the
+        user's bubble to what actually entered the conversation. None on a
+        resumed turn (no new user prompt) or if the index is out of range.
+        """
+        index = self._turn_user_prompt_index
+        if index is None:
+            return None
+        messages = await self._context.full_messages()
+        if not 0 <= index < len(messages):
+            return None
+        return _message_text(messages[index])
+
     async def _call_claude(
         self, tool_schemas: list[dict[str, Any]]
     ) -> ClaudeResponse | None:
@@ -276,35 +294,46 @@ class ClaudeAgent:
             safety_margin_tokens=self._context_safety_margin_tokens,
             chars_per_token=self._context_chars_per_token,
         )
-        request = ClaudeRequest(
+        # Guards see the FULL durable history (un-windowed) so they can inspect
+        # and mutate the whole conversation.
+        guard_request = ClaudeRequest(
             system_prompt=self._system_prompt,
             model=self._model,
             max_tokens=self._max_tokens,
             **_thinking_request_params(self._thinking, max_tokens=self._max_tokens),
             tools=tool_params,
+            chat_history=await self._context.full_messages(),
+            stream_id=self._stream_id,
+            stream_sequence=self._claude_call_sequence,
+        )
+
+        pre_guard_execution = await self._llm_guards.execute_pre(
+            request=_claude_request_to_dict(guard_request),
+            state=self._llm_guard_state,
+            stream_id=self._stream_id,
+            activity_options=self._llm_guard_activity_options,
+        )
+        guarded = _claude_request_from_dict(pre_guard_execution.request)
+        if pre_guard_execution.halted:
+            self._llm_guard_state = pre_guard_execution.state
+            return _claude_response_from_guard_execution(
+                pre_guard_execution,
+                model=guarded.model,
+            )
+
+        # Persist the (possibly censored) full history: pre-guard mutations are
+        # durable. Windowing/clearing below is transport-only and never stored.
+        await self._context.replace_messages(guarded.chat_history)
+
+        request = replace(
+            guarded,
             chat_history=[
                 _message_param_to_dict(message)
                 for message in await self._context.messages_for_model(
                     context_budget
                 )
             ],
-            stream_id=self._stream_id,
-            stream_sequence=self._claude_call_sequence,
         )
-
-        pre_guard_execution = await self._llm_guards.execute_pre(
-            request=_claude_request_to_dict(request),
-            state=self._llm_guard_state,
-            stream_id=self._stream_id,
-            activity_options=self._llm_guard_activity_options,
-        )
-        request = _claude_request_from_dict(pre_guard_execution.request)
-        if pre_guard_execution.halted:
-            self._llm_guard_state = pre_guard_execution.state
-            return _claude_response_from_guard_execution(
-                pre_guard_execution,
-                model=request.model,
-            )
 
         claude_handle = workflow.start_activity(
             call_claude,
@@ -323,7 +352,9 @@ class ClaudeAgent:
 
             response = await claude_handle
             post_guard_execution = await self._llm_guards.execute_post(
-                request=_claude_request_to_dict(request),
+                request=_claude_request_to_dict(
+                    replace(request, chat_history=await self._context.full_messages())
+                ),
                 response=_claude_response_to_dict(response),
                 state=pre_guard_execution.state,
                 stream_id=self._stream_id,
@@ -486,6 +517,7 @@ class ClaudeAgentResult:
     continuation_state: ClaudeAgentState | None = None
     guard_action: str | None = None
     guard_reason: str | None = None
+    effective_user_prompt: str | None = None
 
     @property
     def needs_continue_as_new(self) -> bool:
@@ -882,6 +914,19 @@ def _tool_use_blocks(message: MessageParam) -> list[dict[str, Any]]:
         if block_dict.get("type") == "tool_use":
             blocks.append(block_dict)
     return blocks
+
+
+def _message_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return ""
 
 
 def _message_param_to_dict(message: MessageParam) -> dict[str, Any]:

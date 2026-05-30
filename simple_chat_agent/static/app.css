@@ -959,7 +959,6 @@ main {
     min-height: 0;
     overflow-y: auto;
     padding: var(--space-md);
-    scroll-behavior: smooth;
 }
 .sidebar {
     display: none;

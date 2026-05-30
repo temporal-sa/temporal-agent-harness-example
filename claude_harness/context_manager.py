@@ -32,6 +32,15 @@ class ContextManager(Protocol):
     ) -> list[MessageParam]:
         pass
 
+    async def full_messages(self) -> list[dict[str, Any]]:
+        pass
+
+    async def replace_messages(self, messages: list[dict[str, Any]]) -> None:
+        pass
+
+    def message_count(self) -> int:
+        pass
+
     async def record_assistant_message(self, message: MessageParam) -> None:
         pass
 
@@ -145,6 +154,22 @@ class SlidingWindowContextManager:
             token_budget,
             preserve_first_message=self.preserve_initial_user_message,
         )
+
+    async def full_messages(self) -> list[dict[str, Any]]:
+        """The complete durable history (un-windowed, un-cleared) as dicts.
+
+        Guards receive this so they can inspect/mutate the whole conversation;
+        windowing/tool-clearing happen afterward in messages_for_model purely
+        for the outbound request.
+        """
+        return [_message_to_snapshot(message) for message in self._messages]
+
+    async def replace_messages(self, messages: list[dict[str, Any]]) -> None:
+        """Replace the durable history (e.g. with a guard-censored version)."""
+        self._messages = [_message_from_snapshot(message) for message in messages]
+
+    def message_count(self) -> int:
+        return len(self._messages)
 
     async def record_assistant_message(self, message: MessageParam) -> None:
         self._messages.append(_normalize_message(message))

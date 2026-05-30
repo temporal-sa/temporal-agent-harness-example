@@ -363,6 +363,7 @@ async def create_session(
             ),
             github_connection_id=github_connection_id,
             mcp_servers=mcp_servers,
+            good_place_censor=_good_place_enabled(),
         ),
     )
     _clear_stream(conversation.workflow_id)
@@ -1639,6 +1640,10 @@ def _conversation_title(message: str) -> str:
 
 def _default_model() -> str:
     return os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL_OPTIONS[0])
+
+
+def _good_place_enabled() -> bool:
+    return os.environ.get("SIMPLE_CHAT_GOOD_PLACE", "1").lower() in ("1", "true", "yes")
 
 
 def _model_options() -> list[str]:

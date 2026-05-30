@@ -19,6 +19,7 @@
       currentClaudeSequence: null,
       ignoreClaudeUntilStart: false,
       localPending: [],
+      resolvingApprovals: new Set(),
       lastAssistantCount: 0,
       recoveringMissingWorkflow: false,
       toolsWindowOpen: false,
@@ -300,6 +301,7 @@
       state.currentClaudeSequence = null;
       state.ignoreClaudeUntilStart = false;
       state.localPending = [];
+      state.resolvingApprovals.clear();
       state.draftConversation = true;
       closeArtifactViewer();
       localStorage.removeItem("simpleChatWorkflowId");
@@ -342,6 +344,7 @@
       state.currentClaudeSequence = null;
       state.ignoreClaudeUntilStart = false;
       state.draftConversation = false;
+      state.resolvingApprovals.clear();
       if (!options.preserveLocalPending) {
         state.localPending = [];
       }
@@ -598,7 +601,21 @@
     }
 
     async function resolveApproval(approvalId, decision) {
-      await post(`/api/sessions/${state.workflowId}/approvals/${approvalId}`, { decision });
+      // Guard against double-submits: the approval card stays on screen until the
+      // workflow state refreshes (which the resolution itself triggers), so a fast
+      // second click would otherwise re-POST an already-resolved approval and the
+      // workflow would log "Approval is no longer pending" for each extra click.
+      // Mark it resolving, hide the card optimistically, and only restore on error.
+      if (state.resolvingApprovals.has(approvalId)) return;
+      state.resolvingApprovals.add(approvalId);
+      render();
+      try {
+        await post(`/api/sessions/${state.workflowId}/approvals/${approvalId}`, { decision });
+      } catch (err) {
+        state.resolvingApprovals.delete(approvalId);
+        statusEl.textContent = `approval failed: ${err}`;
+        render();
+      }
     }
 
     function renderSidebar() {
@@ -650,7 +667,11 @@
     }
 
     function renderApprovalsPanel() {
-      const approvals = state.workflowState?.pending_approvals || [];
+      // Hide approvals that are mid-resolution so the card clears the instant the
+      // user clicks, rather than lingering until the next workflow-state refresh.
+      const approvals = (state.workflowState?.pending_approvals || []).filter(
+        (approval) => !state.resolvingApprovals.has(approval.approval_id),
+      );
       if (approvals.length === 0) return null;
 
       const panel = document.createElement("section");
@@ -1176,6 +1197,14 @@
       const nextAssistantCount = nextState.transcript.filter((m) => m.role === "assistant").length;
       state.workflowState = nextState;
       state.localPending = state.localPending.filter((pending) => !isAcknowledged(pending, nextState));
+      // Once the workflow confirms an approval is no longer pending, stop tracking
+      // it as resolving (it has left the panel for good).
+      const pendingApprovalIds = new Set(
+        (nextState.pending_approvals || []).map((approval) => approval.approval_id),
+      );
+      for (const approvalId of state.resolvingApprovals) {
+        if (!pendingApprovalIds.has(approvalId)) state.resolvingApprovals.delete(approvalId);
+      }
       if (nextAssistantCount > previousAssistantCount) markStreamCommitted();
       render();
     }
@@ -1432,8 +1461,18 @@
         fragment.append(approvalsPanel);
       }
 
+      // Capture whether we were pinned to the bottom BEFORE swapping content;
+      // replaceChildren resets scroll, so re-pin only if the user was already
+      // at the bottom. This keeps live output in view without yanking the user
+      // back down when they've scrolled up to read history (and avoids the
+      // jump-to-top-then-scroll churn during the burst of re-renders an
+      // approval resolution triggers).
+      const pinnedToBottom =
+        messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
       messagesEl.replaceChildren(fragment);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      if (pinnedToBottom) {
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
       // The live streaming text/thinking boxes have their own max-height scroll
       // region; keep them pinned to the latest output as text streams in.
       messagesEl
