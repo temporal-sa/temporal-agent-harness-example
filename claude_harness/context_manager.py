@@ -92,7 +92,11 @@ class ContextTokenBudget:
 class SlidingWindowContextManager:
     max_recent_messages: int = 20
     preserve_initial_user_message: bool = True
-    clear_old_tool_results: bool = True
+    # Budget-driven retention: keep every tool result in full and let
+    # messages_for_model's token-budget path shed the oldest/largest only when
+    # actually over budget. Set True to eagerly stub every tool result except
+    # the most recent one (the old aggressive behavior).
+    clear_old_tool_results: bool = False
     max_tool_result_chars: int | None = None
     _messages: list[MessageParam] = field(default_factory=list, init=False)
 
