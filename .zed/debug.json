@@ -3,7 +3,7 @@
     "label": "Replay: Simple Chat Workflow History",
     "adapter": "Debugpy",
     "request": "launch",
-    "module": "simple_chat_agent.replay",
+    "module": "simple_chat_agent.worker.replay",
     "cwd": "$ZED_WORKTREE_ROOT",
     "args": [
       "--workflow-id",

@@ -19,7 +19,8 @@ REGION="us-west-1"
 ACCOUNT="429214323166"
 REPO="temporal-michaelj-agent-harness-demo"
 NAMESPACE="temporal-michaelj-agent-harness-demo"
-WEB_DEPLOYMENT="agent-harness-web"
+FRONTEND_DEPLOYMENT="agent-harness-web"
+API_DEPLOYMENT="agent-harness-api"
 WORKER_DEPLOYMENT="agent-harness-worker"
 
 REGISTRY="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com"
@@ -42,10 +43,12 @@ docker buildx build --platform linux/amd64 \
   -t "${IMAGE}:latest" \
   --push .
 
-echo ">> Rolling out web + worker in ${NAMESPACE} to ${TAG}"
-kubectl set image "deployment/${WEB_DEPLOYMENT}" "web=${IMAGE}:${TAG}" -n "${NAMESPACE}"
+echo ">> Rolling out frontend + API + worker in ${NAMESPACE} to ${TAG}"
+kubectl set image "deployment/${FRONTEND_DEPLOYMENT}" "web=${IMAGE}:${TAG}" -n "${NAMESPACE}"
+kubectl set image "deployment/${API_DEPLOYMENT}" "api=${IMAGE}:${TAG}" -n "${NAMESPACE}"
 kubectl set image "deployment/${WORKER_DEPLOYMENT}" "worker=${IMAGE}:${TAG}" -n "${NAMESPACE}"
-kubectl rollout status "deployment/${WEB_DEPLOYMENT}" -n "${NAMESPACE}" --timeout=300s
+kubectl rollout status "deployment/${FRONTEND_DEPLOYMENT}" -n "${NAMESPACE}" --timeout=300s
+kubectl rollout status "deployment/${API_DEPLOYMENT}" -n "${NAMESPACE}" --timeout=300s
 kubectl rollout status "deployment/${WORKER_DEPLOYMENT}" -n "${NAMESPACE}" --timeout=300s
 
 echo ">> Done. Deployed ${IMAGE}:${TAG}"

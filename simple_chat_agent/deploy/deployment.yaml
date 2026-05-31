@@ -1,13 +1,15 @@
-# Independent web and worker Deployments for the simple_chat_agent.
+# Independent frontend, API, and worker Deployments for the simple_chat_agent.
 #
 # All shared state is now external (S3 claim-checks + artifacts, DynamoDB
-# OAuth/artifact metadata, web-owned HTTP streaming), so the two no longer share
-# a pod or any local volume. Each container keeps a small emptyDir for SQLite
-# scratch (transient OAuth handshake state, etc.).
+# OAuth/artifact metadata, API-owned HTTP streaming), so the runtime boundaries
+# no longer share a pod or any local volume. The API and worker keep a small
+# emptyDir for SQLite scratch (transient OAuth handshake state, etc.).
 #
-# - web: serves the UI + the internal stream API; owns the in-memory stream
-#        buffer, so it stays at a single replica (scaling needs a shared
-#        backplane, e.g. Redis).
+# - web: static frontend only; no secrets or service-account token. The
+#        `component: web` label is retained for Deployment selector stability.
+# - api: FastAPI, OAuth, SSE, artifacts, and internal stream API. Single replica
+#        while it owns the in-memory stream buffer; scaling needs a shared
+#        backplane, e.g. Redis.
 # - worker: Temporal worker + in-process codec; horizontally scalable (the codec
 #           reads claim-checks from S3, so any worker pod can decode).
 ---
@@ -21,8 +23,6 @@ metadata:
     component: web
 spec:
   replicas: 1
-  strategy:
-    type: Recreate
   selector:
     matchLabels:
       app: agent-harness
@@ -33,16 +33,74 @@ spec:
         app: agent-harness
         component: web
     spec:
-      serviceAccountName: agent-harness
+      automountServiceAccountToken: false
       containers:
         - name: web
+          image: 429214323166.dkr.ecr.us-west-1.amazonaws.com/temporal-michaelj-agent-harness-demo:1.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - uvicorn
+            - simple_chat_agent.frontend.server:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+            - --proxy-headers
+            - --forwarded-allow-ips
+            - "*"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-harness-api
+  namespace: temporal-michaelj-agent-harness-demo
+  labels:
+    app: agent-harness
+    component: api
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: agent-harness
+      component: api
+  template:
+    metadata:
+      labels:
+        app: agent-harness
+        component: api
+    spec:
+      serviceAccountName: agent-harness
+      containers:
+        - name: api
           image: 429214323166.dkr.ecr.us-west-1.amazonaws.com/temporal-michaelj-agent-harness-demo:1.0
           imagePullPolicy: IfNotPresent
           # The module's __main__ binds 127.0.0.1 with reload=True (dev only),
           # so launch uvicorn directly bound to all interfaces.
           command:
             - uvicorn
-            - simple_chat_agent.web:app
+            - simple_chat_agent.api.main:app
             - --host
             - 0.0.0.0
             - --port
@@ -63,8 +121,6 @@ spec:
               value: UserEmail
             - name: SIMPLE_CHAT_DYNAMODB_TABLE
               value: temporal-michaelj-agent-harness-demo-oauth
-            - name: SIMPLE_CHAT_STREAM_SINK_URL
-              value: http://agent-harness-web
             - name: SIMPLE_CHAT_ARTIFACTS_TABLE
               value: temporal-michaelj-agent-harness-demo-artifacts
           volumeMounts:
@@ -120,7 +176,7 @@ spec:
           command:
             - python
             - -m
-            - simple_chat_agent.worker
+            - simple_chat_agent.worker.main
           ports:
             - name: codec
               containerPort: 8001
@@ -135,7 +191,7 @@ spec:
             - name: SIMPLE_CHAT_DYNAMODB_TABLE
               value: temporal-michaelj-agent-harness-demo-oauth
             - name: SIMPLE_CHAT_STREAM_SINK_URL
-              value: http://agent-harness-web
+              value: http://agent-harness-api
             - name: SIMPLE_CHAT_ARTIFACTS_TABLE
               value: temporal-michaelj-agent-harness-demo-artifacts
           volumeMounts:

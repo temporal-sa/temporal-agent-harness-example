@@ -1,4 +1,5 @@
-# Routes the test host to the test web Service.
+# Routes API/OAuth/internal paths to the test API Service and everything else
+# to the static frontend Service.
 ---
 apiVersion: traefik.containo.us/v1alpha1
 kind: IngressRoute
@@ -9,6 +10,27 @@ spec:
   entryPoints:
     - websecure
   routes:
+    - kind: Rule
+      match: Host(`agent-harness-demo.testing.tmprl-demo.cloud`) && PathPrefix(`/api`)
+      services:
+        - name: agent-harness-api-testing
+          namespace: temporal-michaelj-agent-harness-demo
+          passHostHeader: true
+          port: 80
+    - kind: Rule
+      match: Host(`agent-harness-demo.testing.tmprl-demo.cloud`) && PathPrefix(`/oauth`)
+      services:
+        - name: agent-harness-api-testing
+          namespace: temporal-michaelj-agent-harness-demo
+          passHostHeader: true
+          port: 80
+    - kind: Rule
+      match: Host(`agent-harness-demo.testing.tmprl-demo.cloud`) && PathPrefix(`/internal`)
+      services:
+        - name: agent-harness-api-testing
+          namespace: temporal-michaelj-agent-harness-demo
+          passHostHeader: true
+          port: 80
     - kind: Rule
       match: Host(`agent-harness-demo.testing.tmprl-demo.cloud`)
       services:
@@ -28,6 +50,27 @@ spec:
   entryPoints:
     - web
   routes:
+    - kind: Rule
+      match: Host(`agent-harness-demo.testing.tmprl-demo.cloud`) && PathPrefix(`/api`)
+      services:
+        - name: agent-harness-api-testing
+          namespace: temporal-michaelj-agent-harness-demo
+          passHostHeader: true
+          port: 80
+    - kind: Rule
+      match: Host(`agent-harness-demo.testing.tmprl-demo.cloud`) && PathPrefix(`/oauth`)
+      services:
+        - name: agent-harness-api-testing
+          namespace: temporal-michaelj-agent-harness-demo
+          passHostHeader: true
+          port: 80
+    - kind: Rule
+      match: Host(`agent-harness-demo.testing.tmprl-demo.cloud`) && PathPrefix(`/internal`)
+      services:
+        - name: agent-harness-api-testing
+          namespace: temporal-michaelj-agent-harness-demo
+          passHostHeader: true
+          port: 80
     - kind: Rule
       match: Host(`agent-harness-demo.testing.tmprl-demo.cloud`)
       services:

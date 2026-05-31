@@ -5,6 +5,7 @@
 
 # Virtualenvs / caches
 .venv
+**/node_modules/
 **/__pycache__/
 *.py[cod]
 
@@ -12,6 +13,8 @@
 .simple_chat_agent/
 .simple_chat_streams/
 .replay/
+.lambda-build/
+simple_chat_agent/frontend/static/dist/
 
 # VCS / IDE / OS
 .git

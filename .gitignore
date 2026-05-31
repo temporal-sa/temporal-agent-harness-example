@@ -40,6 +40,10 @@ ENV/
 .simple_chat_agent/
 .simple_chat_streams/
 .replay/
+.lambda-build/
+node_modules/
+simple_chat_agent/frontend/node_modules/
+simple_chat_agent/frontend/static/dist/
 
 # IDE
 .vscode/

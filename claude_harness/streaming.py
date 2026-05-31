@@ -2,6 +2,11 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Protocol
 
+try:
+    from temporalio import activity as temporal_activity
+except ImportError:  # pragma: no cover - used by the minimal sandbox Lambda zip.
+    temporal_activity = None
+
 
 @dataclass(frozen=True)
 class StreamEvent:
@@ -63,3 +68,27 @@ def configure_stream_sink(
 
 def stream_sink_configured() -> bool:
     return _stream_sink is not None
+
+
+@dataclass
+class EmitStreamEventRequest:
+    stream_id: str | None
+    tool_name: str | None
+    step: str | None
+    kind: str
+    payload: Any
+
+
+async def emit_stream_event_activity(request: EmitStreamEventRequest) -> None:
+    stream = StreamContext(
+        stream_id=request.stream_id,
+        tool_name=request.tool_name,
+        step=request.step,
+    )
+    await stream.emit(request.payload, kind=request.kind)
+
+
+if temporal_activity is not None:
+    emit_stream_event_activity = temporal_activity.defn(
+        name="claude_harness.emit_stream_event"
+    )(emit_stream_event_activity)

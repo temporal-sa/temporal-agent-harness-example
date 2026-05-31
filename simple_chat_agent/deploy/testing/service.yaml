@@ -1,5 +1,5 @@
-# Test web Service (selects only the test web pods). The test worker streams to
-# this Service name (SIMPLE_CHAT_STREAM_SINK_URL=http://agent-harness-web-testing).
+# Test web Service selects only the static frontend pods. The test worker
+# streams to the test API Service.
 apiVersion: v1
 kind: Service
 metadata:
@@ -12,6 +12,23 @@ spec:
   selector:
     app: agent-harness-testing
     component: web
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-harness-api-testing
+  namespace: temporal-michaelj-agent-harness-demo
+  labels:
+    app: agent-harness-testing
+spec:
+  type: ClusterIP
+  selector:
+    app: agent-harness-testing
+    component: api
   ports:
     - name: http
       port: 80

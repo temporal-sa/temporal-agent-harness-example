@@ -1,10 +1,11 @@
 # Isolated TEST stack (branch preview), in the same namespace as prod.
 #
-# Separate web + worker Deployments labelled `app: agent-harness-testing` so the
-# prod Services never select these pods. Isolation in the shared namespace comes
-# from SIMPLE_CHAT_TASK_QUEUE (own queue) + SIMPLE_CHAT_WORKFLOW_PREFIX (own
-# registry ids). The test worker streams to the test web. Backends (S3,
-# DynamoDB, secret, Temporal namespace) are shared with prod.
+# Separate frontend + API + worker Deployments labelled `app:
+# agent-harness-testing` so the prod Services never select these pods. Isolation
+# in the shared namespace comes from SIMPLE_CHAT_TASK_QUEUE (own queue) +
+# SIMPLE_CHAT_WORKFLOW_PREFIX (own registry ids). The test worker streams to the
+# test API. Backends (S3, DynamoDB, secret, Temporal namespace) are shared with
+# prod.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -16,8 +17,6 @@ metadata:
     component: web
 spec:
   replicas: 1
-  strategy:
-    type: Recreate
   selector:
     matchLabels:
       app: agent-harness-testing
@@ -28,14 +27,67 @@ spec:
         app: agent-harness-testing
         component: web
     spec:
-      serviceAccountName: agent-harness
+      automountServiceAccountToken: false
       containers:
         - name: web
           image: 429214323166.dkr.ecr.us-west-1.amazonaws.com/temporal-michaelj-agent-harness-demo:testing
           imagePullPolicy: IfNotPresent
           command:
             - uvicorn
-            - simple_chat_agent.web:app
+            - simple_chat_agent.frontend.server:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+            - --proxy-headers
+            - --forwarded-allow-ips
+            - "*"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-harness-api-testing
+  namespace: temporal-michaelj-agent-harness-demo
+  labels:
+    app: agent-harness-testing
+    component: api
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: agent-harness-testing
+      component: api
+  template:
+    metadata:
+      labels:
+        app: agent-harness-testing
+        component: api
+    spec:
+      serviceAccountName: agent-harness
+      containers:
+        - name: api
+          image: 429214323166.dkr.ecr.us-west-1.amazonaws.com/temporal-michaelj-agent-harness-demo:testing
+          imagePullPolicy: IfNotPresent
+          command:
+            - uvicorn
+            - simple_chat_agent.api.main:app
             - --host
             - 0.0.0.0
             - --port
@@ -58,13 +110,16 @@ spec:
               value: temporal-michaelj-agent-harness-demo-oauth
             - name: SIMPLE_CHAT_ARTIFACTS_TABLE
               value: temporal-michaelj-agent-harness-demo-artifacts
+            # Override shared prod secret values for OAuth redirect generation.
+            - name: SIMPLE_CHAT_PUBLIC_URL
+              value: https://agent-harness-demo.testing.tmprl-demo.cloud
+            - name: GITHUB_OAUTH_REDIRECT_URI
+              value: https://agent-harness-demo.testing.tmprl-demo.cloud/oauth/github/callback
             # --- test isolation ---
             - name: SIMPLE_CHAT_TASK_QUEUE
               value: simple-chat-agent-testing
             - name: SIMPLE_CHAT_WORKFLOW_PREFIX
               value: testing-
-            - name: SIMPLE_CHAT_STREAM_SINK_URL
-              value: http://agent-harness-web-testing
           volumeMounts:
             - name: chat-data
               mountPath: /app/.simple_chat_agent
@@ -104,7 +159,7 @@ spec:
         app: agent-harness-testing
         component: worker
     spec:
-      serviceAccountName: agent-harness
+      serviceAccountName: agent-harness-worker-testing
       containers:
         - name: worker
           image: 429214323166.dkr.ecr.us-west-1.amazonaws.com/temporal-michaelj-agent-harness-demo:testing
@@ -112,7 +167,7 @@ spec:
           command:
             - python
             - -m
-            - simple_chat_agent.worker
+            - simple_chat_agent.worker.main
           ports:
             - name: codec
               containerPort: 8001
@@ -134,7 +189,11 @@ spec:
             - name: SIMPLE_CHAT_WORKFLOW_PREFIX
               value: testing-
             - name: SIMPLE_CHAT_STREAM_SINK_URL
-              value: http://agent-harness-web-testing
+              value: http://agent-harness-api-testing
+            - name: PYTHON_SANDBOX_LAMBDA_FUNCTION
+              value: temporal-michaelj-agent-harness-demo-python-sandbox-testing
+            - name: PYTHON_SANDBOX_STREAM_SINK_URL
+              value: https://agent-harness-demo.testing.tmprl-demo.cloud
           volumeMounts:
             - name: chat-data
               mountPath: /app/.simple_chat_agent

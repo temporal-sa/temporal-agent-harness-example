@@ -1,6 +1,7 @@
 # Each Service targets its own Deployment by the `component` label: the web
-# Service hits the web pods (8000), the codec Service hits the worker pods
-# (8001, the in-process codec server).
+# Service hits the static frontend pods (8080), the API Service hits FastAPI
+# (8000), and the codec Service hits the worker pods (8001, the in-process
+# codec server).
 apiVersion: v1
 kind: Service
 metadata:
@@ -13,6 +14,23 @@ spec:
   selector:
     app: agent-harness
     component: web
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-harness-api
+  namespace: temporal-michaelj-agent-harness-demo
+  labels:
+    app: agent-harness
+spec:
+  type: ClusterIP
+  selector:
+    app: agent-harness
+    component: api
   ports:
     - name: http
       port: 80
