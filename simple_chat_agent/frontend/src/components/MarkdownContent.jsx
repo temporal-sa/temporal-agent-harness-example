@@ -73,6 +73,7 @@ export function CodeBlock({
   languageHint = null,
   showLineNumbers = false,
   compact = false,
+  highlight = true,
   wrapLongLines = false,
 }) {
   const [copied, setCopied] = useState(false);
@@ -86,7 +87,7 @@ export function CodeBlock({
 
   useEffect(() => {
     setHighlightVisible(false);
-    if (highlighterLanguage === "text") return undefined;
+    if (!highlight || highlighterLanguage === "text") return undefined;
     const node = blockRef.current;
     if (!node) return undefined;
     if (!("IntersectionObserver" in window)) {
@@ -104,7 +105,7 @@ export function CodeBlock({
     );
     observer.observe(node);
     return () => observer.disconnect();
-  }, [code, highlighterLanguage]);
+  }, [code, highlight, highlighterLanguage]);
 
   async function copyCode() {
     try {
@@ -129,7 +130,7 @@ export function CodeBlock({
           {copied ? "Copied" : "Copy"}
         </button>
       </div>
-      {highlighterLanguage === "text" || !highlightVisible ? (
+      {!highlight || highlighterLanguage === "text" || !highlightVisible ? (
         <pre className="plain-code">
           <code>{code}</code>
         </pre>

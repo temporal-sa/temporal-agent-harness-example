@@ -35,6 +35,37 @@ export function updateWorkflowStateInState(previous, nextWorkflowState) {
   return next;
 }
 
+export function applyWorkflowStatePatchInState(previous, patch) {
+  if (!previous.workflowState) return previous;
+  const revision = Number(patch.state_revision || patch.revision || 0);
+  if (revision && revision <= previous.workflowStateProjectionRevision) return previous;
+  const {
+    revision: _revision,
+    transcript: _transcript,
+    transcript_offset: _transcriptOffset,
+    transcript_total: _transcriptTotal,
+    transcript_has_more_before: _transcriptHasMoreBefore,
+    transcript_length: _transcriptLength,
+    transcript_revision: _transcriptRevision,
+    ...statePatch
+  } = patch;
+
+  return updateWorkflowStateInState(previous, {
+    ...previous.workflowState,
+    ...statePatch,
+    state_revision: revision || previous.workflowState.state_revision || 0,
+    transcript_revision: previous.workflowState.transcript_revision || 0,
+    transcript: previous.workflowState.transcript || [],
+    transcript_offset: previous.workflowState.transcript_offset || 0,
+    transcript_total:
+      previous.workflowState.transcript_total ||
+      previous.workflowState.transcript_length ||
+      (previous.workflowState.transcript || []).length,
+    transcript_has_more_before: previous.workflowState.transcript_has_more_before || false,
+    artifacts: previous.workflowState.artifacts || [],
+  });
+}
+
 function normalizeWorkflowState(nextWorkflowState, previousWorkflowState = null) {
   const nextTranscript = nextWorkflowState.transcript || previousWorkflowState?.transcript || [];
   const hasTranscript = Object.prototype.hasOwnProperty.call(
@@ -251,13 +282,11 @@ export function handleStreamEventInState(previous, event) {
   const artifactResult = applyArtifactStreamEventInState(previous, event);
   if (artifactResult.handled) return artifactResult.state;
 
-  if (!hasLiveWorkflowActivity(previous)) return previous;
-
   const next = {
     ...previous,
     streamTurn: cloneStreamTurn(previous.streamTurn),
   };
-  const sequence = event.payload?.sequence ?? null;
+  const sequence = claudePayloadSequence(event);
 
   if (event.kind === "claude_start") {
     next.currentClaudeSequence = sequence;
@@ -265,50 +294,73 @@ export function handleStreamEventInState(previous, event) {
     if (next.workflowState) {
       next.workflowState = { ...next.workflowState, status: "responding" };
     }
-    if (isOpenStreamTurn(next.streamTurn)) {
-      registerStreamSequence(next.streamTurn, sequence);
-      next.streamTurn.status = "streaming";
-      next.streamTurn.activeSequence = sequence;
-    }
+    const turn = ensureStreamTurn(next, sequence);
+    completeOpenToolSegments(turn);
+    const agentSegment = ensureAgentSegment(turn, sequence);
+    agentSegment.status = "streaming";
+    turn.status = "streaming";
+    turn.activeSequence = sequence;
   } else if (event.kind === "claude_text_delta" && event.payload?.text) {
-    if (next.ignoreClaudeUntilStart || sequence !== next.currentClaudeSequence) return previous;
-    const turn = ensureStreamTurn(next, sequence);
-    turn.status = "streaming";
-    turn.text += event.payload.text;
+    if (!shouldApplyClaudeStreamEvent(next, sequence)) return previous;
+    const activeSequence = activeClaudeSequence(next, sequence);
+    adoptClaudeSequence(next, activeSequence);
+    const agentSegment = ensureAgentSegment(ensureStreamTurn(next, activeSequence), activeSequence);
+    agentSegment.status = "streaming";
+    agentSegment.text += event.payload.text;
+    next.streamTurn.status = "streaming";
   } else if (event.kind === "claude_thinking_start") {
-    if (next.ignoreClaudeUntilStart || sequence !== next.currentClaudeSequence) return previous;
-    const turn = ensureStreamTurn(next, sequence);
-    turn.status = "streaming";
+    if (!shouldApplyClaudeStreamEvent(next, sequence)) return previous;
+    const activeSequence = activeClaudeSequence(next, sequence);
+    adoptClaudeSequence(next, activeSequence);
+    const agentSegment = ensureAgentSegment(ensureStreamTurn(next, activeSequence), activeSequence);
+    agentSegment.status = "streaming";
+    next.streamTurn.status = "streaming";
   } else if (event.kind === "claude_thinking_delta" && event.payload?.thinking) {
-    if (next.ignoreClaudeUntilStart || sequence !== next.currentClaudeSequence) return previous;
-    const turn = ensureStreamTurn(next, sequence);
-    turn.status = "streaming";
-    turn.thinking += event.payload.thinking;
+    if (!shouldApplyClaudeStreamEvent(next, sequence)) return previous;
+    const activeSequence = activeClaudeSequence(next, sequence);
+    adoptClaudeSequence(next, activeSequence);
+    const agentSegment = ensureAgentSegment(ensureStreamTurn(next, activeSequence), activeSequence);
+    agentSegment.status = "streaming";
+    agentSegment.thinking += event.payload.thinking;
+    next.streamTurn.status = "streaming";
   } else if (event.kind === "claude_cancelled") {
-    if (sequence === next.currentClaudeSequence) {
+    if (shouldApplyClaudeStreamEvent(next, sequence)) {
       return {
         ...markStreamInterruptedInState(next),
         ignoreClaudeUntilStart: true,
       };
     }
   } else if (event.kind === "claude_complete") {
+    if (!shouldApplyClaudeStreamEvent(next, sequence)) return previous;
+    const activeSequence = activeClaudeSequence(next, sequence);
+    adoptClaudeSequence(next, activeSequence);
     const terminal = isTerminalClaudeStop(event.payload || {});
-    if (!terminal && sequence !== next.currentClaudeSequence) return previous;
-    const turn = streamTurnForSequence(next.streamTurn, sequence) || ensureStreamTurn(next, sequence);
-    if (turn) {
-      finishStreamClaudeTurn(turn, event.payload || {});
-      turn.status = terminal ? "complete" : turn.currentEvents.length ? "tooling" : "waiting";
-      turn.lastClaudeCompletedAt = new Date().toISOString();
+    const turn =
+      streamTurnForSequence(next.streamTurn, activeSequence) ||
+      ensureStreamTurn(next, activeSequence);
+    const agentSegment = ensureAgentSegment(turn, activeSequence);
+    finishAgentSegment(agentSegment, event.payload || {});
+    if (terminal) {
+      completeOpenToolSegments(turn);
+      turn.status = "complete";
+      turn.completedAt = new Date().toISOString();
+    } else {
+      ensureToolSegment(turn, activeSequence);
+      turn.status = "tooling";
     }
+    turn.lastClaudeCompletedAt = new Date().toISOString();
   } else if (isClaudeToolEvent(event)) {
-    const turn = ensureStreamTurn(next, next.currentClaudeSequence);
-    appendStreamToolEvent(turn, event);
+    if (!shouldApplyClaudeStreamEvent(next, sequence)) return previous;
+    const activeSequence = activeClaudeSequence(next, sequence);
+    adoptClaudeSequence(next, activeSequence);
+    const turn = ensureStreamTurn(next, activeSequence);
+    appendStreamToolEvent(turn, event, activeSequence);
     if (turn.status !== "complete" && turn.status !== "interrupted") {
       turn.status = "tooling";
     }
   } else if (!event.kind?.startsWith("claude_")) {
     const turn = ensureStreamTurn(next, next.currentClaudeSequence);
-    appendStreamToolEvent(turn, event);
+    appendStreamToolEvent(turn, event, next.currentClaudeSequence);
     if (turn.status !== "complete" && turn.status !== "interrupted") {
       turn.status = "tooling";
     }
@@ -316,12 +368,34 @@ export function handleStreamEventInState(previous, event) {
   return next;
 }
 
-export function streamEventNeedsDeferredWorkflowReconcile(event) {
-  return event.kind === "claude_complete" && event.payload?.stop_reason === "tool_use";
+function claudePayloadSequence(event) {
+  const sequence = event.payload?.sequence;
+  return sequence === undefined ? null : sequence;
+}
+
+function activeClaudeSequence(state, eventSequence) {
+  return eventSequence ?? state.currentClaudeSequence ?? state.streamTurn?.activeSequence ?? null;
+}
+
+function adoptClaudeSequence(state, sequence) {
+  if (state.currentClaudeSequence !== null && state.currentClaudeSequence !== undefined) return;
+  if (sequence === null || sequence === undefined) return;
+  state.currentClaudeSequence = sequence;
+}
+
+function shouldApplyClaudeStreamEvent(state, eventSequence) {
+  if (state.ignoreClaudeUntilStart) return false;
+  if (state.currentClaudeSequence === null || state.currentClaudeSequence === undefined) return true;
+  if (eventSequence === null || eventSequence === undefined) return true;
+  return eventSequence === state.currentClaudeSequence;
 }
 
 export function streamEventNeedsSettledTranscriptDelta(event) {
   return event.kind === "claude_complete" && isTerminalClaudeStop(event.payload || {});
+}
+
+export function streamEventNeedsWorkflowStateRefresh(event) {
+  return event.kind === "claude_complete" && event.payload?.stop_reason === "tool_use";
 }
 
 function applyWorkflowProjectionEventInState(previous, event) {
@@ -329,27 +403,9 @@ function applyWorkflowProjectionEventInState(previous, event) {
   const payload = event.payload || {};
 
   if (event.kind === "workflow_state") {
-    const revision = Number(payload.revision || 0);
-    if (revision && revision <= previous.workflowStateProjectionRevision) {
-      return { handled: true, state: previous };
-    }
-    const { revision: _revision, transcript_revision: _transcriptRevision, ...patch } = payload;
     return {
       handled: true,
-      state: updateWorkflowStateInState(previous, {
-        ...previous.workflowState,
-        ...patch,
-        state_revision: revision || previous.workflowState.state_revision || 0,
-        transcript_revision: previous.workflowState.transcript_revision || 0,
-        transcript: previous.workflowState.transcript || [],
-        transcript_offset: previous.workflowState.transcript_offset || 0,
-        transcript_total:
-          previous.workflowState.transcript_total ||
-          previous.workflowState.transcript_length ||
-          (previous.workflowState.transcript || []).length,
-        transcript_has_more_before: previous.workflowState.transcript_has_more_before || false,
-        artifacts: previous.workflowState.artifacts || [],
-      }),
+      state: applyWorkflowStatePatchInState(previous, payload),
     };
   }
 
@@ -444,10 +500,7 @@ function createStreamTurn(sequence) {
     sequences: sequence === null ? [] : [sequence],
     activeSequence: sequence,
     status: "streaming",
-    text: "",
-    thinking: "",
-    finishedTurns: [],
-    currentEvents: [],
+    segments: [],
     startedAt: new Date().toISOString(),
     completedAt: null,
     lastClaudeCompletedAt: null,
@@ -460,40 +513,89 @@ function cloneStreamTurn(turn) {
   return {
     ...turn,
     sequences: [...turn.sequences],
-    finishedTurns: turn.finishedTurns.map((finishedTurn) => ({
-      ...finishedTurn,
-      events: [...(finishedTurn.events || [])],
+    segments: (turn.segments || []).map((segment) => ({
+      ...segment,
+      events: segment.events ? [...segment.events] : undefined,
     })),
-    currentEvents: [...turn.currentEvents],
   };
 }
 
-function finishStreamClaudeTurn(turn, payload) {
-  const text = String(payload.text || turn.text || "").trim();
-  const stopReason = payload.stop_reason || "unknown";
-  const sequence = payload.sequence ?? turn.activeSequence;
-  turn.finishedTurns.push({
-    sequence,
-    text,
-    thinking: String(turn.thinking || "").trim(),
-    stopReason,
-    usage: payload.usage || null,
-    events: turn.currentEvents,
-    completedAt: new Date().toISOString(),
-  });
-  turn.finishedTurns = turn.finishedTurns.slice(-12);
-  turn.text = "";
-  turn.thinking = "";
-  turn.currentEvents = [];
+function ensureAgentSegment(turn, sequence) {
+  const normalizedSequence = sequence ?? turn.activeSequence ?? null;
+  registerStreamSequence(turn, normalizedSequence);
+  turn.activeSequence = normalizedSequence;
+  let segment = turn.segments.find(
+    (candidate) =>
+      candidate.type === "agent" && candidate.sequence === normalizedSequence,
+  );
+  if (!segment) {
+    segment = {
+      id: `agent:${normalizedSequence ?? "unknown"}:${turn.segments.length}`,
+      type: "agent",
+      sequence: normalizedSequence,
+      status: "streaming",
+      text: "",
+      thinking: "",
+      stopReason: null,
+      usage: null,
+      startedAt: new Date().toISOString(),
+      completedAt: null,
+    };
+    turn.segments.push(segment);
+  }
+  return segment;
 }
 
-function appendStreamToolEvent(turn, event) {
-  const finishedTurn = latestFinishedToolUseTurn(turn);
-  if (finishedTurn) {
-    finishedTurn.events = mergeStreamToolEvent(finishedTurn.events || [], event);
-    return;
+function ensureToolSegment(turn, sequence) {
+  const normalizedSequence = sequence ?? turn.activeSequence ?? null;
+  const existing = latestToolSegmentForSequence(turn, normalizedSequence);
+  if (existing) return existing;
+
+  const segment = {
+    id: `tools:${normalizedSequence ?? "unknown"}:${turn.segments.length}`,
+    type: "tools",
+    afterSequence: normalizedSequence,
+    status: "streaming",
+    events: [],
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+  };
+  turn.segments.push(segment);
+  return segment;
+}
+
+function latestToolSegmentForSequence(turn, sequence) {
+  for (let index = turn.segments.length - 1; index >= 0; index -= 1) {
+    const segment = turn.segments[index];
+    if (segment.type !== "tools") continue;
+    if (sequence === null || sequence === undefined || segment.afterSequence === sequence) {
+      return segment;
+    }
   }
-  turn.currentEvents = mergeStreamToolEvent(turn.currentEvents, event);
+  return null;
+}
+
+function completeOpenToolSegments(turn) {
+  for (const segment of turn.segments) {
+    if (segment.type !== "tools" || segment.status === "complete") continue;
+    segment.status = "complete";
+    segment.completedAt = new Date().toISOString();
+  }
+}
+
+function finishAgentSegment(segment, payload) {
+  const text = String(payload.text || segment.text || "").trim();
+  segment.text = text;
+  segment.thinking = String(segment.thinking || "").trim();
+  segment.status = "complete";
+  segment.stopReason = payload.stop_reason || "unknown";
+  segment.usage = payload.usage || null;
+  segment.completedAt = new Date().toISOString();
+}
+
+function appendStreamToolEvent(turn, event, sequence) {
+  const toolSegment = ensureToolSegment(turn, sequence);
+  toolSegment.events = mergeStreamToolEvent(toolSegment.events || [], event);
 }
 
 function isClaudeToolEvent(event) {
@@ -637,12 +739,6 @@ function streamToolInputKey(event) {
     event.payload?.tool_use_id ||
     `block:${event.payload?.content_block_index ?? "unknown"}`
   );
-}
-
-function latestFinishedToolUseTurn(turn) {
-  const latest = turn.finishedTurns[turn.finishedTurns.length - 1];
-  if (!latest || latest.stopReason !== "tool_use") return null;
-  return latest;
 }
 
 function markStreamCommittedInState(state) {

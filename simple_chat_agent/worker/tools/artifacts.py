@@ -35,7 +35,7 @@ class ArtifactProvider:
             "write, save, export, or create a file. The Python sandbox cannot "
             "persist files; use this tool for durable file output. Pass text "
             "content directly with encoding='text', or pass base64 content "
-            "with encoding='base64' for binary files."
+            "with encoding='base64' for binary files. File name should be the name of the file only without path - paths are not supported."
         ),
         tool_type=ToolType.MUTATING,
         pre_guards=["mutating_tool_approval"],
@@ -147,9 +147,7 @@ def _validate_artifact(*, name: str, mime_type: str, content: bytes) -> None:
     if not content:
         raise ValueError("Artifact content is empty.")
     if len(content) > MAX_ARTIFACT_BYTES:
-        raise ValueError(
-            f"Artifact is too large. Max bytes: {MAX_ARTIFACT_BYTES}."
-        )
+        raise ValueError(f"Artifact is too large. Max bytes: {MAX_ARTIFACT_BYTES}.")
 
 
 def _valid_mime_type(mime_type: str) -> bool:

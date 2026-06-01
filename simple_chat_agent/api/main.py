@@ -422,6 +422,39 @@ async def get_state(
     )
 
 
+@app.get("/api/sessions/{workflow_id}/state/patch")
+async def get_state_patch(
+    request: Request,
+    workflow_id: str,
+    response: Response,
+    after_revision: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    user = await _require_conversation_owner(request, workflow_id)
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        state = await _query_state(workflow_id)
+    except Exception as err:
+        if not _is_temporal_not_found(err):
+            raise
+        await _forget_conversation(user.user_id, workflow_id, user.username)
+        raise HTTPException(
+            status_code=404,
+            detail="Workflow execution not found. Start a new chat.",
+        ) from err
+
+    state_revision = int(state.state_revision or 0)
+    response.headers["X-State-Revision"] = str(state_revision)
+    if after_revision >= state_revision:
+        return {
+            "unchanged": True,
+            "state_revision": state_revision,
+        }
+    return {
+        "unchanged": False,
+        "state": _state_patch_to_dict(state),
+    }
+
+
 @app.get("/api/sessions/{workflow_id}/snapshot")
 async def get_snapshot(
     request: Request,
@@ -1728,6 +1761,20 @@ def _state_to_dict(
 
     if artifacts is not None:
         state_dict["artifacts"] = _artifact_dicts(artifacts)
+    return state_dict
+
+
+def _state_patch_to_dict(state: Any) -> dict[str, Any]:
+    state_dict = _state_to_dict(state)
+    for key in (
+        "transcript",
+        "transcript_offset",
+        "transcript_total",
+        "transcript_has_more_before",
+        "transcript_length",
+        "transcript_revision",
+    ):
+        state_dict.pop(key, None)
     return state_dict
 
 

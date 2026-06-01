@@ -10,6 +10,7 @@ import { artifactNeedsTextFetch, artifactPreviewKind } from "./utils/artifacts.j
 import { jsonHeaders, responseErrorText } from "./utils/http.js";
 import { mcpOAuthStartUrl } from "./utils/tools.js";
 import {
+  applyWorkflowStatePatchInState,
   agentSettingsFromConfig,
   applyTranscriptDeltasInState,
   createPendingMessage,
@@ -19,8 +20,8 @@ import {
   normalizeAgentSettings,
   prependTranscriptPageInState,
   saveAgentSettings,
-  streamEventNeedsDeferredWorkflowReconcile,
   streamEventNeedsSettledTranscriptDelta,
+  streamEventNeedsWorkflowStateRefresh,
   temporalUiUrl,
   updateWorkflowStateInState,
 } from "./state/chatState.js";
@@ -36,14 +37,18 @@ export default function App() {
   const stateRef = useRef(state);
   const messageRef = useRef("");
   const eventSourceRef = useRef(null);
+  const eventSourceTokenRef = useRef(0);
   const messagesRef = useRef(null);
   const pinnedToBottomRef = useRef(true);
   const stateLoadRequestRef = useRef(0);
   const restoreScrollAfterPrependRef = useRef(null);
   const olderMessagesRequestRef = useRef(false);
-  const deferredWorkflowReconcileTimerRef = useRef(null);
   const settledTranscriptTimerRef = useRef(null);
   const settledTranscriptRequestRef = useRef(0);
+  const workflowStateRefreshTimerRef = useRef(null);
+  const workflowStateRefreshRequestRef = useRef(0);
+  const streamEventBufferRef = useRef([]);
+  const streamEventFrameRef = useRef(null);
 
   useEffect(() => {
     stateRef.current = state;
@@ -54,8 +59,9 @@ export default function App() {
     boot(run);
     return () => {
       run.cancelled = true;
-      clearDeferredWorkflowReconcile();
       clearSettledTranscriptRefresh();
+      clearWorkflowStateRefresh();
+      clearStreamEventFlush();
       closeEventSource();
     };
   }, []);
@@ -91,7 +97,7 @@ export default function App() {
     }
     messages
       .querySelectorAll(
-        ".stream-current-turn .stream-text, .stream-current-turn .stream-thinking",
+        ".stream-current-turn .stream-text, .stream-current-turn .stream-thinking, .stream-agent-segment .stream-text, .stream-agent-segment .stream-thinking",
       )
       .forEach((node) => {
         node.scrollTop = node.scrollHeight;
@@ -149,26 +155,46 @@ export default function App() {
   }
 
   function closeEventSource() {
-    clearDeferredWorkflowReconcile();
+    eventSourceTokenRef.current += 1;
     clearSettledTranscriptRefresh();
+    clearWorkflowStateRefresh();
+    clearStreamEventFlush();
     if (!eventSourceRef.current) return;
     eventSourceRef.current.close();
     eventSourceRef.current = null;
   }
 
-  function clearDeferredWorkflowReconcile() {
-    if (!deferredWorkflowReconcileTimerRef.current) return;
-    clearTimeout(deferredWorkflowReconcileTimerRef.current);
-    deferredWorkflowReconcileTimerRef.current = null;
+  function clearStreamEventFlush() {
+    streamEventBufferRef.current = [];
+    if (streamEventFrameRef.current === null) return;
+    window.cancelAnimationFrame(streamEventFrameRef.current);
+    streamEventFrameRef.current = null;
   }
 
-  function scheduleDeferredWorkflowReconcile(workflowId) {
-    clearDeferredWorkflowReconcile();
-    deferredWorkflowReconcileTimerRef.current = setTimeout(() => {
-      deferredWorkflowReconcileTimerRef.current = null;
-      if (document.hidden || stateRef.current.workflowId !== workflowId) return;
-      reconcileWorkflow(workflowId);
-    }, 900);
+  function enqueueStreamEvent(workflowId, event) {
+    streamEventBufferRef.current.push({ workflowId, event });
+    if (streamEventFrameRef.current !== null) return;
+    streamEventFrameRef.current = window.requestAnimationFrame(flushStreamEvents);
+  }
+
+  function flushStreamEvents() {
+    streamEventFrameRef.current = null;
+    const pending = streamEventBufferRef.current;
+    streamEventBufferRef.current = [];
+    if (!pending.length) return;
+
+    setState((previous) => {
+      let next = previous;
+      for (const { workflowId, event } of pending) {
+        if (workflowId && next.workflowId !== workflowId) continue;
+        next = handleStreamEventInState(next, event);
+      }
+      return next;
+    });
+
+    if (streamEventBufferRef.current.length) {
+      streamEventFrameRef.current = window.requestAnimationFrame(flushStreamEvents);
+    }
   }
 
   function clearSettledTranscriptRefresh() {
@@ -187,6 +213,27 @@ export default function App() {
       refreshSettledTranscriptDeltas(workflowId, { attempt }).catch((error) => {
         if (stateRef.current.workflowId !== workflowId) return;
         setStatusNotice(`settled transcript failed: ${error}`);
+      });
+    }, delay);
+  }
+
+  function clearWorkflowStateRefresh() {
+    workflowStateRefreshRequestRef.current += 1;
+    if (!workflowStateRefreshTimerRef.current) return;
+    clearTimeout(workflowStateRefreshTimerRef.current);
+    workflowStateRefreshTimerRef.current = null;
+  }
+
+  function scheduleWorkflowStateRefresh(workflowId, options = {}) {
+    clearWorkflowStateRefresh();
+    const attempt = options.attempt || 0;
+    const delay = options.delay ?? 250;
+    workflowStateRefreshTimerRef.current = setTimeout(() => {
+      workflowStateRefreshTimerRef.current = null;
+      if (document.hidden || stateRef.current.workflowId !== workflowId) return;
+      refreshWorkflowStatePatch(workflowId, { attempt }).catch((error) => {
+        if (stateRef.current.workflowId !== workflowId) return;
+        setStatusNotice(`state refresh failed: ${error}`);
       });
     }, delay);
   }
@@ -529,9 +576,61 @@ export default function App() {
     }
   }
 
+  async function refreshWorkflowStatePatch(workflowId, options = {}) {
+    const current = stateRef.current;
+    const afterRevision = Number(current.workflowState?.state_revision || 0);
+    const requestId = ++workflowStateRefreshRequestRef.current;
+    const response = await fetch(
+      `/api/sessions/${encodeURIComponent(workflowId)}/state/patch?after_revision=${afterRevision}`,
+      {
+        headers: { "Cache-Control": "no-cache" },
+      },
+    );
+    if (response.status === 401) {
+      showLogin();
+      return;
+    }
+    if (response.status === 404) {
+      await handleMissingWorkflow();
+      return;
+    }
+    if (!response.ok) throw new Error(await responseErrorText(response));
+
+    const body = await response.json();
+    if (
+      stateRef.current.workflowId !== workflowId ||
+      requestId !== workflowStateRefreshRequestRef.current
+    ) {
+      return;
+    }
+
+    const patch = body.state || {};
+    if (!body.unchanged) {
+      setState((previous) =>
+        previous.workflowId === workflowId
+          ? applyWorkflowStatePatchInState(previous, patch)
+          : previous,
+      );
+    }
+
+    const pendingApprovals = patch.pending_approvals || [];
+    const visibleApprovals = stateRef.current.workflowState?.pending_approvals || [];
+    if (
+      pendingApprovals.length === 0 &&
+      visibleApprovals.length === 0 &&
+      (options.attempt || 0) < 5
+    ) {
+      scheduleWorkflowStateRefresh(workflowId, {
+        attempt: (options.attempt || 0) + 1,
+        delay: 400,
+      });
+    }
+  }
+
   function connectEvents(workflowId, options = {}) {
     if (!workflowId) return;
     closeEventSource();
+    const eventSourceToken = eventSourceTokenRef.current;
     const params = new URLSearchParams();
     if (options.cursor) params.set("cursor", options.cursor);
     const query = params.toString();
@@ -539,30 +638,44 @@ export default function App() {
       `/api/sessions/${encodeURIComponent(workflowId)}/events${query ? `?${query}` : ""}`,
     );
     eventSourceRef.current = eventSource;
+    function isCurrentEventSource() {
+      return (
+        eventSourceRef.current === eventSource &&
+        eventSourceTokenRef.current === eventSourceToken &&
+        stateRef.current.workflowId === workflowId
+      );
+    }
     eventSource.addEventListener("state", (event) => {
+      if (!isCurrentEventSource()) return;
       const nextState = JSON.parse(event.data);
       setState((previous) => updateWorkflowStateInState(previous, nextState));
     });
     eventSource.addEventListener("stream", (event) => {
+      if (!isCurrentEventSource()) return;
       const streamEvent = JSON.parse(event.data);
-      clearDeferredWorkflowReconcile();
-      setState((previous) => handleStreamEventInState(previous, streamEvent));
+      enqueueStreamEvent(workflowId, streamEvent);
+      if (streamEvent.kind === "claude_start") {
+        clearWorkflowStateRefresh();
+      }
       if (streamEventNeedsSettledTranscriptDelta(streamEvent)) {
         scheduleSettledTranscriptRefresh(workflowId);
       }
-      if (streamEventNeedsDeferredWorkflowReconcile(streamEvent)) {
-        scheduleDeferredWorkflowReconcile(workflowId);
+      if (streamEventNeedsWorkflowStateRefresh(streamEvent)) {
+        scheduleWorkflowStateRefresh(workflowId);
       }
     });
     eventSource.addEventListener("missing", () => {
+      if (!isCurrentEventSource()) return;
       handleMissingWorkflow();
     });
     eventSource.addEventListener("reconcile", () => {
+      if (!isCurrentEventSource()) return;
       if (stateRef.current.workflowId === workflowId) {
         reconcileWorkflow(workflowId);
       }
     });
     eventSource.addEventListener("error", () => {
+      if (!isCurrentEventSource()) return;
       setState((previous) =>
         previous.statusNotice === "event stream reconnecting..."
           ? previous
