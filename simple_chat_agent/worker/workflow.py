@@ -639,33 +639,37 @@ class SimpleChatWorkflow:
         while True:
             settle_after_revision = self._active_settle_after_revision
             if resume_agent_state is None:
+                if (
+                    workflow.all_handlers_finished()
+                    and self._runtime_checkpoint_requested()
+                ):
+                    await self._continue_as_new(chat_input, None)
                 if self._checkpoint_due() and workflow.all_handlers_finished():
                     if self._touched_this_run:
-                        workflow.continue_as_new(
-                            await self._continue_as_new_input(chat_input, None),
-                            initial_versioning_behavior=(
-                                workflow.ContinueAsNewVersioningBehavior.AUTO_UPGRADE
-                            ),
-                        )
+                        await self._continue_as_new(chat_input, None)
                     return
                 try:
                     await workflow.wait_condition(
                         lambda: self._delete_requested
-                        or len(self._pending_messages) > 0,
+                        or len(self._pending_messages) > 0
+                        or (
+                            workflow.all_handlers_finished()
+                            and self._runtime_checkpoint_requested()
+                        ),
                         timeout=self._time_until_checkpoint(),
                     )
                 except asyncio.TimeoutError:
                     pass
                 if self._delete_requested:
                     return
+                if (
+                    workflow.all_handlers_finished()
+                    and self._runtime_checkpoint_requested()
+                ):
+                    await self._continue_as_new(chat_input, None)
                 if self._checkpoint_due() and workflow.all_handlers_finished():
                     if self._touched_this_run:
-                        workflow.continue_as_new(
-                            await self._continue_as_new_input(chat_input, None),
-                            initial_versioning_behavior=(
-                                workflow.ContinueAsNewVersioningBehavior.AUTO_UPGRADE
-                            ),
-                        )
+                        await self._continue_as_new(chat_input, None)
                     return
                 if not self._pending_messages:
                     continue
@@ -729,15 +733,7 @@ class SimpleChatWorkflow:
                 if should_emit_settled:
                     await self._emit_turn_settled(settle_after_revision)
             if continue_as_new_state is not None:
-                workflow.continue_as_new(
-                    await self._continue_as_new_input(
-                        chat_input,
-                        continue_as_new_state,
-                    ),
-                    initial_versioning_behavior=(
-                        workflow.ContinueAsNewVersioningBehavior.AUTO_UPGRADE
-                    ),
-                )
+                await self._continue_as_new(chat_input, continue_as_new_state)
 
     def _touch(self) -> None:
         self._last_touched_at = workflow.now()
@@ -747,6 +743,13 @@ class SimpleChatWorkflow:
         if self._run_started_at is None:
             return False
         return workflow.now() >= self._run_started_at + CHAT_WORKFLOW_RUN_TTL
+
+    def _runtime_checkpoint_requested(self) -> bool:
+        info = workflow.info()
+        return (
+            info.is_continue_as_new_suggested()
+            or info.is_target_worker_deployment_version_changed()
+        )
 
     def _time_until_checkpoint(self) -> timedelta:
         if self._run_started_at is None:
@@ -1016,6 +1019,18 @@ class SimpleChatWorkflow:
                 self._last_touched_at.isoformat()
                 if self._last_touched_at is not None
                 else chat_input.last_touched_at
+            ),
+        )
+
+    async def _continue_as_new(
+        self,
+        chat_input: SimpleChatInput,
+        agent_state: AgentState | None,
+    ) -> None:
+        workflow.continue_as_new(
+            await self._continue_as_new_input(chat_input, agent_state),
+            initial_versioning_behavior=(
+                workflow.ContinueAsNewVersioningBehavior.AUTO_UPGRADE
             ),
         )
 

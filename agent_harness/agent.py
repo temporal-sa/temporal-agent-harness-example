@@ -531,9 +531,13 @@ class Agent:
             )
 
     def _should_return_continue_as_new(self) -> bool:
+        info = workflow.info()
         return (
             self._continue_as_new_policy.enabled
-            and workflow.info().is_continue_as_new_suggested()
+            and (
+                info.is_continue_as_new_suggested()
+                or info.is_target_worker_deployment_version_changed()
+            )
         )
 
     async def _execute_tool(
