@@ -1,0 +1,17 @@
+aws_region = "us-west-1"
+
+github_owner      = "temporal-sa"
+github_repository = "temporal-agent-harness-example"
+
+github_environments = [
+  "testing",
+  "production",
+  "infra",
+]
+
+state_key_prefix = "temporal-agent-harness-example"
+
+ecr_repository_name = "temporal-michaelj-agent-harness-demo"
+eks_cluster_name    = "sa-demo"
+
+github_actions_eks_access_namespace = "temporal-agent-harness"

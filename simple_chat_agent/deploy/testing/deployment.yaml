@@ -117,6 +117,8 @@ spec:
               value: http://agent-harness-searxng.temporal-michaelj-agent-harness-demo.svc.cluster.local:8080
             - name: GITHUB_OAUTH_REDIRECT_URI
               value: https://agent-harness-demo.testing.tmprl-demo.cloud/oauth/github/callback
+            - name: GOOGLE_OAUTH_REDIRECT_URI
+              value: https://agent-harness-demo.testing.tmprl-demo.cloud/oauth/google/callback
             # --- test isolation ---
             - name: SIMPLE_CHAT_TASK_QUEUE
               value: simple-chat-agent-testing
@@ -125,7 +127,7 @@ spec:
             - name: SIMPLE_CHAT_WORKFLOW_PREFIX
               value: testing-
             - name: SIMPLE_CHAT_DEMO_WORKSPACES_ENABLED
-              value: "1"
+              value: "0"
             - name: SIMPLE_CHAT_DEMO_WORKSPACE_HOST_SUFFIX
               value: -agent-harness-demo.testing.tmprl-demo.cloud
             - name: SIMPLE_CHAT_DEMO_SOURCE_NAMESPACE
@@ -135,7 +137,7 @@ spec:
             - name: SIMPLE_CHAT_DEMO_TLS_SECRET_NAME
               value: agent-harness-workspace-testing-tls
             - name: SIMPLE_CHAT_DEMO_WORKSPACE_ROLE_ARN
-              value: arn:aws:iam::429214323166:role/temporal-michaelj-agent-harness-demo-worker-testing
+              value: arn:aws:iam::429214323166:role/temporal-agent-harness-testing-worker
             - name: SIMPLE_CHAT_DEMO_SOURCE_WEB_DEPLOYMENT
               value: agent-harness-web-testing
             - name: SIMPLE_CHAT_DEMO_SOURCE_API_DEPLOYMENT

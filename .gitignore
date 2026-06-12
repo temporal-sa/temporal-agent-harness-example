@@ -46,6 +46,24 @@ node_modules/
 simple_chat_agent/frontend/node_modules/
 simple_chat_agent/frontend/static/dist/
 
+# terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+!.tfvars.example
+*.tfplan
+*.plan
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+crash.log
+crash.*.log
+
 # IDE
 .vscode/
 .idea/

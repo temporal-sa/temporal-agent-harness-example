@@ -1,0 +1,5 @@
+aws_region       = "us-west-1"
+eks_cluster_name = "sa-demo"
+
+github_actions_role_arn = "arn:aws:iam::429214323166:role/temporal-agent-harness-example-github-actions"
+kubernetes_namespace    = "temporal-agent-harness"

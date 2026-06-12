@@ -1,0 +1,97 @@
+name: Deploy Testing
+
+# Temporary rollout policy:
+# - manual only;
+# - no push / pull_request triggers;
+# - no production environment jobs until the testing deployment path is proven.
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Optional image tag override.
+        type: string
+        required: false
+      build_image:
+        description: Build and push the app image before rollout.
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-testing
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy Testing
+    runs-on: ubuntu-latest
+    environment: testing
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-west-1' }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'temporal-michaelj-agent-harness-demo' }}
+      EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME || 'sa-demo' }}
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE || 'temporal-agent-harness' }}
+      IMAGE_TAG: ${{ inputs.image_tag || format('testing-{0}-{1}', github.sha, github.run_number) }}
+      BUILD_IMAGE: ${{ inputs.build_image && '1' || '0' }}
+      CREATE_NAMESPACE: "0"
+      REFRESH_S3_LIFECYCLE: "0"
+
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
+      ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+      ANTHROPIC_MODEL_OPTIONS: ${{ vars.ANTHROPIC_MODEL_OPTIONS }}
+      ANTHROPIC_MODEL_CACHE_SECONDS: ${{ vars.ANTHROPIC_MODEL_CACHE_SECONDS }}
+
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      GOOGLE_OAUTH_ALLOWED_DOMAIN: ${{ vars.GOOGLE_OAUTH_ALLOWED_DOMAIN }}
+      GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+
+      GITHUB_OAUTH_CLIENT_ID: ${{ secrets.APP_GITHUB_OAUTH_CLIENT_ID }}
+      GITHUB_OAUTH_CLIENT_SECRET: ${{ secrets.APP_GITHUB_OAUTH_CLIENT_SECRET }}
+      GITHUB_OAUTH_REDIRECT_URI: ${{ secrets.APP_GITHUB_OAUTH_REDIRECT_URI }}
+      GITHUB_OAUTH_SCOPES: ${{ secrets.APP_GITHUB_OAUTH_SCOPES }}
+
+      SIMPLE_CHAT_CODEC_AUTH_ENABLED: ${{ vars.SIMPLE_CHAT_CODEC_AUTH_ENABLED }}
+      SIMPLE_CHAT_CODEC_ALLOWED_ORIGINS: ${{ vars.SIMPLE_CHAT_CODEC_ALLOWED_ORIGINS }}
+      SIMPLE_CHAT_GOOD_PLACE: ${{ vars.SIMPLE_CHAT_GOOD_PLACE }}
+      SIMPLE_CHAT_JWT_SECRET: ${{ secrets.SIMPLE_CHAT_JWT_SECRET }}
+      SIMPLE_CHAT_LOCAL_AUTH_ENABLED: ${{ vars.SIMPLE_CHAT_LOCAL_AUTH_ENABLED }}
+      SIMPLE_CHAT_LOCAL_AUTH_USERNAME: ${{ secrets.SIMPLE_CHAT_LOCAL_AUTH_USERNAME }}
+      SIMPLE_CHAT_LOCAL_AUTH_PASSWORD: ${{ secrets.SIMPLE_CHAT_LOCAL_AUTH_PASSWORD }}
+      SIMPLE_CHAT_STREAM_TOKEN: ${{ secrets.SIMPLE_CHAT_STREAM_TOKEN }}
+
+      TEMPORAL_API_KEY: ${{ secrets.TEMPORAL_API_KEY }}
+      TEMPORAL_ENDPOINT: ${{ vars.TEMPORAL_ENDPOINT }}
+      TEMPORAL_NAMESPACE: ${{ vars.TEMPORAL_NAMESPACE }}
+      TEMPORAL_TLS: ${{ vars.TEMPORAL_TLS || 'true' }}
+      TEMPORAL_UI_URL: ${{ vars.TEMPORAL_UI_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-deploy-testing-${{ github.run_id }}
+
+      - name: Configure kubeconfig
+        run: aws eks update-kubeconfig --name "${EKS_CLUSTER_NAME}" --region "${AWS_REGION}"
+
+      - name: Show deployment target
+        run: |
+          kubectl version --client=true
+          kubectl auth can-i get deployments.apps --namespace "${K8S_NAMESPACE}"
+          echo "Deploying ${ECR_REPOSITORY}:${IMAGE_TAG} to namespace ${K8S_NAMESPACE}"
+
+      - name: Deploy testing
+        run: ./simple_chat_agent/deploy/testing/deploy-testing.sh
