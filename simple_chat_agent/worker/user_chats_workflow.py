@@ -159,9 +159,7 @@ class UserChatsWorkflow:
         # Restore registry state (carried across continue-as-new). Empty on a
         # first start; the chat/MCP updates that follow repopulate it on replay.
         self._chats = {chat.workflow_id: chat for chat in request.chats}
-        self._mcp_servers = {
-            server.server_id: server for server in request.mcp_servers
-        }
+        self._mcp_servers = {server.server_id: server for server in request.mcp_servers}
         self._demo_workspace = request.demo_workspace
 
         # This entity workflow receives updates on every chat create/touch/forget
@@ -172,10 +170,12 @@ class UserChatsWorkflow:
             try:
                 await workflow.wait_condition(
                     lambda: (
-                        workflow.info().is_continue_as_new_suggested()
-                        or self._checkpoint_due()
-                    )
-                    and workflow.all_handlers_finished(),
+                        (
+                            workflow.info().is_continue_as_new_suggested()
+                            or self._checkpoint_due()
+                        )
+                        and workflow.all_handlers_finished()
+                    ),
                     timeout=self._time_until_checkpoint(),
                 )
             except asyncio.TimeoutError:
