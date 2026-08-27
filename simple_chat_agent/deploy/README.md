@@ -144,9 +144,12 @@ rollout, and refreshes the S3 lifecycle policy.
 
 ## Testing Stack
 
-The testing stack lives alongside production in the same Kubernetes namespace
-but uses separate Deployment names, hostnames, workflow prefixes, task queues,
-and environment overrides.
+The testing deploy script supports two targets. With no overrides, the stack
+lives alongside production in the existing namespace but uses separate
+Deployment names, hostnames, workflow prefixes, task queues, and environment
+overrides. Setting `K8S_NAMESPACE` selects the isolated-namespace path used by
+the manual `Deploy Testing` GitHub Actions workflow and the Terraform resources
+under `infra/stacks/testing-runtime`.
 
 Use:
 
@@ -157,15 +160,19 @@ Use:
 The testing script:
 
 1. builds the current branch into a `testing-<timestamp>` image tag;
-2. creates the workspace-executor authentication secret when absent;
-3. applies the shared internal SearXNG manifest;
-4. applies testing-specific web/API/worker/executor manifests;
+2. creates the app secret for an isolated namespace and the workspace-executor
+   authentication secret when absent;
+3. renders namespace-specific manifests and selects service accounts that match
+   the target namespace's IRSA roles;
+4. applies SearXNG, Redis, and testing-specific web/API/worker/executor
+   manifests;
 5. rolls out the testing Deployments;
-6. refreshes the S3 lifecycle policy.
+6. refreshes the S3 lifecycle policy for the default shared-namespace path.
 
-Both rollout scripts use the explicit `sa-demo` kubectl context; they do not
-depend on whichever context happens to be current. Each rollout also sets a
-unique timestamp-based Temporal Worker Deployment build ID.
+Local rollout scripts default to the explicit `sa-demo` kubectl context; they
+do not depend on whichever context happens to be current. The GitHub Actions
+workflow clears `KUBE_CONTEXT` after configuring its own kubeconfig. Each
+rollout also sets a unique timestamp-based Temporal Worker Deployment build ID.
 
 The testing URL is:
 

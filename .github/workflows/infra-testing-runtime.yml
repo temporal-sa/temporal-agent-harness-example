@@ -1,0 +1,70 @@
+name: Infra Testing Runtime
+
+# Temporary rollout policy:
+# - manual only;
+# - no push / pull_request triggers;
+# - no production environment jobs until the testing deployment path is proven.
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Apply the planned changes.
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: infra-testing-runtime
+  cancel-in-progress: false
+
+jobs:
+  terraform:
+    name: Terraform Testing Runtime
+    runs-on: ubuntu-latest
+    environment: infra
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-west-1' }}
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_aws_region: ${{ vars.AWS_REGION || 'us-west-1' }}
+      TF_VAR_kubernetes_namespace: ${{ vars.K8S_NAMESPACE || 'temporal-agent-harness' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-infra-testing-runtime-${{ github.run_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: 1.15.6
+
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive infra
+
+      - name: Terraform init
+        working-directory: infra/stacks/testing-runtime
+        run: terraform init
+
+      - name: Terraform validate
+        working-directory: infra/stacks/testing-runtime
+        run: terraform validate
+
+      - name: Terraform plan
+        working-directory: infra/stacks/testing-runtime
+        run: terraform plan -out=tfplan
+
+      - name: Terraform apply
+        if: ${{ inputs.apply }}
+        working-directory: infra/stacks/testing-runtime
+        run: terraform apply -auto-approve tfplan

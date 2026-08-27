@@ -21,16 +21,22 @@ from temporalio.client import Client
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.service import RPCError, RPCStatusCode
 
-from agent_harness.providers.claude import (
-    DEFAULT_THINKING_BUDGET_TOKENS,
-    MIN_THINKING_BUDGET_TOKENS,
-)
 from agent_harness.mcp import (
     configure_mcp_auth_resolver,
     configure_mcp_http_auth_resolver,
 )
 from agent_harness.mcp_types import HttpMcpServerConfig
+from agent_harness.providers.claude import (
+    DEFAULT_THINKING_BUDGET_TOKENS,
+    MIN_THINKING_BUDGET_TOKENS,
+)
 from simple_chat_agent import TASK_QUEUE
+from simple_chat_agent.api.anthropic_models import (
+    EFFORT_ORDER,
+    default_effort,
+    default_thinking_mode,
+    get_anthropic_model_catalog,
+)
 from simple_chat_agent.api.auth import (
     DEFAULT_SESSION_SECONDS,
     SESSION_COOKIE,
@@ -41,24 +47,13 @@ from simple_chat_agent.api.auth import (
     user_from_local_username,
     user_from_session_token,
 )
-from simple_chat_agent.common.env import load_dotenv
-from simple_chat_agent.common.external_storage import (
-    purge_workflow_payloads,
-    simple_chat_data_converter,
-)
-from simple_chat_agent.api.github_oauth import (
-    GITHUB_PROVIDER,
-)
 from simple_chat_agent.api.features import (
     demo_workspace_mode,
     demo_workspaces_enabled,
     github_tools_enabled,
 )
-from simple_chat_agent.api.anthropic_models import (
-    EFFORT_ORDER,
-    default_effort,
-    default_thinking_mode,
-    get_anthropic_model_catalog,
+from simple_chat_agent.api.github_oauth import (
+    GITHUB_PROVIDER,
 )
 from simple_chat_agent.api.google_oauth import (
     GOOGLE_PROVIDER,
@@ -74,13 +69,13 @@ from simple_chat_agent.api.local_auth import (
     local_auth_credentials_valid,
     local_auth_requested,
 )
-from simple_chat_agent.api.routes.sessions import (
-    SessionRouteDeps,
-    create_sessions_router,
-)
 from simple_chat_agent.api.routes.demo_workspace import (
     DemoWorkspaceRouteDeps,
     create_demo_workspace_router,
+)
+from simple_chat_agent.api.routes.sessions import (
+    SessionRouteDeps,
+    create_sessions_router,
 )
 from simple_chat_agent.api.routes.tools import (
     ToolRouteDeps,
@@ -88,6 +83,11 @@ from simple_chat_agent.api.routes.tools import (
 )
 from simple_chat_agent.api.streaming import StreamBroker
 from simple_chat_agent.api.temporal_ui import temporal_ui_user_workflows_url
+from simple_chat_agent.common.env import load_dotenv
+from simple_chat_agent.common.external_storage import (
+    purge_workflow_payloads,
+    simple_chat_data_converter,
+)
 from simple_chat_agent.common.mcp_auth import (
     resolve_mcp_auth_headers,
     resolve_mcp_http_auth,
@@ -118,7 +118,6 @@ from simple_chat_agent.worker.workflow import (
     TranscriptDeltaResult,
     TranscriptPage,
 )
-
 
 load_dotenv()
 
@@ -203,7 +202,9 @@ async def config(request: Request) -> dict[str, Any]:
             "mode": default_thinking_mode(default_model),
             "mode_options": list(default_model.thinking_modes if default_model else ()),
             "effort": default_effort(default_model),
-            "effort_options": list(default_model.effort_options if default_model else EFFORT_ORDER),
+            "effort_options": list(
+                default_model.effort_options if default_model else EFFORT_ORDER
+            ),
         },
         "features": {
             "demo_workspace": demo_workspace_mode(),
@@ -217,7 +218,9 @@ async def config(request: Request) -> dict[str, Any]:
 async def google_auth_configured() -> dict[str, Any]:
     configured = google_oauth_configured()
     if demo_workspace_mode():
-        configured = bool(os.environ.get("SIMPLE_CHAT_DEMO_PARENT_PUBLIC_URL", "").strip())
+        configured = bool(
+            os.environ.get("SIMPLE_CHAT_DEMO_PARENT_PUBLIC_URL", "").strip()
+        )
     return {
         "configured": configured,
         "allowed_domain": google_allowed_domain(),
@@ -662,8 +665,12 @@ def _demo_workspace_config(user: AuthenticatedUser) -> DemoWorkspaceConfig:
         source_namespace = _pod_namespace() or "temporal-michaelj-agent-harness-demo"
 
     testing_defaults = TASK_QUEUE.endswith("-testing") or "testing" in TASK_QUEUE
-    default_web = "agent-harness-web-testing" if testing_defaults else "agent-harness-web"
-    default_api = "agent-harness-api-testing" if testing_defaults else "agent-harness-api"
+    default_web = (
+        "agent-harness-web-testing" if testing_defaults else "agent-harness-web"
+    )
+    default_api = (
+        "agent-harness-api-testing" if testing_defaults else "agent-harness-api"
+    )
     default_worker = (
         "agent-harness-worker-testing" if testing_defaults else "agent-harness-worker"
     )
@@ -737,7 +744,13 @@ def _allowed_demo_workspace_return_to(value: str) -> str:
     parsed = urlparse(value)
     if parsed.scheme != "https" or not parsed.netloc:
         return ""
-    if parsed.username or parsed.password or parsed.params or parsed.query or parsed.fragment:
+    if (
+        parsed.username
+        or parsed.password
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
         return ""
 
     host_suffix = os.environ.get(
@@ -758,42 +771,58 @@ def _allowed_demo_workspace_return_to(value: str) -> str:
 
 
 async def _register_demo_workspace_chat(conversation: ChatRecord) -> None:
-    parent_workflow_id = os.environ.get("SIMPLE_CHAT_DEMO_PARENT_WORKFLOW_ID", "").strip()
+    parent_workflow_id = os.environ.get(
+        "SIMPLE_CHAT_DEMO_PARENT_WORKFLOW_ID", ""
+    ).strip()
     if not parent_workflow_id:
         return
     try:
-        await _client().get_workflow_handle(parent_workflow_id).signal(
-            DemoWorkspaceWorkflow.register_chat,
-            WorkspaceChatRecord(
-                workflow_id=conversation.workflow_id,
-                run_id=conversation.run_id,
-                task_queue=conversation.task_queue,
-            ),
+        await (
+            _client()
+            .get_workflow_handle(parent_workflow_id)
+            .signal(
+                DemoWorkspaceWorkflow.register_chat,
+                WorkspaceChatRecord(
+                    workflow_id=conversation.workflow_id,
+                    run_id=conversation.run_id,
+                    task_queue=conversation.task_queue,
+                ),
+            )
         )
     except Exception as err:  # noqa: BLE001 - parent tracking is best-effort
         print(f"Failed to register demo workspace chat: {err!r}")
 
 
 async def _unregister_demo_workspace_chat(workflow_id: str) -> None:
-    parent_workflow_id = os.environ.get("SIMPLE_CHAT_DEMO_PARENT_WORKFLOW_ID", "").strip()
+    parent_workflow_id = os.environ.get(
+        "SIMPLE_CHAT_DEMO_PARENT_WORKFLOW_ID", ""
+    ).strip()
     if not parent_workflow_id:
         return
     try:
-        await _client().get_workflow_handle(parent_workflow_id).signal(
-            DemoWorkspaceWorkflow.unregister_chat,
-            workflow_id,
+        await (
+            _client()
+            .get_workflow_handle(parent_workflow_id)
+            .signal(
+                DemoWorkspaceWorkflow.unregister_chat,
+                workflow_id,
+            )
         )
     except Exception as err:  # noqa: BLE001 - parent tracking is best-effort
         print(f"Failed to unregister demo workspace chat: {err!r}")
 
 
 async def _touch_demo_workspace() -> None:
-    parent_workflow_id = os.environ.get("SIMPLE_CHAT_DEMO_PARENT_WORKFLOW_ID", "").strip()
+    parent_workflow_id = os.environ.get(
+        "SIMPLE_CHAT_DEMO_PARENT_WORKFLOW_ID", ""
+    ).strip()
     if not parent_workflow_id:
         return
     try:
-        await _client().get_workflow_handle(parent_workflow_id).signal(
-            DemoWorkspaceWorkflow.touch_workspace
+        await (
+            _client()
+            .get_workflow_handle(parent_workflow_id)
+            .signal(DemoWorkspaceWorkflow.touch_workspace)
         )
     except Exception as err:  # noqa: BLE001 - parent tracking is best-effort
         print(f"Failed to touch demo workspace: {err!r}")
@@ -801,9 +830,11 @@ async def _touch_demo_workspace() -> None:
 
 def _pod_namespace() -> str:
     try:
-        return Path(
-            "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
-        ).read_text(encoding="utf-8").strip()
+        return (
+            Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
     except OSError:
         return ""
 

@@ -25,6 +25,11 @@ simple_chat_agent/frontend/static/dist/
 .DS_Store
 **/.DS_Store
 
+# Infra-as-code and Terraform local state / provider downloads (not needed at runtime)
+infra/
+**/.terraform/
+**/*.tfstate*
+
 # Deploy artifacts and docs not needed at runtime
 deploy/
 **/deploy/
