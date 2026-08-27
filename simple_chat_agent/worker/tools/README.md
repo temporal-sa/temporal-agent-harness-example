@@ -77,7 +77,7 @@ workflow and waits for the UI to approve or reject the requested tool call.
 | `github.py` | `github_authenticated_user`, `github_list_repositories`, `github_list_issues`, `github_open_issue`. |
 | `workspace_shell.py` | `workspace_shell` runs Bash, Python, and other commands through the credential-free workspace executor. It also retains a hidden `python_sandbox` compatibility alias. |
 | `research.py` | Optional SearXNG and Google-backed research tools. |
-| `subagent.py` | `create_subagent` starts a child agent workflow for delegated work. |
+| `subagent.py` | `create_subagent` starts a child agent workflow for delegated work. Every child receives the tool and can delegate recursively; approvals remain anchored to the main chat workflow. |
 | `approval.py` | Approval guard, not a user-visible tool. |
 
 Dynamic HTTP MCP tools are registered by `AppToolSet._sync_mcp_tools()` from the

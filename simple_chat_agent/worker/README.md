@@ -50,7 +50,10 @@ a `ClaudeAgent` for chat workflows.
 - `SimpleChatWorkflow`: one chat conversation.
 - `UserChatsWorkflow`: one user registry, including chat list, MCP server
   configuration, and demo workspace record.
-- `SubagentWorkflow`: child agent workflow used by the `create_subagent` tool.
+- `SubagentWorkflow`: recursively delegating child agent workflow used by the
+  `create_subagent` tool. Every descendant keeps the main chat workflow as its
+  approval and artifact authority while recording its immediate delegator for
+  stream lineage.
 - `DemoWorkspaceWorkflow`: controller for temporary demo workspaces.
 
 The worker also registers the provider activity, generic tool and guard
