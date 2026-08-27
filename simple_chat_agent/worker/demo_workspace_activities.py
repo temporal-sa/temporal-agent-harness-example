@@ -463,6 +463,10 @@ def _common_env(request: ProvisionDemoWorkspaceRequest) -> list[dict[str, Any]]:
     }
     if os.environ.get("SIMPLE_CHAT_S3_BUCKET"):
         values["SIMPLE_CHAT_S3_BUCKET"] = os.environ["SIMPLE_CHAT_S3_BUCKET"]
+    if os.environ.get("SIMPLE_CHAT_ARTIFACTS_TABLE"):
+        values["SIMPLE_CHAT_ARTIFACTS_TABLE"] = os.environ[
+            "SIMPLE_CHAT_ARTIFACTS_TABLE"
+        ]
     if os.environ.get("SIMPLE_CHAT_EXTERNAL_STORAGE_THRESHOLD_BYTES"):
         values["SIMPLE_CHAT_EXTERNAL_STORAGE_THRESHOLD_BYTES"] = os.environ[
             "SIMPLE_CHAT_EXTERNAL_STORAGE_THRESHOLD_BYTES"

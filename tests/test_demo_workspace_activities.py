@@ -52,6 +52,44 @@ class DemoWorkspaceRedisTests(unittest.TestCase):
             "redis://:$(SIMPLE_CHAT_STREAM_TOKEN)@agent-harness-redis:6379/0",
         )
 
+    def test_workspace_env_wires_durable_artifacts_without_oauth_table(self) -> None:
+        request = ProvisionDemoWorkspaceRequest(
+            namespace="workspace-1",
+            temporal_namespace="namespace",
+            host="workspace.example.com",
+            url="https://workspace.example.com",
+            task_queue="workspace-queue",
+            workflow_prefix="workspace-",
+            control_workflow_id="controller",
+            parent_public_url="https://parent.example.com",
+            source_namespace="source",
+            source_secret_name="source-secret",
+            tls_secret_name="source-tls",
+            source_web_deployment="web",
+            source_api_deployment="api",
+            source_worker_deployment="worker",
+            user_email="user@example.com",
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "SIMPLE_CHAT_S3_BUCKET": "artifact-bucket",
+                "SIMPLE_CHAT_ARTIFACTS_TABLE": "artifact-table",
+                "SIMPLE_CHAT_DYNAMODB_TABLE": "oauth-table",
+            },
+            clear=True,
+        ):
+            env = _common_env(request)
+
+        values = {
+            item["name"]: item["value"]
+            for item in env
+            if "value" in item
+        }
+        self.assertEqual(values["SIMPLE_CHAT_S3_BUCKET"], "artifact-bucket")
+        self.assertEqual(values["SIMPLE_CHAT_ARTIFACTS_TABLE"], "artifact-table")
+        self.assertNotIn("SIMPLE_CHAT_DYNAMODB_TABLE", values)
+
     def test_workspace_redis_is_password_protected_and_ephemeral(self) -> None:
         deployment = _redis_deployment("workspace-1")
         pod_spec = deployment["spec"]["template"]["spec"]
