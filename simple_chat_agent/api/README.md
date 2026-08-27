@@ -70,9 +70,14 @@ The primary workflow interactions are:
 - update `DemoWorkspaceWorkflow` when creating, crashing, or deleting isolated
   demo workspaces.
 
-The API validates ownership before exposing a workflow to the current user. If a
-workflow is gone, it removes stale registry and artifact metadata where
-appropriate and returns a clean 404 to the UI.
+The API validates ownership before exposing a workflow to the current user. It
+describes the chat through Temporal and verifies that its parent is the current
+user's deterministic `UserChatsWorkflow`; this service-side check remains
+available when no worker is polling. Signal routes then send by workflow ID, and
+registry touch bookkeeping is also a Signal, so worker outages do not prevent
+Temporal from accepting interactive input. If a workflow is gone, the API
+removes stale registry and artifact metadata where appropriate and returns a
+clean 404 to the UI.
 
 ## Snapshot, Delta, And Stream Reconciliation
 

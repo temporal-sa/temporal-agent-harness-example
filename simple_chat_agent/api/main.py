@@ -511,8 +511,11 @@ async def _touch_conversation(
     title: str | None = None,
     user_email: str = "",
 ) -> None:
-    await (await _ensure_user_chats_workflow(user_id, user_email)).execute_update(
-        UserChatsWorkflow.touch_chat,
+    # This bookkeeping must not make delivery of a chat signal depend on a
+    # worker. The registry workflow ID is deterministic, and a Temporal Signal
+    # is accepted durably by the service even while no worker is polling.
+    await _handle(user_chats_workflow_id(user_id)).signal(
+        UserChatsWorkflow.touch_chat_signal,
         TouchChatRequest(workflow_id=workflow_id, title=title),
     )
 
@@ -842,9 +845,22 @@ async def _require_conversation_owner(
     workflow_id: str,
 ) -> AuthenticatedUser:
     user = _current_user(request)
-    if not await (await _ensure_user_chats_workflow(user.user_id, user.username)).query(
-        UserChatsWorkflow.has_chat,
-        workflow_id,
+
+    # Workflow Queries execute on a worker, so they cannot authorize a Signal
+    # that must remain deliverable during a worker outage. Describe is served by
+    # Temporal itself. Chats are children of the authenticated user's
+    # deterministic registry workflow, which gives us a worker-independent
+    # ownership check without introducing another state store.
+    try:
+        description = await _handle(workflow_id).describe()
+    except Exception as err:
+        if not _is_temporal_not_found(err):
+            raise
+        raise HTTPException(status_code=404, detail="Conversation not found") from err
+
+    if (
+        description.workflow_type != SimpleChatWorkflow.__name__
+        or description.parent_id != user_chats_workflow_id(user.user_id)
     ):
         raise HTTPException(status_code=404, detail="Conversation not found")
     return user

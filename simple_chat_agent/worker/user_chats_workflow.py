@@ -263,6 +263,13 @@ class UserChatsWorkflow:
 
     @workflow.update
     async def touch_chat(self, request: TouchChatRequest) -> ChatRecord | None:
+        return self._touch_chat(request)
+
+    @workflow.signal
+    def touch_chat_signal(self, request: TouchChatRequest) -> None:
+        self._touch_chat(request)
+
+    def _touch_chat(self, request: TouchChatRequest) -> ChatRecord | None:
         self._touch()
         record = self._chats.get(request.workflow_id)
         if record is None:
