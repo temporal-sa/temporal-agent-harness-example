@@ -180,7 +180,11 @@ Both use app storage, not workflow history, for file bytes.
 
 Research tools are feature-gated by environment:
 
-- `SIMPLE_CHAT_SEARXNG_BASE_URL` enables `search_web`.
+- `GOOGLE_SEARCH_GROUNDING_API_KEY` enables Google-grounded `search_web` and
+  takes precedence over SearXNG. `GOOGLE_SEARCH_GROUNDING_MODEL` optionally
+  overrides the default `gemini-2.5-flash` model.
+- `SIMPLE_CHAT_SEARXNG_BASE_URL` enables the compatibility `search_web` backend
+  when Google grounding is not configured.
 - `GOOGLE_API_KEY` or per-service Google keys enable Fact Check, Knowledge
   Graph, Books, YouTube, and Safe Browsing helpers.
 

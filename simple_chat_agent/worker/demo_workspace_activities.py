@@ -13,14 +13,14 @@ from urllib.request import Request, urlopen
 from temporalio import activity
 
 from simple_chat_agent.common.external_storage import purge_workflow_payloads
-from simple_chat_agent.worker.tools.research import (
-    GOOGLE_RESEARCH_API_KEY_NAMES,
-    SEARXNG_BASE_URL,
-)
 from simple_chat_agent.worker.demo_workspace_workflow import (
     ProvisionDemoWorkspaceRequest,
 )
-
+from simple_chat_agent.worker.tools.research import (
+    GOOGLE_RESEARCH_API_KEY_NAMES,
+    GOOGLE_SEARCH_GROUNDING_MODEL,
+    SEARXNG_BASE_URL,
+)
 
 WORKSPACE_LABEL = "agent-harness-demo-workspace"
 WORKSPACE_SECRET = "agent-harness-workspace-secrets"
@@ -476,6 +476,10 @@ def _common_env(request: ProvisionDemoWorkspaceRequest) -> list[dict[str, Any]]:
     for name in GOOGLE_RESEARCH_API_KEY_NAMES:
         if os.environ.get(name):
             values[name] = os.environ[name]
+    if os.environ.get(GOOGLE_SEARCH_GROUNDING_MODEL):
+        values[GOOGLE_SEARCH_GROUNDING_MODEL] = os.environ[
+            GOOGLE_SEARCH_GROUNDING_MODEL
+        ]
     if request.search_attr_name:
         values["SIMPLE_CHAT_USER_EMAIL_SEARCH_ATTR"] = request.search_attr_name
     if os.environ.get("SIMPLE_CHAT_GOOD_PLACE") is not None:

@@ -12,6 +12,10 @@ from simple_chat_agent.worker.demo_workspace_activities import (
 from simple_chat_agent.worker.demo_workspace_workflow import (
     ProvisionDemoWorkspaceRequest,
 )
+from simple_chat_agent.worker.tools.research import (
+    GOOGLE_SEARCH_GROUNDING_API_KEY,
+    GOOGLE_SEARCH_GROUNDING_MODEL,
+)
 
 
 class DemoWorkspaceRedisTests(unittest.TestCase):
@@ -89,6 +93,44 @@ class DemoWorkspaceRedisTests(unittest.TestCase):
         self.assertEqual(values["SIMPLE_CHAT_S3_BUCKET"], "artifact-bucket")
         self.assertEqual(values["SIMPLE_CHAT_ARTIFACTS_TABLE"], "artifact-table")
         self.assertNotIn("SIMPLE_CHAT_DYNAMODB_TABLE", values)
+
+    def test_workspace_env_includes_google_search_grounding(self) -> None:
+        request = ProvisionDemoWorkspaceRequest(
+            namespace="workspace-1",
+            temporal_namespace="namespace",
+            host="workspace.example.com",
+            url="https://workspace.example.com",
+            task_queue="workspace-queue",
+            workflow_prefix="workspace-",
+            control_workflow_id="controller",
+            parent_public_url="https://parent.example.com",
+            source_namespace="source",
+            source_secret_name="source-secret",
+            tls_secret_name="source-tls",
+            source_web_deployment="web",
+            source_api_deployment="api",
+            source_worker_deployment="worker",
+            user_email="user@example.com",
+        )
+        with patch.dict(
+            os.environ,
+            {
+                GOOGLE_SEARCH_GROUNDING_API_KEY: "grounding-key",
+                GOOGLE_SEARCH_GROUNDING_MODEL: "grounding-model",
+            },
+            clear=True,
+        ):
+            env = _common_env(request)
+
+        values = {item["name"]: item["value"] for item in env if "value" in item}
+        self.assertEqual(
+            values[GOOGLE_SEARCH_GROUNDING_API_KEY],
+            "grounding-key",
+        )
+        self.assertEqual(
+            values[GOOGLE_SEARCH_GROUNDING_MODEL],
+            "grounding-model",
+        )
 
     def test_workspace_redis_is_password_protected_and_ephemeral(self) -> None:
         deployment = _redis_deployment("workspace-1")

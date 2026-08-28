@@ -175,7 +175,12 @@ Research tools are opt-in. If the corresponding environment value is absent,
 the tool is not shown in the Tools window and is not offered to new chats.
 
 ```bash
-# Web search through an internal SearXNG instance.
+# Preferred web search backend: Gemini with Google Search grounding. This key
+# is intentionally separate from the keys used by the direct Google APIs.
+GOOGLE_SEARCH_GROUNDING_API_KEY=...
+GOOGLE_SEARCH_GROUNDING_MODEL=gemini-2.5-flash
+
+# Legacy compatibility backend when Google grounding is not configured.
 SIMPLE_CHAT_SEARXNG_BASE_URL=http://127.0.0.1:8080
 
 # Optional Google-backed research enrichers. This shared key enables all of
@@ -193,10 +198,13 @@ GOOGLE_SAFE_BROWSING_API_KEY=...
 For local SearXNG Docker setup, see `docs/local-development.md` from the repo
 root.
 
-The Kubernetes manifests deploy SearXNG as an internal ClusterIP service in the
-primary namespace; it is not routed through ingress. Temporary demo workspaces
-receive the same SearXNG URL and Google research API key environment values so
-the research tools carry over when those values are configured.
+When `GOOGLE_SEARCH_GROUNDING_API_KEY` is set, `search_web` uses Google Search
+grounding and does not call SearXNG. SearXNG remains available only for
+environments without that key. The Kubernetes manifests still deploy SearXNG
+as an internal ClusterIP compatibility service in the primary namespace; it is
+not routed through ingress. Temporary demo workspaces receive the same SearXNG
+URL and Google research API key environment values, including the grounding
+key, so the research tools carry over when those values are configured.
 
 ## HTTP MCP Servers
 
