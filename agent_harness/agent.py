@@ -39,7 +39,13 @@ from .providers.interface import (
     start_provider_activity,
 )
 from .sliding_window_context_manager import SlidingWindowContextManager
-from .streaming import emit_harness_event, stream_error_payload
+from .streaming import (
+    emit_harness_event,
+    emit_harness_events,
+    start_harness_event_batch,
+    stream_error_payload,
+    wait_harness_event_batch,
+)
 from .tools import ToolResult, ToolSet
 
 AgentStopReason = str
@@ -338,9 +344,14 @@ class Agent:
             stream_id=self._stream_id,
             stream_agent=self._stream_agent,
             activity_options=self._llm_guard_activity_options,
+            defer_stream_events=True,
+        )
+        pre_guard_stream_handle = start_harness_event_batch(
+            pre_guard_execution.stream_events
         )
         guarded = self._provider.request_from_dict(pre_guard_execution.request)
         if pre_guard_execution.halted:
+            await wait_harness_event_batch(pre_guard_stream_handle)
             self._llm_guard_state = pre_guard_execution.state
             return self._provider.response_from_guard_execution(
                 pre_guard_execution,
@@ -354,10 +365,13 @@ class Agent:
         )
 
         try:
-            response = await self._call_provider_with_context_recovery(
-                guarded,
-                tool_params,
-            )
+            try:
+                response = await self._call_provider_with_context_recovery(
+                    guarded,
+                    tool_params,
+                )
+            finally:
+                await wait_harness_event_batch(pre_guard_stream_handle)
             if response is None:
                 return None
 
@@ -373,7 +387,9 @@ class Agent:
                 stream_id=self._stream_id,
                 stream_agent=self._stream_agent,
                 activity_options=self._llm_guard_activity_options,
+                defer_stream_events=True,
             )
+            await emit_harness_events(post_guard_execution.stream_events)
             if post_guard_execution.halted:
                 self._llm_guard_state = post_guard_execution.state
                 return self._provider.response_from_guard_execution(

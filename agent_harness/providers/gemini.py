@@ -85,6 +85,26 @@ PROVIDER_REFUSAL_FALLBACK = (
     "refusal message, so the app stopped this agent run instead of retrying "
     "the same request."
 )
+_gemini_clients: dict[str, genai.Client] = {}
+
+
+def _gemini_client(api_key: str) -> genai.Client:
+    client = _gemini_clients.get(api_key)
+    if client is None:
+        client = genai.Client(
+            api_key=api_key,
+            http_options=_gemini_http_options(),
+        )
+        _gemini_clients[api_key] = client
+    return client
+
+
+async def close_gemini_clients() -> None:
+    clients = list(_gemini_clients.values())
+    _gemini_clients.clear()
+    for client in clients:
+        with suppress(Exception):
+            await client.aio.aclose()
 
 
 @dataclass(frozen=True)
@@ -456,27 +476,24 @@ async def call_gemini(request: GeminiRequest) -> GeminiResponse:
     ]
 
     try:
-        async with genai.Client(
-            api_key=api_key,
-            http_options=_gemini_http_options(),
-        ).aio as client:
-            if _should_count_request_tokens(request):
-                await _raise_if_gemini_context_too_large(
-                    client,
-                    request,
-                    contents,
-                    config,
-                )
-            state = await _stream_gemini_message(
+        client = _gemini_client(api_key).aio
+        if _should_count_request_tokens(request):
+            await _raise_if_gemini_context_too_large(
                 client,
-                model=request.model,
-                contents=contents,
-                config=config,
-                stream_id=request.stream_id,
-                stream_sequence=request.stream_sequence,
-                stream_attempt=request.stream_attempt,
-                stream_agent=request.stream_agent,
+                request,
+                contents,
+                config,
             )
+        state = await _stream_gemini_message(
+            client,
+            model=request.model,
+            contents=contents,
+            config=config,
+            stream_id=request.stream_id,
+            stream_sequence=request.stream_sequence,
+            stream_attempt=request.stream_attempt,
+            stream_agent=request.stream_agent,
+        )
     except genai_errors.APIError as err:
         await AgentStreamWriter.for_provider(
             stream_id=request.stream_id,

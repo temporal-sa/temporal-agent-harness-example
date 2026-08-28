@@ -10,10 +10,7 @@ from typing import Any, AsyncIterator
 from fastapi import Request
 from redis.exceptions import RedisError
 
-from simple_chat_agent.common.redis_streams import (
-    ZERO_STREAM_ID,
-    RedisStreamStore,
-)
+from simple_chat_agent.common.redis_streams import RedisStreamStore
 from simple_chat_agent.common.streaming import (
     append_local_stream_event,
     stream_path,
@@ -130,9 +127,11 @@ class StreamBroker:
         request: Request,
         *,
         cursor: str,
+        after_revision: int = 0,
     ) -> AsyncIterator[dict[str, str]]:
         current_cursor = cursor
         sleep_seconds = STREAM_ACTIVE_POLL_INTERVAL_SECONDS
+        validate_cursor = True
         while not await request.is_disconnected():
             if self._redis is not None:
                 replay = await self._redis.read_entries(
@@ -140,7 +139,9 @@ class StreamBroker:
                     cursor=current_cursor,
                     limit=TURN_STREAM_REPLAY_LIMIT,
                     block_milliseconds=STREAM_REDIS_BLOCK_MILLISECONDS,
+                    validate_cursor=validate_cursor,
                 )
+                validate_cursor = False
             else:
                 replay = self._file_replay_entries(
                     workflow_id,
@@ -166,6 +167,17 @@ class StreamBroker:
                 event = entry["event"]
                 data = dict(entry["data"])
                 if event == "turn_settled":
+                    result = data.get("result")
+                    to_revision = (
+                        result.get("to_revision")
+                        if isinstance(result, dict)
+                        else None
+                    )
+                    if (
+                        to_revision is not None
+                        and int(to_revision) <= after_revision
+                    ):
+                        continue
                     data["cursor"] = current_cursor
                 yield self._event(event, data, event_id=current_cursor)
                 if event == "turn_settled":
@@ -299,13 +311,16 @@ class StreamBroker:
             return
 
         current_cursor = last_event_id
+        validate_cursor = True
         while not await request.is_disconnected():
             replay = await self._redis.read_entries(
                 workflow_id,
                 cursor=current_cursor,
                 limit=TURN_STREAM_REPLAY_LIMIT,
                 block_milliseconds=STREAM_REDIS_BLOCK_MILLISECONDS,
+                validate_cursor=validate_cursor,
             )
+            validate_cursor = False
             if not replay["replay_available"]:
                 yield self._event(
                     "reconcile",

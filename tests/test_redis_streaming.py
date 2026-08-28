@@ -113,6 +113,88 @@ class RedisReconnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_key, second_key)
         self.assertTrue(first_key.startswith("stream:"))
 
+    async def test_sink_flushes_first_token_and_coalesces_following_deltas(self) -> None:
+        store = AsyncMock(spec=RedisStreamStore)
+        sink = RedisStreamSink(store)
+
+        def event(text: str, sequence: int) -> StreamEvent:
+            return StreamEvent(
+                stream_id="chat-batched",
+                tool_name="agent",
+                step=None,
+                kind="agent_text_delta",
+                payload={
+                    "operation_id": "main:llm:1",
+                    "sequence": 1,
+                    "text": text,
+                },
+                sequence=sequence,
+            )
+
+        await sink.emit(event("A", 1))
+        self.assertEqual(store.append_events.await_count, 1)
+
+        await sink.emit(event("B", 2))
+        await sink.emit(event("C", 3))
+        await sink.flush()
+
+        self.assertEqual(store.append_events.await_count, 2)
+        batch = store.append_events.await_args_list[-1].args[0]
+        self.assertEqual(len(batch), 1)
+        self.assertEqual(batch[0].data["payload"]["text"], "BC")
+        await sink.close()
+
+    async def test_turn_stream_validates_cursor_once_and_skips_old_settlement(self) -> None:
+        store = AsyncMock(spec=RedisStreamStore)
+        store.read_entries.side_effect = [
+            {
+                "entries": [
+                    {
+                        "id": "1-0",
+                        "event": "turn_settled",
+                        "data": {"result": {"to_revision": 4}},
+                    },
+                    {
+                        "id": "2-0",
+                        "event": "stream",
+                        "data": {"kind": "agent_text_delta"},
+                    },
+                ],
+                "cursor": "2-0",
+                "replay_available": True,
+                "reason": "",
+            },
+            {
+                "entries": [
+                    {
+                        "id": "3-0",
+                        "event": "turn_settled",
+                        "data": {"result": {"to_revision": 6}},
+                    }
+                ],
+                "cursor": "3-0",
+                "replay_available": True,
+                "reason": "",
+            },
+        ]
+        broker = StreamBroker(store)
+
+        chunks = []
+        async for chunk in broker.turn_event_stream(
+            "chat-preopened",
+            _ConnectedRequest(),  # type: ignore[arg-type]
+            cursor="0-0",
+            after_revision=4,
+        ):
+            chunks.append(chunk)
+
+        self.assertEqual(
+            [chunk["event"] for chunk in chunks],
+            ["stream", "turn_settled"],
+        )
+        self.assertTrue(store.read_entries.await_args_list[0].kwargs["validate_cursor"])
+        self.assertFalse(store.read_entries.await_args_list[1].kwargs["validate_cursor"])
+
 
 @unittest.skipUnless(shutil.which("redis-server"), "redis-server is not installed")
 class RedisStreamingTests(unittest.IsolatedAsyncioTestCase):

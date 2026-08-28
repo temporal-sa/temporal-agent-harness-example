@@ -23,6 +23,7 @@ from agent_harness.tools import ToolSet
 from simple_chat_agent import TASK_QUEUE
 from simple_chat_agent.worker.tools.subagent import (
     CREATE_SUBAGENT_TOOL,
+    MAX_SUBAGENT_DELEGATION_DEPTH,
     SubagentProvider,
     SubagentRequest,
     SubagentResponse,
@@ -210,6 +211,7 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
             child_request.parent_tool_call_id,
             "create-subagent-call-1",
         )
+        self.assertEqual(child_request.delegation_depth, 1)
         self.assertIn("focused research subagent", child_request.system_prompt)
         self.assertFalse(result.error)
 
@@ -256,6 +258,7 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
             conversation_id=lambda: "simple-chat-main",
             github_connection_id=lambda: None,
             root_workflow_id=lambda: "simple-chat-main",
+            delegation_depth=lambda: 1,
         )
         child_result = SubagentResponse(
             text="Nested research complete.",
@@ -301,9 +304,108 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
             child_request.tool_names,
             ["research", CREATE_SUBAGENT_TOOL],
         )
+        self.assertEqual(child_request.delegation_depth, 2)
         self.assertFalse(result.error)
 
-    def test_tool_schema_invites_parallel_delegation_with_one_required_input(
+    async def test_depth_ten_child_does_not_receive_create_subagent(self) -> None:
+        workflow_info = Mock(
+            workflow_id="simple-chat-main-subagent-depth-9",
+            typed_search_attributes=TypedSearchAttributes([]),
+        )
+        ctx = Mock(
+            stream_id="simple-chat-main",
+            tool_call_id="create-depth-10-call",
+        )
+        ctx.tool_names.return_value = ["research", CREATE_SUBAGENT_TOOL]
+        provider = SubagentProvider(
+            default_model=lambda: "claude-sonnet-4-5",
+            user_ref=lambda: "user-123",
+            conversation_id=lambda: "simple-chat-main",
+            github_connection_id=lambda: None,
+            root_workflow_id=lambda: "simple-chat-main",
+            delegation_depth=lambda: MAX_SUBAGENT_DELEGATION_DEPTH - 1,
+        )
+        child_result = SubagentResponse(
+            text="Depth-10 research complete.",
+            stop_reason="end_turn",
+            turns=1,
+            model="claude-sonnet-4-5",
+            tool_names=["research"],
+            denied_tool_names=[],
+        )
+
+        with (
+            patch(
+                "simple_chat_agent.worker.tools.subagent.workflow.info",
+                return_value=workflow_info,
+            ),
+            patch(
+                "simple_chat_agent.worker.tools.subagent.workflow.uuid4",
+                return_value="depth-10",
+            ),
+            patch(
+                "simple_chat_agent.worker.tools.subagent.workflow."
+                "execute_child_workflow",
+                new=AsyncMock(return_value=child_result),
+            ) as execute_child,
+        ):
+            result = await provider.create_subagent(
+                ctx,
+                task="Complete the final delegated workstream.",
+                tool_names=["research", CREATE_SUBAGENT_TOOL],
+            )
+
+        child_request = execute_child.await_args.args[1]
+        self.assertEqual(
+            child_request.delegation_depth,
+            MAX_SUBAGENT_DELEGATION_DEPTH,
+        )
+        self.assertEqual(child_request.tool_names, ["research"])
+        self.assertNotIn(CREATE_SUBAGENT_TOOL, child_request.denied_tool_names)
+        self.assertFalse(result.error)
+
+    async def test_workflow_enforces_delegation_depth_boundary(self) -> None:
+        task_queue = f"subagent-depth-{uuid.uuid4()}"
+        async with (
+            await WorkflowEnvironment.start_local() as env,
+            Worker(
+                env.client,
+                task_queue=task_queue,
+                workflows=[SubagentWorkflow],
+                activities=[complete_subagent_call],
+                workflow_runner=agent_harness_workflow_runner(),
+            ),
+        ):
+            depth_nine = await env.client.execute_workflow(
+                SubagentWorkflow.run,
+                SubagentRequest(
+                    system_prompt="Complete the test task.",
+                    task="Verify depth-nine tools.",
+                    model="claude-sonnet-4-5",
+                    tool_names=["research", CREATE_SUBAGENT_TOOL],
+                    delegation_depth=MAX_SUBAGENT_DELEGATION_DEPTH - 1,
+                ),
+                id=f"subagent-depth-9-{uuid.uuid4()}",
+                task_queue=task_queue,
+            )
+            depth_ten = await env.client.execute_workflow(
+                SubagentWorkflow.run,
+                SubagentRequest(
+                    system_prompt="Complete the test task.",
+                    task="Verify depth-ten tools.",
+                    model="claude-sonnet-4-5",
+                    tool_names=["research", CREATE_SUBAGENT_TOOL],
+                    delegation_depth=MAX_SUBAGENT_DELEGATION_DEPTH,
+                ),
+                id=f"subagent-depth-10-{uuid.uuid4()}",
+                task_queue=task_queue,
+            )
+
+        self.assertIn(CREATE_SUBAGENT_TOOL, depth_nine.tool_names)
+        self.assertNotIn(CREATE_SUBAGENT_TOOL, depth_ten.tool_names)
+        self.assertNotIn(CREATE_SUBAGENT_TOOL, depth_ten.denied_tool_names)
+
+    def test_tool_schema_encourages_selective_delegation_with_one_required_input(
         self,
     ) -> None:
         provider = SubagentProvider(
@@ -320,11 +422,17 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(schema["input_schema"]["required"], ["task"])
-        self.assertIn("Proactively delegate", schema["description"])
+        self.assertIn("Delegate only when", schema["description"])
+        self.assertIn("Prefer completing focused work yourself", schema["description"])
+        self.assertIn("smallest number of subagents necessary", schema["description"])
+        self.assertIn(
+            "Recursive delegation should be exceptional", schema["description"]
+        )
         self.assertIn("same assistant turn", schema["description"])
-        self.assertIn("those calls run concurrently", schema["description"])
-        self.assertIn("always receives create_subagent", schema["description"])
-        self.assertIn("recursively delegate", schema["description"])
+        self.assertIn(
+            "depth-10 agents do not receive create_subagent", schema["description"]
+        )
+        self.assertNotIn("Proactively delegate", schema["description"])
 
 
 if __name__ == "__main__":

@@ -86,6 +86,7 @@ PROVIDER_REFUSAL_FALLBACK = (
     "refusal message, so the app stopped this agent run instead of retrying "
     "the same request."
 )
+_anthropic_clients: dict[tuple[str, str, str], AsyncAnthropic] = {}
 
 
 @dataclass(frozen=True)
@@ -368,6 +369,28 @@ def _anthropic_client_kwargs() -> dict[str, str]:
     return {"base_url": base_url}
 
 
+def _anthropic_client() -> AsyncAnthropic:
+    kwargs = _anthropic_client_kwargs()
+    key = (
+        os.environ.get("ANTHROPIC_API_KEY", ""),
+        os.environ.get("ANTHROPIC_AUTH_TOKEN", ""),
+        kwargs.get("base_url", ""),
+    )
+    client = _anthropic_clients.get(key)
+    if client is None:
+        client = AsyncAnthropic(max_retries=0, **kwargs)
+        _anthropic_clients[key] = client
+    return client
+
+
+async def close_anthropic_clients() -> None:
+    clients = list(_anthropic_clients.values())
+    _anthropic_clients.clear()
+    for client in clients:
+        with suppress(Exception):
+            await client.close()
+
+
 def _claude_response_from_guard_execution(
     execution: LlmGuardExecution,
     *,
@@ -402,21 +425,21 @@ async def call_agent_api(request: ClaudeRequest) -> ClaudeResponse:
         create_params["output_config"] = request.output_config
 
     try:
-        async with AsyncAnthropic(max_retries=0, **_anthropic_client_kwargs()) as client:
-            if _should_count_request_tokens(request):
-                await _raise_if_claude_context_too_large(
-                    client,
-                    request,
-                    create_params,
-                )
-            response = await _stream_claude_message(
+        client = _anthropic_client()
+        if _should_count_request_tokens(request):
+            await _raise_if_claude_context_too_large(
                 client,
+                request,
                 create_params,
-                stream_id=request.stream_id,
-                stream_sequence=request.stream_sequence,
-                stream_attempt=request.stream_attempt,
-                stream_agent=request.stream_agent,
             )
+        response = await _stream_claude_message(
+            client,
+            create_params,
+            stream_id=request.stream_id,
+            stream_sequence=request.stream_sequence,
+            stream_attempt=request.stream_attempt,
+            stream_agent=request.stream_agent,
+        )
     except APIStatusError as err:
         await AgentStreamWriter.for_provider(
             stream_id=request.stream_id,

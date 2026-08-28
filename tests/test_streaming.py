@@ -4,11 +4,13 @@ import unittest
 
 from temporalio.converter import DataConverter
 
-from agent_harness.llm_guards import LlmGuardContext, LlmGuardResult
+from agent_harness.activity_options import DEFAULT_ACTIVITY_OPTIONS
+from agent_harness.llm_guards import LlmGuardContext, LlmGuardPipeline, LlmGuardResult
 from agent_harness.streaming import (
     AgentStreamEventKind,
     AgentStreamWriter,
     EmitStreamEventRequest,
+    EmitStreamEventsRequest,
     StreamContext,
     StreamEvent,
     configure_stream_sink,
@@ -62,6 +64,55 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(decoded, [request])
+
+    async def test_emit_stream_events_request_decodes_a_batch(self) -> None:
+        request = EmitStreamEventsRequest(
+            events=[
+                EmitStreamEventRequest(
+                    stream_id="stream-1",
+                    tool_name="good_place_pre_guard",
+                    step=None,
+                    kind="harness_llm_guard_start",
+                    payload={"status": "running"},
+                ),
+                EmitStreamEventRequest(
+                    stream_id="stream-1",
+                    tool_name="good_place_pre_guard",
+                    step=None,
+                    kind="harness_llm_guard_complete",
+                    payload={"status": "passed"},
+                ),
+            ]
+        )
+
+        payloads = await DataConverter.default.encode([request])
+        decoded = await DataConverter.default.decode(
+            payloads,
+            [EmitStreamEventsRequest],
+        )
+
+        self.assertEqual(decoded, [request])
+
+    async def test_llm_guard_can_defer_its_visibility_events_as_one_batch(self) -> None:
+        def guard(ctx: LlmGuardContext) -> LlmGuardResult:
+            return LlmGuardResult.allow(response=ctx.response)
+
+        execution = await LlmGuardPipeline(post_guards=[guard]).execute_post(
+            request={"model": "test", "stream_sequence": 2},
+            response={
+                "message": {"role": "assistant", "content": "hello"},
+            },
+            state={},
+            stream_id="stream-1",
+            stream_agent={"id": "main"},
+            activity_options=DEFAULT_ACTIVITY_OPTIONS,
+            defer_stream_events=True,
+        )
+
+        self.assertEqual(
+            [event.kind for event in execution.stream_events],
+            ["harness_llm_guard_start", "harness_llm_guard_complete"],
+        )
 
     async def test_stream_event_preserves_agent_and_tool_call_identity(self) -> None:
         sink = RecordingStreamSink()

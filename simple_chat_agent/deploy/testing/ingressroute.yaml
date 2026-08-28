@@ -12,7 +12,7 @@ spec:
   routes:
     - kind: Rule
       match: Host(`agent-harness-demo.testing.tmprl-demo.cloud`) && PathPrefix(`/api`)
-      priority: 1000
+      priority: 2000
       services:
         - name: agent-harness-api-testing
           namespace: temporal-michaelj-agent-harness-demo
@@ -20,7 +20,7 @@ spec:
           port: 80
     - kind: Rule
       match: Host(`agent-harness-demo.testing.tmprl-demo.cloud`) && PathPrefix(`/oauth`)
-      priority: 1000
+      priority: 2000
       services:
         - name: agent-harness-api-testing
           namespace: temporal-michaelj-agent-harness-demo
@@ -28,7 +28,7 @@ spec:
           port: 80
     - kind: Rule
       match: Host(`agent-harness-demo.testing.tmprl-demo.cloud`) && PathPrefix(`/internal`)
-      priority: 1000
+      priority: 2000
       services:
         - name: agent-harness-api-testing
           namespace: temporal-michaelj-agent-harness-demo
@@ -56,7 +56,7 @@ spec:
   routes:
     - kind: Rule
       match: Host(`agent-harness-demo.testing.tmprl-demo.cloud`) && PathPrefix(`/api`)
-      priority: 1000
+      priority: 2000
       services:
         - name: agent-harness-api-testing
           namespace: temporal-michaelj-agent-harness-demo
@@ -64,7 +64,7 @@ spec:
           port: 80
     - kind: Rule
       match: Host(`agent-harness-demo.testing.tmprl-demo.cloud`) && PathPrefix(`/oauth`)
-      priority: 1000
+      priority: 2000
       services:
         - name: agent-harness-api-testing
           namespace: temporal-michaelj-agent-harness-demo
@@ -72,7 +72,7 @@ spec:
           port: 80
     - kind: Rule
       match: Host(`agent-harness-demo.testing.tmprl-demo.cloud`) && PathPrefix(`/internal`)
-      priority: 1000
+      priority: 2000
       services:
         - name: agent-harness-api-testing
           namespace: temporal-michaelj-agent-harness-demo

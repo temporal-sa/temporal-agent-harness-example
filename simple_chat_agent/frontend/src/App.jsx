@@ -35,7 +35,10 @@ import {
   emptyArtifactViewer,
   initialState,
 } from "./state/initialState.js";
-import { latestBufferedStreamCursor } from "./state/streamBuffer.js";
+import {
+  coalesceBufferedStreamEvents,
+  latestBufferedStreamCursor,
+} from "./state/streamBuffer.js";
 import { AgentStreamEventKind } from "./state/streamEvents.js";
 
 const TURN_TRACE_CACHE_PREFIX = "simpleChatTurnTraces:v2:";
@@ -188,6 +191,7 @@ export default function App() {
   const workflowStateRefreshRequestRef = useRef(0);
   const streamEventBufferRef = useRef([]);
   const streamEventFrameRef = useRef(null);
+  const turnLatencyRef = useRef(null);
 
   useEffect(() => {
     stateRef.current = state;
@@ -377,19 +381,21 @@ export default function App() {
     const pending = streamEventBufferRef.current;
     streamEventBufferRef.current = [];
     if (!pending.length) return;
+    const coalesced = coalesceBufferedStreamEvents(pending);
 
     const activeWorkflowId = stateRef.current.workflowId;
     const appliedCursor = latestBufferedStreamCursor(pending, activeWorkflowId);
 
     setState((previous) => {
       let next = previous;
-      for (const { workflowId, event } of pending) {
+      for (const { workflowId, event } of coalesced) {
         if (workflowId && next.workflowId !== workflowId) continue;
         next = handleStreamEventInState(next, event);
       }
       return next;
     });
     if (appliedCursor) streamCursorRef.current = appliedCursor;
+    recordFirstRenderedToken(coalesced);
 
     if (streamEventBufferRef.current.length) {
       streamEventFrameRef.current = window.requestAnimationFrame(flushStreamEvents);
@@ -874,89 +880,109 @@ export default function App() {
     }
   }
 
-  function openTurnEventSource(workflowId, options = {}) {
+  function startTurnEventSource(workflowId, options = {}) {
     const token = beginTurnStream(workflowId);
     let source = null;
     let settled = false;
     let reconciled = false;
     let finished = false;
 
-    return new Promise((resolve) => {
-      function finish() {
-        if (finished) return;
-        finished = true;
-        if (source) source.close();
-        if (turnStreamTokenRef.current === token) {
-          turnStreamSourceRef.current = null;
-          turnStreamFinishRef.current = null;
-          activeTurnStreamWorkflowRef.current = null;
-        }
-        resolve({ settled, reconciled });
+    let resolveCompletion;
+    let resolveOpened;
+    const completion = new Promise((resolve) => {
+      resolveCompletion = resolve;
+    });
+    const opened = new Promise((resolve) => {
+      resolveOpened = resolve;
+    });
+
+    function finish() {
+      if (finished) return;
+      finished = true;
+      if (source) source.close();
+      if (turnStreamTokenRef.current === token) {
+        turnStreamSourceRef.current = null;
+        turnStreamFinishRef.current = null;
+        activeTurnStreamWorkflowRef.current = null;
       }
+      resolveOpened(false);
+      resolveCompletion({ settled, reconciled });
+    }
 
-      turnStreamFinishRef.current = finish;
-      source = new EventSource(turnEventSourceUrl(workflowId, options));
-      turnStreamSourceRef.current = source;
+    turnStreamFinishRef.current = finish;
+    source = new EventSource(turnEventSourceUrl(workflowId, options));
+    turnStreamSourceRef.current = source;
+    source.onopen = () => {
+      resolveOpened(true);
+      markTurnLatency("streamOpenedAt");
+    };
 
-      source.addEventListener("stream", (message) => {
-        if (turnStreamTokenRef.current !== token) return;
-        const streamEvent = parseStreamEventData(message);
-        if (!streamEvent) return;
-        enqueueStreamEvent(workflowId, streamEvent, message.lastEventId);
-        if (
-          streamEvent.kind === AgentStreamEventKind.AGENT_START &&
-          streamEvent.agent?.kind !== "subagent"
-        ) {
-          clearWorkflowStateRefresh();
-        }
-        if (streamEventNeedsWorkflowStateRefresh(streamEvent)) {
-          scheduleWorkflowStateRefresh(workflowId);
-        }
-      });
+    source.addEventListener("stream", (message) => {
+      if (turnStreamTokenRef.current !== token) return;
+      const streamEvent = parseStreamEventData(message);
+      if (!streamEvent) return;
+      recordFirstStreamEvent(streamEvent, message.lastEventId);
+      enqueueStreamEvent(workflowId, streamEvent, message.lastEventId);
+      if (
+        streamEvent.kind === AgentStreamEventKind.AGENT_START &&
+        streamEvent.agent?.kind !== "subagent"
+      ) {
+        clearWorkflowStateRefresh();
+      }
+      if (streamEventNeedsWorkflowStateRefresh(streamEvent)) {
+        scheduleWorkflowStateRefresh(workflowId);
+      }
+    });
 
-      source.addEventListener("turn_settled", async (message) => {
-        if (turnStreamTokenRef.current !== token) return;
-        flushStreamEventsNow();
-        if (message.lastEventId) streamCursorRef.current = message.lastEventId;
-        const body = parseStreamEventData(message);
-        if (!body) {
-          deferReconcileWorkflow(workflowId, { resumeActive: true });
-          finish();
-          return;
-        }
-        if (body.cursor) streamCursorRef.current = body.cursor;
-        settled = true;
-        await applyTurnSettledResult(workflowId, body.result);
+    source.addEventListener("turn_settled", async (message) => {
+      if (turnStreamTokenRef.current !== token) return;
+      flushStreamEventsNow();
+      if (message.lastEventId) streamCursorRef.current = message.lastEventId;
+      const body = parseStreamEventData(message);
+      if (!body) {
+        deferReconcileWorkflow(workflowId, { resumeActive: true });
         finish();
-      });
+        return;
+      }
+      if (body.cursor) streamCursorRef.current = body.cursor;
+      settled = true;
+      await applyTurnSettledResult(workflowId, body.result);
+      finishTurnLatency("settled");
+      finish();
+    });
 
-      source.addEventListener("reconcile", (message) => {
-        if (turnStreamTokenRef.current !== token) return;
-        flushStreamEventsNow();
-        if (message.lastEventId) streamCursorRef.current = message.lastEventId;
-        reconciled = true;
+    source.addEventListener("reconcile", (message) => {
+      if (turnStreamTokenRef.current !== token) return;
+      flushStreamEventsNow();
+      if (message.lastEventId) streamCursorRef.current = message.lastEventId;
+      reconciled = true;
+      finishTurnLatency("reconciled");
+      finish();
+      deferReconcileWorkflow(workflowId, {
+        resumeActive: true,
+        restoreActiveStream: true,
+      });
+    });
+
+    source.onerror = () => {
+      flushStreamEventsNow();
+      if (turnStreamTokenRef.current !== token) {
+        finish();
+        return;
+      }
+      if (source.readyState === EventSource.CLOSED && !settled && !reconciled) {
         finish();
         deferReconcileWorkflow(workflowId, {
           resumeActive: true,
           restoreActiveStream: true,
         });
-      });
+      }
+    };
+    return { completion, finish, opened };
+  }
 
-      source.onerror = () => {
-        flushStreamEventsNow();
-        if (turnStreamTokenRef.current !== token) {
-          finish();
-          return;
-        }
-        if (source.readyState === EventSource.CLOSED && !settled && !reconciled) {
-          finish();
-          deferReconcileWorkflow(workflowId, {
-            resumeActive: true,
-            restoreActiveStream: true,
-          });
-        }
-      };
-    });
+  async function openTurnEventSource(workflowId, options = {}) {
+    return startTurnEventSource(workflowId, options).completion;
   }
 
   async function resumeActiveTurnStream(workflowId, options = {}) {
@@ -965,30 +991,122 @@ export default function App() {
   }
 
   async function streamChatMessage(workflowId, payload, pendingId) {
-    closeTurnStream();
-    clearLiveStreamState();
-    const response = await fetch(`/api/sessions/${encodeURIComponent(workflowId)}/chat`, {
-      method: "POST",
-      headers: jsonHeaders(),
-      body: JSON.stringify(payload),
+    beginTurnLatency(workflowId);
+    const initialCursor = streamCursorRef.current;
+    const turnStream = startTurnEventSource(workflowId, {
+      cursor: initialCursor,
+      afterRevision: payload.after_revision,
     });
+    if (!initialCursor) await turnStream.opened;
+    let response;
+    try {
+      response = await fetch(`/api/sessions/${encodeURIComponent(workflowId)}/chat`, {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify(payload),
+      });
+    } catch (error) {
+      turnStream.finish();
+      finishTurnLatency("submit_failed");
+      throw error;
+    }
+    markTurnLatency("acceptedAt");
+    if (turnLatencyRef.current) {
+      turnLatencyRef.current.serverTiming = response.headers.get("Server-Timing") || "";
+    }
     if (response.status === 401) {
+      turnStream.finish();
+      finishTurnLatency("unauthorized");
       showLogin();
       return;
     }
     if (response.status === 404) {
+      turnStream.finish();
+      finishTurnLatency("workflow_missing");
       await handleMissingWorkflow();
       return;
     }
-    if (!response.ok) throw new Error(await responseErrorText(response));
+    if (!response.ok) {
+      turnStream.finish();
+      finishTurnLatency("submit_failed");
+      throw new Error(await responseErrorText(response));
+    }
 
-    const body = await response.json();
-    if (body.cursor) streamCursorRef.current = body.cursor;
+    await response.json();
     markPendingDelivered(pendingId);
-    await openTurnEventSource(workflowId, {
-      cursor: body.cursor || streamCursorRef.current,
-      afterRevision: payload.after_revision,
+    await turnStream.completion;
+  }
+
+  function beginTurnLatency(workflowId) {
+    turnLatencyRef.current = {
+      workflowId,
+      submittedAt: performance.now(),
+    };
+  }
+
+  function markTurnLatency(field) {
+    const timing = turnLatencyRef.current;
+    if (timing && timing[field] === undefined) timing[field] = performance.now();
+  }
+
+  function recordFirstStreamEvent(event, cursor) {
+    const timing = turnLatencyRef.current;
+    if (!timing) return;
+    markTurnLatency("firstStreamEventAt");
+    if (
+      timing.firstTokenReceivedAt === undefined &&
+      [AgentStreamEventKind.AGENT_TEXT_DELTA, AgentStreamEventKind.AGENT_THINKING_DELTA].includes(
+        event.kind,
+      )
+    ) {
+      timing.firstTokenReceivedAt = performance.now();
+      timing.providerEmittedAt = event.emitted_at || "";
+      const cursorMilliseconds = String(cursor || "").split("-", 1)[0];
+      const redisMilliseconds = /^\d+$/.test(cursorMilliseconds)
+        ? Number(cursorMilliseconds)
+        : Number.NaN;
+      const emittedMilliseconds = Date.parse(event.emitted_at || "");
+      if (Number.isFinite(redisMilliseconds)) {
+        timing.redisToBrowserMs = Date.now() - redisMilliseconds;
+      }
+      if (Number.isFinite(redisMilliseconds) && Number.isFinite(emittedMilliseconds)) {
+        timing.workerToRedisMs = redisMilliseconds - emittedMilliseconds;
+      }
+    }
+  }
+
+  function recordFirstRenderedToken(pending) {
+    const timing = turnLatencyRef.current;
+    if (!timing || timing.firstTokenRenderedAt !== undefined) return;
+    const hasToken = pending.some(({ event }) =>
+      [AgentStreamEventKind.AGENT_TEXT_DELTA, AgentStreamEventKind.AGENT_THINKING_DELTA].includes(
+        event?.kind,
+      ),
+    );
+    if (!hasToken) return;
+    window.requestAnimationFrame(() => markTurnLatency("firstTokenRenderedAt"));
+  }
+
+  function finishTurnLatency(outcome) {
+    const timing = turnLatencyRef.current;
+    if (!timing) return;
+    const now = performance.now();
+    const duration = (value) =>
+      value === undefined ? undefined : Math.round((value - timing.submittedAt) * 10) / 10;
+    console.info("[turn-latency]", {
+      workflowId: timing.workflowId,
+      outcome,
+      acceptedMs: duration(timing.acceptedAt),
+      streamOpenMs: duration(timing.streamOpenedAt),
+      firstEventMs: duration(timing.firstStreamEventAt),
+      firstTokenReceivedMs: duration(timing.firstTokenReceivedAt),
+      firstTokenRenderedMs: duration(timing.firstTokenRenderedAt),
+      settledMs: Math.round((now - timing.submittedAt) * 10) / 10,
+      workerToRedisMs: timing.workerToRedisMs,
+      redisToBrowserMs: timing.redisToBrowserMs,
+      serverTiming: timing.serverTiming || "",
     });
+    turnLatencyRef.current = null;
   }
 
   async function refreshWorkflowStatePatch(workflowId, options = {}) {

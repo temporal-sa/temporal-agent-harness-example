@@ -74,6 +74,25 @@ PROVIDER_REFUSAL_FALLBACK = (
     "provider-generated refusal message, so the app stopped this agent run "
     "instead of retrying the same request."
 )
+_chatgpt_clients: dict[str, Any] = {}
+
+
+def _chatgpt_client(api_key: str) -> Any:
+    client = _chatgpt_clients.get(api_key)
+    if client is None:
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(api_key=api_key, max_retries=0)
+        _chatgpt_clients[api_key] = client
+    return client
+
+
+async def close_chatgpt_clients() -> None:
+    clients = list(_chatgpt_clients.values())
+    _chatgpt_clients.clear()
+    for client in clients:
+        with suppress(Exception):
+            await client.close()
 
 
 @dataclass(frozen=True)
@@ -488,17 +507,16 @@ async def call_chatgpt(request: ChatGPTRequest) -> ChatGPTResponse:
         create_params["reasoning"] = request.reasoning
 
     try:
-        from openai import APIStatusError, AsyncOpenAI
+        from openai import APIStatusError
 
-        async with AsyncOpenAI(api_key=api_key, max_retries=0) as client:
-            state = await _stream_chatgpt_response(
-                client,
-                create_params,
-                stream_id=request.stream_id,
-                stream_sequence=request.stream_sequence,
-                stream_attempt=request.stream_attempt,
-                stream_agent=request.stream_agent,
-            )
+        state = await _stream_chatgpt_response(
+            _chatgpt_client(api_key),
+            create_params,
+            stream_id=request.stream_id,
+            stream_sequence=request.stream_sequence,
+            stream_attempt=request.stream_attempt,
+            stream_agent=request.stream_agent,
+        )
     except APIStatusError as err:
         await AgentStreamWriter.for_provider(
             stream_id=request.stream_id,

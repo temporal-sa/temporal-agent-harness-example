@@ -64,6 +64,14 @@ class RedisStreamEntry:
         return {"id": self.id, "event": self.event, "data": self.data}
 
 
+@dataclass(frozen=True)
+class RedisStreamAppend:
+    stream_id: str
+    event: str
+    data: dict[str, Any]
+    idempotency_key: str
+
+
 class RedisStreamStore:
     def __init__(
         self,
@@ -136,6 +144,33 @@ class RedisStreamStore:
         )
         return str(cursor)
 
+    async def append_events(
+        self,
+        events: list[RedisStreamAppend],
+    ) -> list[str]:
+        if not events:
+            return []
+
+        async def append_batch() -> list[str]:
+            pipeline = self._client.pipeline(transaction=False)
+            for item in events:
+                stream_key, idempotency_hash = self._keys(item.stream_id)
+                pipeline.eval(
+                    _APPEND_EVENT_SCRIPT,
+                    2,
+                    stream_key,
+                    idempotency_hash,
+                    item.event,
+                    json.dumps(item.data, default=str, separators=(",", ":")),
+                    item.idempotency_key,
+                    str(self._ttl_seconds),
+                )
+            return [str(cursor) for cursor in await pipeline.execute()]
+
+        # Every batch item has a stable key, so retrying the pipeline after a
+        # lost response cannot append a duplicate.
+        return await self._execute(append_batch)
+
     async def clear(self, stream_id: str) -> None:
         await self._execute(lambda: self._client.delete(*self._keys(stream_id)))
 
@@ -198,15 +233,17 @@ class RedisStreamStore:
         cursor: str,
         limit: int,
         block_milliseconds: int,
+        validate_cursor: bool = True,
     ) -> dict[str, Any]:
-        availability = await self._replay_availability(stream_id, cursor)
-        if not availability["replay_available"]:
-            return {
-                "entries": [],
-                "cursor": availability["cursor"],
-                "replay_available": False,
-                "reason": availability["reason"],
-            }
+        if validate_cursor:
+            availability = await self._replay_availability(stream_id, cursor)
+            if not availability["replay_available"]:
+                return {
+                    "entries": [],
+                    "cursor": availability["cursor"],
+                    "replay_available": False,
+                    "reason": availability["reason"],
+                }
 
         stream_key, _ = self._keys(stream_id)
         raw_streams = await self._execute(

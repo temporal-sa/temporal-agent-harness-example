@@ -115,6 +115,7 @@ class StreamContext:
                         stream_id=event.stream_id,
                         stream_agent=event.agent,
                         activity_options=DEFAULT_ACTIVITY_OPTIONS,
+                        emit_stream_events=False,
                     )
                     guarded_message = (guarded.response or {}).get("message")
                     guarded_content = (
@@ -402,6 +403,11 @@ class EmitStreamEventRequest:
     tool_call_id: str | None = None
 
 
+@dataclass
+class EmitStreamEventsRequest:
+    events: list[EmitStreamEventRequest]
+
+
 async def emit_stream_event_activity(request: EmitStreamEventRequest) -> None:
     stream = StreamContext(
         stream_id=request.stream_id,
@@ -413,10 +419,73 @@ async def emit_stream_event_activity(request: EmitStreamEventRequest) -> None:
     await stream.emit(request.payload, kind=request.kind)
 
 
+async def emit_stream_events_activity(request: EmitStreamEventsRequest) -> None:
+    for event in request.events:
+        await emit_stream_event_activity(event)
+
+
 if temporal_activity is not None:
     emit_stream_event_activity = temporal_activity.defn(
         name="agent_harness.emit_stream_event"
     )(emit_stream_event_activity)
+    emit_stream_events_activity = temporal_activity.defn(
+        name="agent_harness.emit_stream_events"
+    )(emit_stream_events_activity)
+
+
+def stream_event_request(
+    *,
+    stream_id: str | None,
+    kind: str,
+    payload: object,
+    agent: dict[str, str | None] | None = None,
+    tool_name: str | None = None,
+    tool_call_id: str | None = None,
+    step: str | None = None,
+) -> EmitStreamEventRequest | None:
+    if stream_id is None:
+        return None
+    return EmitStreamEventRequest(
+        stream_id=stream_id,
+        tool_name=tool_name,
+        step=step,
+        kind=kind,
+        payload=payload,
+        agent=agent,
+        tool_call_id=tool_call_id,
+    )
+
+
+def start_harness_event_batch(
+    events: list[EmitStreamEventRequest],
+) -> Any | None:
+    if not events:
+        return None
+
+    from temporalio import workflow
+    from temporalio.common import RetryPolicy
+
+    return workflow.start_activity(
+        "agent_harness.emit_stream_events",
+        EmitStreamEventsRequest(events=list(events)),
+        start_to_close_timeout=timedelta(seconds=10),
+        retry_policy=RetryPolicy(maximum_attempts=1),
+        summary=f"stream:batch:{len(events)}",
+    )
+
+
+async def wait_harness_event_batch(handle: Any | None) -> None:
+    if handle is None:
+        return
+    try:
+        await handle
+    except Exception:
+        # Visibility failures must not fail the user's agent run.
+        return
+
+
+async def emit_harness_events(events: list[EmitStreamEventRequest]) -> None:
+    await wait_harness_event_batch(start_harness_event_batch(events))
 
 
 async def emit_harness_event(
@@ -429,31 +498,23 @@ async def emit_harness_event(
     tool_call_id: str | None = None,
     step: str | None = None,
 ) -> None:
-    if stream_id is None:
+    event = stream_event_request(
+        stream_id=stream_id,
+        kind=kind,
+        payload=payload,
+        agent=agent,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        step=step,
+    )
+    if event is None:
         return
 
     # This function is used from deterministic Workflow code. The actual
     # sideband write stays in an Activity so replay never performs HTTP or file
     # I/O. Visibility failures must not fail the user's agent run.
     try:
-        from temporalio import workflow
-        from temporalio.common import RetryPolicy
-
-        await workflow.execute_activity(
-            "agent_harness.emit_stream_event",
-            EmitStreamEventRequest(
-                stream_id=stream_id,
-                tool_name=tool_name,
-                step=step,
-                kind=kind,
-                payload=payload,
-                agent=agent,
-                tool_call_id=tool_call_id,
-            ),
-            start_to_close_timeout=timedelta(seconds=10),
-            retry_policy=RetryPolicy(maximum_attempts=1),
-            summary=f"stream:{kind}",
-        )
+        await emit_harness_events([event])
     except Exception:
         return
 

@@ -29,6 +29,7 @@ with workflow.unsafe.imports_passed_through():
 
 
 CREATE_SUBAGENT_TOOL = "create_subagent"
+MAX_SUBAGENT_DELEGATION_DEPTH = 10
 _DEFAULT_SUBAGENT_MAX_TOKENS = 16_000
 _MAX_SUBAGENT_MAX_TOKENS = 32_000
 
@@ -55,6 +56,9 @@ class SubagentRequest:
     reference_time: str = ""
     agent_state: AgentState | None = None
     approval_counter: int = 0
+    # Main workflow is depth 0; its first child is depth 1. Depth-10 agents do
+    # not receive create_subagent, but retain all of their other granted tools.
+    delegation_depth: int = 1
 
 
 @dataclass
@@ -79,6 +83,7 @@ class SubagentProvider:
         reference_time: Callable[[], str | None] | None = None,
         mcp_servers: Callable[[], list[HttpMcpServerConfig]] | None = None,
         root_workflow_id: Callable[[], str | None] | None = None,
+        delegation_depth: Callable[[], int] | None = None,
     ) -> None:
         self._default_model = default_model
         self._thinking = thinking or (lambda: None)
@@ -88,24 +93,23 @@ class SubagentProvider:
         self._reference_time = reference_time or (lambda: None)
         self._mcp_servers = mcp_servers or (list)
         self._root_workflow_id = root_workflow_id or (lambda: None)
+        self._delegation_depth = delegation_depth or (lambda: 0)
 
     @tool(
         name=CREATE_SUBAGENT_TOOL,
         description=(
-            "Proactively delegate one independent, substantive workstream to a "
-            "child research agent. Use this whenever a request has separable "
-            "research topics, comparisons, sources, regions, time periods, or "
-            "report sections. For parallel work, call create_subagent multiple "
-            "times in the same assistant turn—one focused call per independent "
-            "workstream; those calls run concurrently. Do not research clearly "
-            "separable workstreams serially yourself. Each child returns findings "
-            "for you to cross-check and synthesize. Omit tool_names to grant all "
-            "currently available tools, or pass a focused subset. Every child "
-            "always receives create_subagent and may recursively delegate its own "
-            "independent workstreams. "
-            "Mutating tools still request approval through the parent chat. Avoid "
-            "delegation only for trivial, single-step work. Children have no turn "
-            "or delegation-depth limit."
+            "Delegate only when the assigned task contains a substantial, "
+            "independent workstream that would materially benefit from parallel "
+            "execution. Prefer completing focused work yourself. Avoid overlapping "
+            "assignments and use the smallest number of subagents necessary. "
+            "Recursive delegation should be exceptional, especially when your own "
+            "assignment is already narrowly scoped. For parallel work, calls made "
+            "in the same assistant turn run concurrently. Each child returns "
+            "findings for you to cross-check and synthesize. Omit tool_names to "
+            "grant all currently available tools, or pass a focused subset. "
+            "Subagents may recursively delegate through depth 9; depth-10 agents "
+            "do not receive create_subagent. Mutating tools still request approval "
+            "through the parent chat."
         ),
         tool_type=ToolType.READ,
     )
@@ -114,11 +118,12 @@ class SubagentProvider:
         ctx: ToolContext,
         task: str,
         system_prompt: str = (
-            "You are a focused research subagent. Investigate the delegated "
-            "workstream thoroughly, use the available tools, cross-check "
-            "important claims, distinguish evidence from inference, cite sources "
-            "when available, recursively delegate independent substantive "
-            "subproblems when useful, and return concise findings for the parent "
+            "You are a focused research subagent. Complete the delegated workstream "
+            "yourself, use the available tools, cross-check important claims, "
+            "distinguish evidence from inference, and cite sources when available. "
+            "Delegate only when a substantial independent subproblem would "
+            "materially benefit from parallel execution, and use the smallest "
+            "number of subagents necessary. Return concise findings for the parent "
             "agent to synthesize."
         ),
         tool_names: list[str] | None = None,
@@ -137,11 +142,18 @@ class SubagentProvider:
         current_workflow_id = workflow.info().workflow_id
         root_workflow_id = self._root_workflow_id() or current_workflow_id
         child_workflow_id = f"{root_workflow_id}-subagent-{workflow.uuid4()}"
+        child_delegation_depth = max(0, self._delegation_depth()) + 1
         requested_tool_names = (
-            available_tool_names
-            if tool_names is None
-            else _dedupe([*tool_names, CREATE_SUBAGENT_TOOL])
+            available_tool_names if tool_names is None else list(tool_names)
         )
+        if child_delegation_depth < MAX_SUBAGENT_DELEGATION_DEPTH:
+            requested_tool_names = _dedupe(
+                [*requested_tool_names, CREATE_SUBAGENT_TOOL]
+            )
+        else:
+            requested_tool_names = [
+                name for name in requested_tool_names if name != CREATE_SUBAGENT_TOOL
+            ]
         granted_tool_names, denied_tool_names = _split_requested_tools(
             requested_tool_names,
             available_tool_names,
@@ -167,6 +179,7 @@ class SubagentProvider:
                 mcp_servers=list(self._mcp_servers()),
                 stream_id=ctx.stream_id,
                 reference_time=self._reference_time() or "",
+                delegation_depth=child_delegation_depth,
             ),
             id=child_workflow_id,
             task_queue=TASK_QUEUE,
@@ -208,10 +221,20 @@ class SubagentWorkflow:
             default_model=request.model,
             thinking=request.thinking,
             reference_time=request.reference_time,
+            delegation_depth=request.delegation_depth,
             request_mutating_tool_approval=self._request_parent_tool_approval,
         )
+        requested_tool_names = list(request.tool_names)
+        if request.delegation_depth < MAX_SUBAGENT_DELEGATION_DEPTH:
+            requested_tool_names = _dedupe(
+                [*requested_tool_names, CREATE_SUBAGENT_TOOL]
+            )
+        else:
+            requested_tool_names = [
+                name for name in requested_tool_names if name != CREATE_SUBAGENT_TOOL
+            ]
         tool_names, denied_tool_names = _split_requested_tools(
-            _dedupe([*request.tool_names, CREATE_SUBAGENT_TOOL]),
+            requested_tool_names,
             tools.tool_names(),
         )
         denied_tool_names = _dedupe([*request.denied_tool_names, *denied_tool_names])
@@ -260,6 +283,7 @@ class SubagentWorkflow:
                     reference_time=request.reference_time,
                     agent_state=result.continuation_state,
                     approval_counter=self._approval_counter,
+                    delegation_depth=request.delegation_depth,
                 ),
                 initial_versioning_behavior=(
                     workflow.ContinueAsNewVersioningBehavior.AUTO_UPGRADE
@@ -321,6 +345,7 @@ def _build_subagent_tools(
     default_model: str,
     thinking: ClaudeThinkingConfig | None,
     reference_time: str,
+    delegation_depth: int,
     request_mutating_tool_approval: Callable[
         [str, dict[str, Any]], Awaitable[ApprovalDecision]
     ]
@@ -341,18 +366,20 @@ def _build_subagent_tools(
     )
     tools.add_provider(ResearchProvider())
     tools.add_provider(GitHubProvider(lambda: github_connection_id))
-    tools.add_provider(
-        SubagentProvider(
-            default_model=lambda: default_model,
-            thinking=lambda: thinking,
-            user_ref=lambda: user_ref,
-            conversation_id=lambda: conversation_id,
-            github_connection_id=lambda: github_connection_id,
-            reference_time=lambda: reference_time,
-            mcp_servers=lambda: list(mcp_servers),
-            root_workflow_id=lambda: parent_workflow_id,
+    if delegation_depth < MAX_SUBAGENT_DELEGATION_DEPTH:
+        tools.add_provider(
+            SubagentProvider(
+                default_model=lambda: default_model,
+                thinking=lambda: thinking,
+                user_ref=lambda: user_ref,
+                conversation_id=lambda: conversation_id,
+                github_connection_id=lambda: github_connection_id,
+                reference_time=lambda: reference_time,
+                mcp_servers=lambda: list(mcp_servers),
+                root_workflow_id=lambda: parent_workflow_id,
+                delegation_depth=lambda: delegation_depth,
+            )
         )
-    )
     for server in mcp_servers:
         tools.add_mcp_provider(HttpMcpProvider(server))
     return tools
