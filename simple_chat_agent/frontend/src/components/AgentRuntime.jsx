@@ -21,6 +21,10 @@ export function AgentRuntime({
   const [activeAgentId, setActiveAgentId] = useState(mainAgent?.id || null);
   const activeAgent =
     agents.find((agent) => agent.id === activeAgentId) || mainAgent || agents[0] || null;
+  const navigationRows = useMemo(
+    () => buildAgentNavigationRows(agents, activeAgent?.id),
+    [activeAgent?.id, agents],
+  );
   const frames = useMemo(
     () => buildRuntimeFrames(timeline, activeAgent),
     [timeline, activeAgent],
@@ -179,19 +183,57 @@ export function AgentRuntime({
 
   return (
     <div className="runtime-visualizer">
-      {agents.length > 1 ? (
-        <div className="runtime-agent-switcher" aria-label="Select agent runtime">
-          {agents.map((agent) => (
-            <button
-              key={agent.id}
-              type="button"
-              className={agent.id === activeAgent.id ? "active" : ""}
-              onClick={() => selectAgent(agent.id)}
+      {navigationRows.length ? (
+        <div className="runtime-agent-navigator" aria-label="Subagent hierarchy">
+          {navigationRows.map((row, depth) => (
+            <div
+              key={row.parent.id}
+              className="runtime-agent-row"
+              aria-label={`Delegation depth ${depth + 1}`}
             >
-              <span className={`runtime-dot ${runtimeStatus(agent.status)}`} />
-              <span>{agent.kind === "main" ? "Main agent" : compactText(agent.label, 42)}</span>
-              <small>{runtimeStatus(agent.status)}</small>
-            </button>
+              <button
+                type="button"
+                className={`runtime-agent-parent${
+                  row.parent.id === activeAgent.id ? " active" : ""
+                }`}
+                onClick={() => selectAgent(row.parent.id)}
+                aria-current={row.parent.id === activeAgent.id ? "page" : undefined}
+              >
+                <span className={`runtime-dot ${runtimeStatus(row.parent.status)}`} />
+                <span>
+                  {row.parent.kind === "main"
+                    ? "Main agent"
+                    : compactText(row.parent.label, 42)}
+                </span>
+                <small>{runtimeStatus(row.parent.status)}</small>
+              </button>
+              <span className="runtime-agent-branch" aria-hidden="true">›</span>
+              <div
+                className="runtime-agent-switcher"
+                aria-label={`Subagents of ${row.parent.label || "Main agent"}`}
+              >
+                {row.children.map((agent) => {
+                  const active = agent.id === activeAgent.id;
+                  const selected = agent.id === row.selectedChildId;
+                  return (
+                    <button
+                      key={agent.id}
+                      type="button"
+                      className={`${selected ? "selected" : ""}${
+                        active ? " active" : ""
+                      }`}
+                      onClick={() => selectAgent(agent.id)}
+                      aria-current={active ? "page" : undefined}
+                      aria-pressed={selected}
+                    >
+                      <span className={`runtime-dot ${runtimeStatus(agent.status)}`} />
+                      <span>{compactText(agent.label, 42)}</span>
+                      <small>{runtimeStatus(agent.status)}</small>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
           ))}
         </div>
       ) : null}
@@ -346,6 +388,45 @@ export function AgentRuntime({
       ) : null}
     </div>
   );
+}
+
+export function buildAgentNavigationRows(agents, activeAgentId) {
+  const mainAgent = agents.find((agent) => agent.kind === "main") || agents[0] || null;
+  if (!mainAgent) return [];
+
+  const agentsById = new Map(agents.map((agent) => [agent.id, agent]));
+  const activeAgent = agentsById.get(activeAgentId) || mainAgent;
+  const reversePath = [];
+  const visited = new Set();
+  let current = activeAgent;
+  while (current && !visited.has(current.id)) {
+    visited.add(current.id);
+    reversePath.push(current);
+    if (current.id === mainAgent.id) break;
+    current = agentsById.get(current.parentId) || null;
+  }
+
+  const reachedMain = reversePath[reversePath.length - 1]?.id === mainAgent.id;
+  const path = reachedMain ? reversePath.reverse() : [mainAgent];
+  const pathIndexById = new Map(path.map((agent, index) => [agent.id, index]));
+  const childrenByParentId = new Map();
+  for (const agent of agents) {
+    if (agent.kind !== "subagent" || !agent.parentId) continue;
+    const children = childrenByParentId.get(agent.parentId) || [];
+    children.push(agent);
+    childrenByParentId.set(agent.parentId, children);
+  }
+
+  return path.flatMap((parent) => {
+    const children = childrenByParentId.get(parent.id) || [];
+    if (!children.length) return [];
+    const pathIndex = pathIndexById.get(parent.id);
+    return [{
+      parent,
+      children,
+      selectedChildId: path[pathIndex + 1]?.id || null,
+    }];
+  });
 }
 
 function useLiveStreamAutoscroll(viewportRef, contentRef, enabled, streamId, content) {

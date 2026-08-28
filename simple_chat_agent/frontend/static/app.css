@@ -1392,15 +1392,31 @@ main {
     color: #aeb9c9;
     font-family: var(--font-mono);
 }
+.runtime-agent-navigator {
+    min-width: 0;
+    display: grid;
+    border-bottom: 1px solid rgba(119, 142, 176, 0.13);
+    background: #0b0e13;
+}
+.runtime-agent-row {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(150px, 230px) 22px minmax(0, 1fr);
+    align-items: center;
+    padding: 7px 12px;
+    border-bottom: 1px solid rgba(119, 142, 176, 0.09);
+}
+.runtime-agent-row:last-child {
+    border-bottom: 0;
+}
 .runtime-agent-switcher {
     min-width: 0;
     display: flex;
     gap: 6px;
-    padding: 8px 12px;
+    padding: 1px 0;
     overflow-x: auto;
-    border-bottom: 1px solid rgba(119, 142, 176, 0.13);
-    background: #0b0e13;
 }
+.runtime-agent-parent,
 .runtime-agent-switcher button {
     min-width: 150px;
     max-width: 270px;
@@ -1415,17 +1431,36 @@ main {
     color: #7f8da2;
     font: 0.62rem/1 var(--font-mono);
 }
+.runtime-agent-parent {
+    width: 100%;
+    max-width: none;
+    border-color: rgba(117, 156, 218, 0.27);
+    background: rgba(20, 27, 38, 0.82);
+}
+.runtime-agent-branch {
+    color: #43536c;
+    text-align: center;
+    font-size: 1rem;
+}
+.runtime-agent-parent.active,
 .runtime-agent-switcher button.active {
     border-color: rgba(106, 159, 246, 0.58);
     background: rgba(37, 55, 82, 0.68);
     color: #d5deec;
     box-shadow: inset 0 0 18px rgba(83, 137, 225, 0.08);
 }
+.runtime-agent-switcher button.selected:not(.active) {
+    border-color: rgba(128, 160, 211, 0.4);
+    background: rgba(29, 40, 58, 0.76);
+    color: #b9c7da;
+}
+.runtime-agent-parent span:nth-child(2),
 .runtime-agent-switcher button span:nth-child(2) {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
+.runtime-agent-parent small,
 .runtime-agent-switcher small {
     color: #637187;
     font-size: 0.52rem;
@@ -2334,6 +2369,20 @@ main {
     }
     .runtime-panel-header small {
         grid-column: 2;
+    }
+    .runtime-agent-row {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 6px;
+        padding: 8px 10px;
+    }
+    .runtime-agent-parent {
+        min-width: 0;
+    }
+    .runtime-agent-branch {
+        display: none;
+    }
+    .runtime-agent-switcher {
+        padding-left: 18px;
     }
     .runtime-stage {
         min-height: 0;

@@ -162,23 +162,40 @@ export function streamAgents(timeline) {
     if (segment.completedAt) agent.completedAt = segment.completedAt;
   }
 
+  const startedToolCalls = new Set(
+    [...agents.values()]
+      .filter((agent) => agent.kind === "subagent" && agent.parentToolCallId)
+      .map((agent) => agent.parentToolCallId),
+  );
   const startedTasks = new Set(
     [...agents.values()]
-      .filter((agent) => agent.kind === "subagent")
-      .map((agent) => agent.label),
+      .filter(
+        (agent) => agent.kind === "subagent" && !agent.parentToolCallId,
+      )
+      .map((agent) => `${agent.parentId || ""}:${agent.label}`),
   );
   for (const segment of timeline.segments || []) {
-    if ((segment.agentKind || "main") !== "main" || segment.type !== "tools") continue;
+    if (segment.type !== "tools") continue;
     for (const event of segment.events || []) {
       if (event.kind !== AgentStreamEventKind.AGENT_TOOL_INPUT_COMPLETE) continue;
       if (event.payload?.tool_name !== "create_subagent") continue;
       const task = String(event.payload?.input?.task || "").trim();
-      if (!task || startedTasks.has(task)) continue;
-      const id = `queued:${event.payload?.tool_use_id || agents.size}`;
+      const parentId = String(segment.agentId || "main");
+      const parentToolCallId = String(
+        event.payload?.tool_use_id || event.tool_call_id || "",
+      );
+      const taskKey = `${parentId}:${task}`;
+      if (
+        !task ||
+        (parentToolCallId
+          ? startedToolCalls.has(parentToolCallId)
+          : startedTasks.has(taskKey))
+      ) continue;
+      const id = `queued:${parentToolCallId || agents.size}`;
       agents.set(id, {
         id,
-        parentId: segment.agentId || null,
-        parentToolCallId: event.payload?.tool_use_id || event.tool_call_id || null,
+        parentId,
+        parentToolCallId: parentToolCallId || null,
         kind: "subagent",
         label: task,
         segments: [],
@@ -187,7 +204,8 @@ export function streamAgents(timeline) {
         completedAt: null,
         queued: true,
       });
-      startedTasks.add(task);
+      if (parentToolCallId) startedToolCalls.add(parentToolCallId);
+      else startedTasks.add(taskKey);
     }
   }
 

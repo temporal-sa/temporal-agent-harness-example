@@ -38,6 +38,121 @@ test("the agent switcher always keeps the main agent first", async (t) => {
   assert.deepEqual(agents.map((agent) => agent.id), ["main", "child"]);
 });
 
+test("subagent navigation follows only the selected lineage", async (t) => {
+  const server = await createServer({
+    server: { middlewareMode: true },
+    appType: "custom",
+  });
+  t.after(() => server.close());
+  const { buildAgentNavigationRows } = await server.ssrLoadModule(
+    "/src/components/AgentRuntime.jsx",
+  );
+  const agents = [
+    { id: "main", kind: "main", label: "Main agent", status: "running" },
+    { id: "a", parentId: "main", kind: "subagent", label: "Child A", status: "running" },
+    { id: "b", parentId: "main", kind: "subagent", label: "Child B", status: "complete" },
+    { id: "a1", parentId: "a", kind: "subagent", label: "Child A1", status: "complete" },
+    { id: "a2", parentId: "a", kind: "subagent", label: "Child A2", status: "running" },
+    { id: "b1", parentId: "b", kind: "subagent", label: "Child B1", status: "queued" },
+  ];
+
+  function summarize(activeAgentId) {
+    return buildAgentNavigationRows(agents, activeAgentId).map((row) => ({
+      parent: row.parent.id,
+      children: row.children.map((agent) => agent.id),
+      selected: row.selectedChildId,
+    }));
+  }
+
+  assert.deepEqual(summarize("main"), [
+    { parent: "main", children: ["a", "b"], selected: null },
+  ]);
+  assert.deepEqual(summarize("a"), [
+    { parent: "main", children: ["a", "b"], selected: "a" },
+    { parent: "a", children: ["a1", "a2"], selected: null },
+  ]);
+  assert.deepEqual(summarize("a2"), [
+    { parent: "main", children: ["a", "b"], selected: "a" },
+    { parent: "a", children: ["a1", "a2"], selected: "a2" },
+  ]);
+  assert.deepEqual(summarize("b"), [
+    { parent: "main", children: ["a", "b"], selected: "b" },
+    { parent: "b", children: ["b1"], selected: null },
+  ]);
+});
+
+test("nested subagents appear in their parent row while queued", async (t) => {
+  const server = await createServer({
+    server: { middlewareMode: true },
+    appType: "custom",
+  });
+  t.after(() => server.close());
+  const { streamAgents } = await server.ssrLoadModule("/src/components/StreamPanel.jsx");
+  const agents = streamAgents({
+    status: "tooling",
+    segments: [
+      {
+        id: "agent:main:1",
+        type: "agent",
+        agentId: "main",
+        agentKind: "main",
+        agentLabel: "Main agent",
+        sequence: 1,
+        status: "complete",
+      },
+      {
+        id: "agent:child:1",
+        type: "agent",
+        agentId: "child",
+        parentAgentId: "main",
+        parentToolCallId: "main-tool",
+        agentKind: "subagent",
+        agentLabel: "Parent research",
+        sequence: 1,
+        status: "streaming",
+      },
+      {
+        id: "tools:child:1",
+        type: "tools",
+        agentId: "child",
+        parentAgentId: "main",
+        agentKind: "subagent",
+        agentLabel: "Parent research",
+        afterSequence: 1,
+        status: "streaming",
+        events: [
+          {
+            kind: "agent_tool_input_complete",
+            payload: {
+              tool_use_id: "nested-tool",
+              tool_name: "create_subagent",
+              input: { task: "Nested research" },
+            },
+          },
+          {
+            kind: "agent_tool_input_complete",
+            payload: {
+              tool_use_id: "nested-tool-2",
+              tool_name: "create_subagent",
+              input: { task: "Nested research" },
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  const queued = agents.find((agent) => agent.id === "queued:nested-tool");
+  assert.ok(queued);
+  assert.equal(queued.parentId, "child");
+  assert.equal(queued.parentToolCallId, "nested-tool");
+  assert.equal(queued.status, "queued");
+  assert.equal(
+    agents.find((agent) => agent.id === "queued:nested-tool-2")?.parentId,
+    "child",
+  );
+});
+
 test("the runtime projects requested, running, failed, recovered, and completed tools", async (t) => {
   const server = await createServer({
     server: { middlewareMode: true },
