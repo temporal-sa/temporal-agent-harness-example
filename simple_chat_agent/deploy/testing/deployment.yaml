@@ -181,7 +181,7 @@ metadata:
     app: agent-harness-testing
     component: worker
 spec:
-  replicas: 10
+  replicas: 2
   selector:
     matchLabels:
       app: agent-harness-testing
