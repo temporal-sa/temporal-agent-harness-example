@@ -134,8 +134,7 @@ app = FastAPI(lifespan=lifespan)
 # traded for buffering while large JSON state snapshots still compress.
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
-# Local-dev fallback: the dedicated frontend server owns static assets in
-# deployment, but FastAPI can still serve them when run directly.
+# Serve the built UI from the API in catalog deployments and local development.
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "frontend" / "static"
 _FRONTEND_INDEX = _STATIC_DIR / "dist" / "index.html"
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
@@ -577,9 +576,9 @@ app.include_router(
 def main() -> None:
     uvicorn.run(
         "simple_chat_agent.api.main:app",
-        host="127.0.0.1",
+        host=os.environ.get("SIMPLE_CHAT_API_HOST", "127.0.0.1"),
         port=8000,
-        reload=True,
+        reload=os.environ.get("SIMPLE_CHAT_API_RELOAD", "false").lower() in {"1", "true"},
         proxy_headers=True,
         forwarded_allow_ips=os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1"),
     )

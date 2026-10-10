@@ -21,6 +21,11 @@ pipelines, Google login, and workspace controller are retired on this branch.
 | redis | `redis-server` | Best-effort streaming shared by API and worker |
 | executor | `tini -g -- python -m simple_chat_agent.worker.sandbox.executor` | Credential-free Bubblewrap shell on port 8082 |
 
+The catalog sets `SIMPLE_CHAT_API_HOST` and `SIMPLE_CHAT_CODEC_SERVER_HOST` to
+`0.0.0.0` so Services and pod probes can reach their listeners. The API runs
+without the development reloader. The internal worker codec requires a signed
+Temporal Cloud access token; its root readiness endpoint remains accessible.
+
 The API accepts the catalog's `X-Temporal-Auth-Subject` and
 `X-Temporal-Auth-Email` headers. Ingress removes browser-supplied identity
 headers before forward authentication. Keep the API behind that ingress; do
