@@ -187,6 +187,24 @@ class DefaultAgentBehaviorTests(unittest.TestCase):
 
 
 class ReferenceTimeRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_can_be_buffered_when_worker_query_times_out(self) -> None:
+        deps = Mock()
+        registry = Mock()
+        registry.query = AsyncMock(side_effect=TimeoutError)
+        deps.ensure_user_chats_workflow = AsyncMock(return_value=registry)
+        deps.github_connection_id_for_user.return_value = None
+        user = Mock(user_id="user-123", username="researcher@example.com")
+
+        request = await _chat_signal_request(
+            deps,
+            user=user,
+            message_request=MessageRequest(message="Continue when workers return."),
+            attachments=[],
+        )
+
+        self.assertEqual(request.message, "Continue when workers return.")
+        self.assertIsNone(request.available_tool_names)
+
     async def test_chat_request_records_current_utc_reference_time(self) -> None:
         deps = Mock()
         registry = Mock()

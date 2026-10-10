@@ -839,17 +839,27 @@ async def _chat_signal_request(
     attachments: list[Any],
 ) -> ChatSignalRequest:
     registry = await deps.ensure_user_chats_workflow(user.user_id, user.username)
-    mcp_servers = await registry.query(UserChatsWorkflow.list_mcp_servers)
     github_connection_id = deps.github_connection_id_for_user(user)
+    mcp_servers = []
+    available_tool_names = None
+    try:
+        async with asyncio.timeout(2):
+            mcp_servers = await registry.query(UserChatsWorkflow.list_mcp_servers)
+    except TimeoutError:
+        # A paused worker cannot answer queries. None preserves the chat's
+        # existing tool configuration while Temporal buffers this signal.
+        pass
+    else:
+        available_tool_names = tool_names_for_connections(
+            github_connection_id=github_connection_id,
+            mcp_servers=mcp_servers,
+            research_tool_names=configured_research_tool_names(),
+        )
     return ChatSignalRequest(
         message=message_request.message,
         attachments=attachments,
         after_revision=message_request.after_revision,
-        available_tool_names=tool_names_for_connections(
-            github_connection_id=github_connection_id,
-            mcp_servers=mcp_servers,
-            research_tool_names=configured_research_tool_names(),
-        ),
+        available_tool_names=available_tool_names,
         github_connection_id=github_connection_id,
         mcp_servers=mcp_servers,
         reference_time=(

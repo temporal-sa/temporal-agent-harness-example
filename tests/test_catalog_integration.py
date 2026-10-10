@@ -13,9 +13,20 @@ from simple_chat_agent.api.auth import user_from_catalog_headers
 from simple_chat_agent.worker.main import _worker_deployment_config
 from simple_chat_agent.worker.user_chats_workflow import user_chats_workflow_id
 from simple_chat_agent.common.external_storage import simple_chat_data_converter
+from simple_chat_agent.api.temporal_ui import temporal_ui_url, temporal_ui_user_workflows_url
+from urllib.parse import parse_qs, urlsplit
 
 
 class CatalogIntegrationTests(unittest.TestCase):
+    def test_catalog_workflow_links_use_the_standard_cloud_address(self) -> None:
+        with patch.dict(os.environ, {"TEMPORAL_ADDRESS": "demo.a2dd6.tmprl.cloud:7233"}, clear=True):
+            link = temporal_ui_url(namespace="demo.a2dd6", workflow_id="chat", run_id="run")
+            self.assertEqual(urlsplit(link).netloc, "cloud.temporal.io")
+
+    def test_user_workflow_filter_matches_the_full_keyword_email(self) -> None:
+        link = temporal_ui_user_workflows_url("user@temporal.io", namespace="demo.a2dd6", search_attr_name="UserEmail")
+        self.assertEqual(parse_qs(urlsplit(link).query)["query"], ['UserEmail = "user@temporal.io"'])
+
     def test_catalog_cannot_fall_back_to_pod_local_payload_storage(self) -> None:
         with patch.dict(os.environ, {"SIMPLE_CHAT_REQUIRE_SHARED_STORAGE": "true"}, clear=True):
             with self.assertRaisesRegex(RuntimeError, "SIMPLE_CHAT_S3_BUCKET"):

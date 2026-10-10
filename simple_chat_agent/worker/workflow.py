@@ -110,7 +110,7 @@ class ChatSignalRequest:
     message: str
     attachments: list[AttachmentRef] = field(default_factory=list)
     after_revision: int = 0
-    available_tool_names: list[str] = field(default_factory=list)
+    available_tool_names: list[str] | None = field(default_factory=list)
     github_connection_id: str | None = None
     mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
     reference_time: str = ""

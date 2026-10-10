@@ -11,7 +11,7 @@ def temporal_ui_base_url() -> str:
         return explicit
     # Otherwise derive from the environment: a Temporal Cloud endpoint maps to
     # the Cloud Web UI; anything else falls back to the local dev server.
-    endpoint = os.environ.get("TEMPORAL_ENDPOINT", "")
+    endpoint = os.environ.get("TEMPORAL_ADDRESS", os.environ.get("TEMPORAL_ENDPOINT", ""))
     if "tmprl.cloud" in endpoint:
         return "https://cloud.temporal.io"
     return "http://localhost:8233"
@@ -31,11 +31,8 @@ def temporal_ui_user_workflows_url(
         return None
     base_url = temporal_ui_base_url().rstrip("/")
     namespace_path = quote(namespace, safe="")
-    # UserEmail is a Text (tokenized) search attribute, so including the email
-    # domain would match the "temporal"/"io" tokens shared by every user and
-    # return everyone. Filter on the local part only for a per-user result.
-    local_part = email.split("@", 1)[0]
-    query = quote(f'{search_attr_name} = "{local_part}"', safe="")
+    # UserEmail is a Keyword attribute, matching the Workflow's typed value.
+    query = quote(f'{search_attr_name} = "{email}"', safe="")
     return f"{base_url}/namespaces/{namespace_path}/workflows?query={query}"
 
 

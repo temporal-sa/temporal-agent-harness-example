@@ -42,8 +42,9 @@ and `TEMPORAL_WORKER_BUILD_ID`; the catalog also isolates those in clones.
 Workers remain versioned and workflows are PINNED. The catalog renders a
 1260-second pod shutdown window for the SDK's 1200-second drain timeout.
 Crash/scale-down controls affect workers, leaving the API, Redis, and executor
-available. Submit approvals while workers are stopped, then scale up to show
-Temporal delivering the buffered Signals.
+available. Submit approvals or messages while workers are stopped, then scale
+up to show Temporal delivering the buffered Signals. Messages preserve the
+chat's current tool configuration if the MCP settings query times out.
 
 ## Storage and internal credentials
 
@@ -96,3 +97,5 @@ and recovery. `/healthz` gates basic startup; it does not prove those flows.
 This branch starts in a fresh catalog namespace. It does not replace workers
 polling old demo queues or migrate their histories. Keep the original branch
 and old workers for any workflows still pinned to those deployments.
+Later catalog runtime replacements also need old workers preserved until
+compatible pinned executions have been replayed and moved to the replacement.
