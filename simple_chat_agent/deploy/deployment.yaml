@@ -200,6 +200,9 @@ spec:
         component: worker
     spec:
       serviceAccountName: agent-harness
+      # Temporal drains in-flight Activities for 20 minutes on SIGTERM. Keep
+      # the pod alive slightly longer so completion can reach the server.
+      terminationGracePeriodSeconds: 1260
       containers:
         - name: worker
           image: 429214323166.dkr.ecr.us-west-1.amazonaws.com/temporal-michaelj-agent-harness-demo:1.0
@@ -240,6 +243,8 @@ spec:
               value: https://agent-harness-demo.tmprl-demo.cloud
             - name: SIMPLE_CHAT_WORKER_VERSION
               value: "1.0.0"
+            - name: SIMPLE_CHAT_WORKER_GRACEFUL_SHUTDOWN_SECONDS
+              value: "1200"
             - name: SIMPLE_CHAT_SEARXNG_BASE_URL
               value: http://agent-harness-searxng.temporal-michaelj-agent-harness-demo.svc.cluster.local:8080
             - name: WORKSPACE_EXECUTOR_URL

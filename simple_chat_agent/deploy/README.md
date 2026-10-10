@@ -32,7 +32,9 @@ any local volume:
   installs the Pod's egress firewall and exits; the long-running executor is
   non-root and capless. It receives no app secret, ServiceAccount token, or IAM
   role, and refuses readiness if an ambient AWS or Kubernetes credential path
-  is detected.
+  is detected. Tini runs as PID 1 to reap orphaned Bubblewrap children, and the
+  health probe periodically launches a real sandbox command and rejects an
+  executor that accumulates orphaned zombie processes.
 
 ## Deployment Philosophy
 

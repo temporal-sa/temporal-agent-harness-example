@@ -82,6 +82,9 @@ spec:
           image: 429214323166.dkr.ecr.us-west-1.amazonaws.com/temporal-michaelj-agent-harness-demo:testing
           imagePullPolicy: IfNotPresent
           command:
+            - /usr/bin/tini
+            - -g
+            - --
             - python
             - -m
             - simple_chat_agent.worker.sandbox.executor
@@ -100,6 +103,10 @@ spec:
               value: "8082"
             - name: WORKSPACE_EXECUTOR_MAX_CONCURRENT
               value: "4"
+            - name: WORKSPACE_EXECUTOR_LIVE_HEALTH_INTERVAL_SECONDS
+              value: "30"
+            - name: WORKSPACE_EXECUTOR_MAX_ORPHAN_ZOMBIES
+              value: "8"
             - name: PYTHONDONTWRITEBYTECODE
               value: "1"
           volumeMounts:

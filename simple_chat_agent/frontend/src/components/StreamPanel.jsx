@@ -5,6 +5,7 @@ import { AgentStreamEventKind } from "../state/streamEvents.js";
 
 export function StreamPanel({
   turn,
+  waiting = false,
   collapsed,
   onToggle,
   embedded = false,
@@ -14,7 +15,7 @@ export function StreamPanel({
   const timeline = useMemo(() => normalizeStreamTimeline(turn), [turn]);
   const agents = useMemo(() => streamAgents(timeline), [timeline]);
 
-  if (!turn || !timeline.segments.length) return null;
+  if ((!turn || !timeline.segments.length) && !waiting) return null;
 
   return (
     <section
@@ -267,6 +268,7 @@ function eventSummary(event) {
 }
 
 function panelStatus(timeline, agents) {
+  if (!(timeline.segments || []).length) return "dispatching";
   const subagents = agents.filter((agent) => agent.kind === "subagent").length;
   const events = (timeline.segments || []).reduce(
     (count, segment) => count + (segment.events?.length || 0),

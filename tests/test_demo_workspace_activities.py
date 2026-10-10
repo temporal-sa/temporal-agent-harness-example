@@ -8,9 +8,13 @@ from simple_chat_agent.worker.demo_workspace_activities import (
     _common_env,
     _redis_deployment,
     _service,
+    _worker_deployment,
 )
 from simple_chat_agent.worker.demo_workspace_workflow import (
     ProvisionDemoWorkspaceRequest,
+)
+from simple_chat_agent.worker.shutdown import (
+    WORKER_GRACEFUL_SHUTDOWN_SECONDS_ENV,
 )
 from simple_chat_agent.worker.tools.research import (
     GOOGLE_SEARCH_GROUNDING_API_KEY,
@@ -19,6 +23,37 @@ from simple_chat_agent.worker.tools.research import (
 
 
 class DemoWorkspaceRedisTests(unittest.TestCase):
+    def test_workspace_worker_has_time_to_drain_activities(self) -> None:
+        request = ProvisionDemoWorkspaceRequest(
+            namespace="workspace-1",
+            temporal_namespace="namespace",
+            host="workspace.example.com",
+            url="https://workspace.example.com",
+            task_queue="workspace-queue",
+            workflow_prefix="workspace-",
+            control_workflow_id="controller",
+            parent_public_url="https://parent.example.com",
+            source_namespace="source",
+            source_secret_name="source-secret",
+            tls_secret_name="source-tls",
+            source_web_deployment="web",
+            source_api_deployment="api",
+            source_worker_deployment="worker",
+            user_email="user@example.com",
+        )
+        with patch.dict(
+            os.environ,
+            {WORKER_GRACEFUL_SHUTDOWN_SECONDS_ENV: "120"},
+            clear=True,
+        ):
+            env = _common_env(request)
+            deployment = _worker_deployment("worker-image", "workspace-1", env)
+
+        values = {item["name"]: item["value"] for item in env if "value" in item}
+        pod_spec = deployment["spec"]["template"]["spec"]
+        self.assertEqual(values[WORKER_GRACEFUL_SHUTDOWN_SECONDS_ENV], "120")
+        self.assertEqual(pod_spec["terminationGracePeriodSeconds"], 180)
+
     def test_workspace_env_wires_redis_without_copying_the_token_value(self) -> None:
         request = ProvisionDemoWorkspaceRequest(
             namespace="workspace-1",

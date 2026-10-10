@@ -41,6 +41,11 @@ export function Messages({
     transcriptOffset,
     transcriptTotal,
   );
+  const waitingForRuntime =
+    workflowState?.status === "responding" ||
+    localPending.some((pending) =>
+      ["sending", "delivered"].includes(String(pending?.phase || "")),
+    );
   const hasContent = workflowState || localPending.length > 0;
   if (loadingConversation) {
     return <ConversationLoading />;
@@ -87,6 +92,7 @@ export function Messages({
       ))}
       <StreamPanel
         turn={streamTurn}
+        waiting={waitingForRuntime}
         collapsed={streamPanelCollapsed}
         onToggle={onToggleStreamPanel}
         inputText={activeMessage?.role === "user" ? activeMessage.content : ""}

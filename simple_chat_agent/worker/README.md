@@ -52,7 +52,7 @@ a `ClaudeAgent` for chat workflows.
   configuration, and demo workspace record.
 - `SubagentWorkflow`: recursively delegating child agent workflow used by the
   `create_subagent` tool. The main workflow is depth 0; subagents through depth
-  9 may delegate, while depth-10 subagents do not receive `create_subagent`.
+  2 may delegate, while depth-3 subagents do not receive `create_subagent`.
   Every descendant keeps the main chat workflow as its approval and artifact
   authority while recording its immediate delegator for stream lineage.
 - `DemoWorkspaceWorkflow`: controller for temporary demo workspaces.
@@ -147,6 +147,10 @@ Environment variables:
 - `SIMPLE_CHAT_WORKER_VERSION`: build id, default `1.0.0`.
 - `SIMPLE_CHAT_WORKER_DEPLOYMENT_NAME`: deployment name, default task queue.
 - `SIMPLE_CHAT_WORKER_VERSIONING_ENABLED`: set false/0/no/off to disable.
+- `SIMPLE_CHAT_WORKER_GRACEFUL_SHUTDOWN_SECONDS`: time to stop polling and wait
+  for in-flight Activities after shutdown starts, default 1200 seconds. Shared
+  Kubernetes deployments use a 1260-second pod termination grace period so the
+  Worker has an additional minute to report completions and exit.
 
 The default behavior is pinned. Continue-as-new calls use
 `AUTO_UPGRADE`, so a workflow can move to the latest compatible deployment when

@@ -235,6 +235,14 @@ export function restoreActiveStreamTurnInState(previous, events) {
   };
 }
 
+export function applyReplayedStreamEventsInState(previous, events) {
+  let next = previous;
+  for (const event of events || []) {
+    next = handleStreamEventInState(next, event);
+  }
+  return next;
+}
+
 export function prependTranscriptPageInState(previous, page) {
   if (!previous.workflowState) return previous;
   return {

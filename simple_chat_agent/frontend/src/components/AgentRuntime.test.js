@@ -1,7 +1,30 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 
 import { createServer } from "vite";
+
+test("the runtime appears immediately while an accepted turn awaits stream events", async (t) => {
+  const server = await createServer({
+    server: { middlewareMode: true },
+    appType: "custom",
+  });
+  t.after(() => server.close());
+  const { StreamPanel } = await server.ssrLoadModule("/src/components/StreamPanel.jsx");
+
+  const markup = renderToStaticMarkup(
+    createElement(StreamPanel, {
+      turn: null,
+      waiting: true,
+      collapsed: false,
+    }),
+  );
+
+  assert.match(markup, /Agent runtime/);
+  assert.match(markup, /dispatching/);
+  assert.match(markup, /Waiting for agent activity/);
+});
 
 test("the agent switcher always keeps the main agent first", async (t) => {
   const server = await createServer({

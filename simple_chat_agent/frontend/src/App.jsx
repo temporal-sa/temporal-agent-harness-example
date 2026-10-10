@@ -10,6 +10,7 @@ import { artifactNeedsTextFetch, artifactPreviewKind } from "./utils/artifacts.j
 import { jsonHeaders, responseErrorText } from "./utils/http.js";
 import { mcpOAuthStartUrl } from "./utils/tools.js";
 import {
+  applyReplayedStreamEventsInState,
   applyWorkflowStatePatchInState,
   agentSettingsFromConfig,
   applyTranscriptDeltasInState,
@@ -37,9 +38,16 @@ import {
 } from "./state/initialState.js";
 import {
   coalesceBufferedStreamEvents,
+  coalesceStreamEvents,
   latestBufferedStreamCursor,
+  takeBufferedStreamEventBatch,
 } from "./state/streamBuffer.js";
 import { AgentStreamEventKind } from "./state/streamEvents.js";
+import {
+  TURN_STREAM_FIRST_EVENT_TIMEOUT_MS,
+  turnStreamNeedsRecovery,
+  turnStreamRecoveryDelay,
+} from "./state/turnStream.js";
 
 const TURN_TRACE_CACHE_PREFIX = "simpleChatTurnTraces:v2:";
 const TURN_TRACE_CACHE_LIMIT = 12;
@@ -192,6 +200,7 @@ export default function App() {
   const streamEventBufferRef = useRef([]);
   const streamEventFrameRef = useRef(null);
   const turnLatencyRef = useRef(null);
+  const turnStreamRecoveryAttemptRef = useRef(0);
 
   useEffect(() => {
     stateRef.current = state;
@@ -378,8 +387,7 @@ export default function App() {
 
   function flushStreamEvents() {
     streamEventFrameRef.current = null;
-    const pending = streamEventBufferRef.current;
-    streamEventBufferRef.current = [];
+    const pending = takeBufferedStreamEventBatch(streamEventBufferRef.current);
     if (!pending.length) return;
     const coalesced = coalesceBufferedStreamEvents(pending);
 
@@ -552,9 +560,9 @@ export default function App() {
     };
   }
 
-  async function loadActiveStreamReplayData(workflowId) {
+  async function loadActiveStreamReplayData(workflowId, options = {}) {
     const events = [];
-    let cursor = "";
+    let cursor = options.cursor || "";
     for (let page = 0; page < 50; page += 1) {
       const params = new URLSearchParams({ limit: "5000" });
       if (cursor) params.set("cursor", cursor);
@@ -707,11 +715,18 @@ export default function App() {
         ? updateWorkflowStateInState(previous, loaded.workflowState)
         : previous,
     );
-    if (options.resumeActive && workflowHasActiveRun(loaded.workflowState)) {
+    const activeRun = workflowHasActiveRun(loaded.workflowState);
+    if (!activeRun && !streamCursorRef.current) {
+      streamCursorRef.current = loaded.streamCursor;
+    }
+    if (options.resumeActive && activeRun) {
       let resumeCursor = streamCursorRef.current || loaded.streamCursor;
       if (options.restoreActiveStream) {
         try {
-          const replay = await loadActiveStreamReplayData(workflowId);
+          const replayStartCursor = streamCursorRef.current;
+          const replay = await loadActiveStreamReplayData(workflowId, {
+            cursor: replayStartCursor,
+          });
           if (
             stateLoadRequestRef.current !== loadRequest ||
             stateRef.current.workflowId !== workflowId
@@ -721,11 +736,17 @@ export default function App() {
           if (replay?.replay_available) {
             resumeCursor = replay.cursor || resumeCursor;
             streamCursorRef.current = resumeCursor;
+            const replayEvents = coalesceStreamEvents(replay.events || []);
             setState((previous) =>
               previous.workflowId === workflowId
-                ? restoreActiveStreamTurnInState(previous, replay.events || [])
+                ? previous.streamTurn && replayStartCursor
+                  ? applyReplayedStreamEventsInState(previous, replayEvents)
+                  : restoreActiveStreamTurnInState(previous, replayEvents)
                 : previous,
             );
+          } else if (replay?.cursor) {
+            resumeCursor = replay.cursor;
+            streamCursorRef.current = replay.cursor;
           }
         } catch (error) {
           console.warn("active stream replay failed", { workflowId, error });
@@ -886,6 +907,11 @@ export default function App() {
     let settled = false;
     let reconciled = false;
     let finished = false;
+    let accepted = false;
+    let firstEventReceived = false;
+    let streamErrored = false;
+    let firstEventTimer = null;
+    let recoveryTimer = null;
 
     let resolveCompletion;
     let resolveOpened;
@@ -899,6 +925,14 @@ export default function App() {
     function finish() {
       if (finished) return;
       finished = true;
+      if (firstEventTimer !== null) {
+        window.clearTimeout(firstEventTimer);
+        firstEventTimer = null;
+      }
+      if (recoveryTimer !== null) {
+        window.clearTimeout(recoveryTimer);
+        recoveryTimer = null;
+      }
       if (source) source.close();
       if (turnStreamTokenRef.current === token) {
         turnStreamSourceRef.current = null;
@@ -907,6 +941,77 @@ export default function App() {
       }
       resolveOpened(false);
       resolveCompletion({ settled, reconciled });
+    }
+
+    function scheduleRecovery(reason) {
+      if (
+        finished ||
+        recoveryTimer !== null ||
+        !turnStreamNeedsRecovery({ settled, reconciled })
+      ) {
+        return;
+      }
+      flushStreamEventsNow();
+      const attempt = turnStreamRecoveryAttemptRef.current;
+      turnStreamRecoveryAttemptRef.current += 1;
+      const delay = turnStreamRecoveryDelay(attempt);
+      console.warn("turn stream recovery scheduled", {
+        workflowId,
+        reason,
+        attempt,
+        delay,
+      });
+      recoveryTimer = window.setTimeout(() => {
+        recoveryTimer = null;
+        if (turnStreamTokenRef.current !== token || finished) return;
+        finish();
+        reconcileWorkflow(workflowId, {
+          resumeActive: true,
+          restoreActiveStream: true,
+        });
+      }, delay);
+    }
+
+    function armFirstEventWatchdog() {
+      accepted = true;
+      if (firstEventReceived) return;
+      if (finished) {
+        const attempt = turnStreamRecoveryAttemptRef.current;
+        turnStreamRecoveryAttemptRef.current += 1;
+        window.setTimeout(() => {
+          if (
+            turnStreamTokenRef.current === token &&
+            stateRef.current.workflowId === workflowId
+          ) {
+            reconcileWorkflow(workflowId, {
+              resumeActive: true,
+              restoreActiveStream: true,
+            });
+          }
+        }, turnStreamRecoveryDelay(attempt));
+        return;
+      }
+      if (streamErrored) {
+        scheduleRecovery("stream unavailable after message acceptance");
+        return;
+      }
+      if (firstEventTimer !== null) window.clearTimeout(firstEventTimer);
+      firstEventTimer = window.setTimeout(() => {
+        firstEventTimer = null;
+        scheduleRecovery("no first event after message acceptance");
+      }, TURN_STREAM_FIRST_EVENT_TIMEOUT_MS);
+    }
+
+    function noteStreamEvent() {
+      const first = !firstEventReceived;
+      firstEventReceived = true;
+      streamErrored = false;
+      turnStreamRecoveryAttemptRef.current = 0;
+      if (firstEventTimer !== null) {
+        window.clearTimeout(firstEventTimer);
+        firstEventTimer = null;
+      }
+      return first;
     }
 
     turnStreamFinishRef.current = finish;
@@ -921,8 +1026,10 @@ export default function App() {
       if (turnStreamTokenRef.current !== token) return;
       const streamEvent = parseStreamEventData(message);
       if (!streamEvent) return;
+      const first = noteStreamEvent();
       recordFirstStreamEvent(streamEvent, message.lastEventId);
       enqueueStreamEvent(workflowId, streamEvent, message.lastEventId);
+      if (first) flushStreamEventsNow();
       if (
         streamEvent.kind === AgentStreamEventKind.AGENT_START &&
         streamEvent.agent?.kind !== "subagent"
@@ -936,6 +1043,7 @@ export default function App() {
 
     source.addEventListener("turn_settled", async (message) => {
       if (turnStreamTokenRef.current !== token) return;
+      noteStreamEvent();
       flushStreamEventsNow();
       if (message.lastEventId) streamCursorRef.current = message.lastEventId;
       const body = parseStreamEventData(message);
@@ -953,6 +1061,7 @@ export default function App() {
 
     source.addEventListener("reconcile", (message) => {
       if (turnStreamTokenRef.current !== token) return;
+      noteStreamEvent();
       flushStreamEventsNow();
       if (message.lastEventId) streamCursorRef.current = message.lastEventId;
       reconciled = true;
@@ -970,19 +1079,16 @@ export default function App() {
         finish();
         return;
       }
-      if (source.readyState === EventSource.CLOSED && !settled && !reconciled) {
-        finish();
-        deferReconcileWorkflow(workflowId, {
-          resumeActive: true,
-          restoreActiveStream: true,
-        });
-      }
+      streamErrored = true;
+      if (accepted) scheduleRecovery(`EventSource readyState=${source.readyState}`);
     };
-    return { completion, finish, opened };
+    return { completion, finish, opened, armFirstEventWatchdog };
   }
 
   async function openTurnEventSource(workflowId, options = {}) {
-    return startTurnEventSource(workflowId, options).completion;
+    const turnStream = startTurnEventSource(workflowId, options);
+    turnStream.armFirstEventWatchdog();
+    return turnStream.completion;
   }
 
   async function resumeActiveTurnStream(workflowId, options = {}) {
@@ -992,6 +1098,7 @@ export default function App() {
 
   async function streamChatMessage(workflowId, payload, pendingId) {
     beginTurnLatency(workflowId);
+    turnStreamRecoveryAttemptRef.current = 0;
     const initialCursor = streamCursorRef.current;
     const turnStream = startTurnEventSource(workflowId, {
       cursor: initialCursor,
@@ -1034,6 +1141,7 @@ export default function App() {
 
     await response.json();
     markPendingDelivered(pendingId);
+    turnStream.armFirstEventWatchdog();
     await turnStream.completion;
   }
 
@@ -1201,7 +1309,10 @@ export default function App() {
 
     setState((previous) => {
       if (previous.workflowId !== workflowId) return previous;
-      const merged = mergeReplayedTurnTracesInState(previous, body.events || []);
+      const merged = mergeReplayedTurnTracesInState(
+        previous,
+        coalesceStreamEvents(body.events || []),
+      );
       return merged.turnTraces?.[transcriptIndex]?.turn
         ? merged
         : setTurnTraceErrorInState(

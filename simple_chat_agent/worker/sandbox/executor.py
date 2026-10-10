@@ -34,6 +34,8 @@ PROGRESS_INTERVAL_SECONDS = 5
 TERMINATE_GRACE_SECONDS = 2
 WORKSPACE_MODE = 0o700
 STATE_DIR_NAME = ".executor-state"
+DEFAULT_LIVE_HEALTH_INTERVAL_SECONDS = 30.0
+DEFAULT_MAX_ORPHAN_ZOMBIES = 8
 _SAFE_EXECUTION_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 
 
@@ -60,11 +62,16 @@ _concurrency = asyncio.Semaphore(
     max(1, int(os.environ.get("WORKSPACE_EXECUTOR_MAX_CONCURRENT", "4")))
 )
 _self_test_error: str | None = None
+_live_health_lock = asyncio.Lock()
+_last_live_health_check_at = 0.0
+_last_live_health_error: str | None = None
 
 
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
-    missing = [name for name in ("bwrap", "bash", "prlimit") if shutil.which(name) is None]
+    missing = [
+        name for name in ("bwrap", "bash", "prlimit") if shutil.which(name) is None
+    ]
     if missing:
         raise HTTPException(
             status_code=503,
@@ -72,7 +79,74 @@ async def healthz() -> dict[str, str]:
         )
     if _self_test_error is not None:
         raise HTTPException(status_code=503, detail=_self_test_error)
+    live_error = await _live_sandbox_health_error()
+    if live_error is not None:
+        raise HTTPException(status_code=503, detail=live_error)
     return {"status": "ok"}
+
+
+async def _live_sandbox_health_error() -> str | None:
+    global _last_live_health_check_at, _last_live_health_error
+
+    zombie_count = _orphaned_zombie_count()
+    max_zombies = max(
+        0,
+        int(
+            os.environ.get(
+                "WORKSPACE_EXECUTOR_MAX_ORPHAN_ZOMBIES",
+                str(DEFAULT_MAX_ORPHAN_ZOMBIES),
+            )
+        ),
+    )
+    if zombie_count > max_zombies:
+        return (
+            "Workspace sandbox reaper is unhealthy: "
+            f"found {zombie_count} orphaned zombie processes "
+            f"(maximum {max_zombies})."
+        )
+
+    interval_seconds = max(
+        1.0,
+        float(
+            os.environ.get(
+                "WORKSPACE_EXECUTOR_LIVE_HEALTH_INTERVAL_SECONDS",
+                str(DEFAULT_LIVE_HEALTH_INTERVAL_SECONDS),
+            )
+        ),
+    )
+    now = time.monotonic()
+    if now - _last_live_health_check_at < interval_seconds:
+        return _last_live_health_error
+
+    async with _live_health_lock:
+        now = time.monotonic()
+        if now - _last_live_health_check_at < interval_seconds:
+            return _last_live_health_error
+        _last_live_health_error = await asyncio.to_thread(_sandbox_self_test)
+        _last_live_health_check_at = time.monotonic()
+        return _last_live_health_error
+
+
+def _orphaned_zombie_count(proc_root: Path = Path("/proc")) -> int:
+    if not proc_root.is_dir():
+        return 0
+
+    count = 0
+    for status_path in proc_root.glob("[0-9]*/status"):
+        try:
+            status = status_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        state = ""
+        parent_pid = ""
+        for line in status.splitlines():
+            if line.startswith("State:"):
+                state = line.removeprefix("State:").strip()
+            elif line.startswith("PPid:"):
+                parent_pid = line.removeprefix("PPid:").strip()
+        if state.startswith("Z") and parent_pid == "1":
+            count += 1
+    return count
 
 
 @app.post("/execute")
@@ -400,7 +474,9 @@ def _normalize_cwd(value: str) -> str:
 def _authorize(authorization: str | None) -> None:
     expected = os.environ.get("WORKSPACE_EXECUTOR_TOKEN", "")
     if not expected:
-        raise HTTPException(status_code=503, detail="Executor authentication is not configured.")
+        raise HTTPException(
+            status_code=503, detail="Executor authentication is not configured."
+        )
     scheme, _, supplied = (authorization or "").partition(" ")
     if scheme.lower() != "bearer" or not hmac.compare_digest(supplied, expected):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -491,9 +567,7 @@ def _credential_boundary_self_test() -> str | None:
     if exposed:
         return f"Executor credential boundary failed: {', '.join(exposed)} is set."
 
-    service_account_token = Path(
-        "/var/run/secrets/kubernetes.io/serviceaccount/token"
-    )
+    service_account_token = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
     if service_account_token.exists():
         return "Executor credential boundary failed: ServiceAccount token is mounted."
 
@@ -521,9 +595,7 @@ def _credential_boundary_self_test() -> str | None:
 
     kubernetes_host = os.environ.get("KUBERNETES_SERVICE_HOST")
     kubernetes_port = int(os.environ.get("KUBERNETES_SERVICE_PORT", "443"))
-    if kubernetes_host and _tcp_endpoint_reachable(
-        kubernetes_host, kubernetes_port
-    ):
+    if kubernetes_host and _tcp_endpoint_reachable(kubernetes_host, kubernetes_port):
         return "Executor credential boundary failed: Kubernetes API is reachable."
     return None
 

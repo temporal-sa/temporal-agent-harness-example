@@ -307,14 +307,14 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(child_request.delegation_depth, 2)
         self.assertFalse(result.error)
 
-    async def test_depth_ten_child_does_not_receive_create_subagent(self) -> None:
+    async def test_max_depth_child_does_not_receive_create_subagent(self) -> None:
         workflow_info = Mock(
-            workflow_id="simple-chat-main-subagent-depth-9",
+            workflow_id="simple-chat-main-subagent-parent-at-boundary",
             typed_search_attributes=TypedSearchAttributes([]),
         )
         ctx = Mock(
             stream_id="simple-chat-main",
-            tool_call_id="create-depth-10-call",
+            tool_call_id="create-max-depth-call",
         )
         ctx.tool_names.return_value = ["research", CREATE_SUBAGENT_TOOL]
         provider = SubagentProvider(
@@ -326,7 +326,7 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
             delegation_depth=lambda: MAX_SUBAGENT_DELEGATION_DEPTH - 1,
         )
         child_result = SubagentResponse(
-            text="Depth-10 research complete.",
+            text="Maximum-depth research complete.",
             stop_reason="end_turn",
             turns=1,
             model="claude-sonnet-4-5",
@@ -341,7 +341,7 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 "simple_chat_agent.worker.tools.subagent.workflow.uuid4",
-                return_value="depth-10",
+                return_value="max-depth",
             ),
             patch(
                 "simple_chat_agent.worker.tools.subagent.workflow."
@@ -364,6 +364,28 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(CREATE_SUBAGENT_TOOL, child_request.denied_tool_names)
         self.assertFalse(result.error)
 
+    async def test_subagent_rejects_a_model_outside_the_advertised_policy(
+        self,
+    ) -> None:
+        provider = SubagentProvider(
+            default_model=lambda: "claude-sonnet-4-6",
+            user_ref=lambda: "user-123",
+            conversation_id=lambda: "simple-chat-main",
+            github_connection_id=lambda: None,
+        )
+
+        result = await provider.create_subagent(
+            Mock(),
+            task="Investigate the question.",
+            model="claude-opus-5",  # type: ignore[arg-type]
+        )
+
+        self.assertTrue(result.error)
+        self.assertIn(
+            "Unsupported subagent model 'claude-opus-5'",
+            result.payload["error"],
+        )
+
     async def test_workflow_enforces_delegation_depth_boundary(self) -> None:
         task_queue = f"subagent-depth-{uuid.uuid4()}"
         async with (
@@ -376,34 +398,34 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
                 workflow_runner=agent_harness_workflow_runner(),
             ),
         ):
-            depth_nine = await env.client.execute_workflow(
+            delegating_depth = await env.client.execute_workflow(
                 SubagentWorkflow.run,
                 SubagentRequest(
                     system_prompt="Complete the test task.",
-                    task="Verify depth-nine tools.",
+                    task="Verify tools immediately below the depth boundary.",
                     model="claude-sonnet-4-5",
                     tool_names=["research", CREATE_SUBAGENT_TOOL],
                     delegation_depth=MAX_SUBAGENT_DELEGATION_DEPTH - 1,
                 ),
-                id=f"subagent-depth-9-{uuid.uuid4()}",
+                id=f"subagent-delegating-depth-{uuid.uuid4()}",
                 task_queue=task_queue,
             )
-            depth_ten = await env.client.execute_workflow(
+            max_depth = await env.client.execute_workflow(
                 SubagentWorkflow.run,
                 SubagentRequest(
                     system_prompt="Complete the test task.",
-                    task="Verify depth-ten tools.",
+                    task="Verify tools at the maximum depth.",
                     model="claude-sonnet-4-5",
                     tool_names=["research", CREATE_SUBAGENT_TOOL],
                     delegation_depth=MAX_SUBAGENT_DELEGATION_DEPTH,
                 ),
-                id=f"subagent-depth-10-{uuid.uuid4()}",
+                id=f"subagent-max-depth-{uuid.uuid4()}",
                 task_queue=task_queue,
             )
 
-        self.assertIn(CREATE_SUBAGENT_TOOL, depth_nine.tool_names)
-        self.assertNotIn(CREATE_SUBAGENT_TOOL, depth_ten.tool_names)
-        self.assertNotIn(CREATE_SUBAGENT_TOOL, depth_ten.denied_tool_names)
+        self.assertIn(CREATE_SUBAGENT_TOOL, delegating_depth.tool_names)
+        self.assertNotIn(CREATE_SUBAGENT_TOOL, max_depth.tool_names)
+        self.assertNotIn(CREATE_SUBAGENT_TOOL, max_depth.denied_tool_names)
 
     def test_tool_schema_encourages_selective_delegation_with_one_required_input(
         self,
@@ -422,6 +444,15 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(schema["input_schema"]["required"], ["task"])
+        self.assertEqual(
+            schema["input_schema"]["properties"]["model"]["anyOf"][0]["enum"],
+            [
+                "claude-opus-4-8",
+                "claude-sonnet-4-6",
+                "claude-sonnet-4-5-20250929",
+                "claude-haiku-4-5-20251001",
+            ],
+        )
         self.assertIn("Delegate only when", schema["description"])
         self.assertIn("Prefer completing focused work yourself", schema["description"])
         self.assertIn("smallest number of subagents necessary", schema["description"])
@@ -430,7 +461,7 @@ class SubagentSearchAttributeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("same assistant turn", schema["description"])
         self.assertIn(
-            "depth-10 agents do not receive create_subagent", schema["description"]
+            "depth-3 agents do not receive create_subagent", schema["description"]
         )
         self.assertNotIn("Proactively delegate", schema["description"])
 

@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import asdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any, AsyncIterator, Callable
 
@@ -16,6 +15,7 @@ from simple_chat_agent.api.anthropic_models import (
     clamp_output_tokens_for_model,
     get_anthropic_model_catalog,
     max_context_tokens_for_model,
+    select_anthropic_model,
 )
 from simple_chat_agent.api.artifacts import artifact_response
 from simple_chat_agent.api.auth import AuthenticatedUser
@@ -40,7 +40,6 @@ from simple_chat_agent.api.serialization import (
 from simple_chat_agent.api.streaming import StreamBroker
 from simple_chat_agent.api.temporal_ui import temporal_ui_url
 from simple_chat_agent.api.thinking import (
-    default_model,
     good_place_enabled,
     thinking_config_from_request,
 )
@@ -64,10 +63,14 @@ from simple_chat_agent.worker.user_chats_workflow import (
     CreateChatRequest,
     UserChatsWorkflow,
 )
-from simple_chat_agent.worker.workflow import ChatSignalRequest, SimpleChatWorkflow
-from simple_chat_agent.worker.workflow import TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES
-from simple_chat_agent.worker.workflow import TRANSCRIPT_QUERY_HARD_MAX_BYTES
-from simple_chat_agent.worker.workflow import TRANSCRIPT_QUERY_MIN_MAX_BYTES
+from simple_chat_agent.worker.workflow import (
+    TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES,
+    TRANSCRIPT_QUERY_HARD_MAX_BYTES,
+    TRANSCRIPT_QUERY_MIN_MAX_BYTES,
+    ChatSignalRequest,
+    SimpleChatWorkflow,
+)
+
 
 @dataclass(frozen=True)
 class SessionRouteDeps:
@@ -124,7 +127,13 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         registry = await deps.ensure_user_chats_workflow(user.user_id, user.username)
         mcp_servers = await registry.query(UserChatsWorkflow.list_mcp_servers)
         model_catalog = await asyncio.to_thread(get_anthropic_model_catalog)
-        model = session_request.model or default_model(model_catalog)
+        try:
+            model = select_anthropic_model(model_catalog, session_request.model)
+        except ValueError as err:
+            raise HTTPException(
+                status_code=400,
+                detail=str(err),
+            ) from err
         max_tokens = clamp_output_tokens_for_model(
             session_request.max_tokens,
             model_catalog,
@@ -655,10 +664,10 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             raise HTTPException(status_code=404, detail="Artifact not found")
         mime_type = artifact.mime_type.lower()
         name = artifact.name.lower()
-        if (
-            mime_type not in ("text/html", "application/xhtml+xml")
-            and not name.endswith((".html", ".htm", ".xhtml"))
-        ):
+        if mime_type not in (
+            "text/html",
+            "application/xhtml+xml",
+        ) and not name.endswith((".html", ".htm", ".xhtml")):
             raise HTTPException(
                 status_code=415,
                 detail="Artifact is not an HTML document",
@@ -804,9 +813,8 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
 
 
 def _is_conversation_agent(workflow_id: str, agent_workflow_id: str) -> bool:
-    return (
-        agent_workflow_id == workflow_id
-        or agent_workflow_id.startswith(f"{workflow_id}-subagent-")
+    return agent_workflow_id == workflow_id or agent_workflow_id.startswith(
+        f"{workflow_id}-subagent-"
     )
 
 
@@ -857,10 +865,7 @@ async def _chat_signal_request(
         github_connection_id=github_connection_id,
         mcp_servers=mcp_servers,
         reference_time=(
-            datetime.now(UTC)
-            .replace(microsecond=0)
-            .isoformat()
-            .replace("+00:00", "Z")
+            datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         ),
     )
 

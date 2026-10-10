@@ -15,6 +15,11 @@ with workflow.unsafe.imports_passed_through():
     from agent_harness.tool_types import ToolType
     from agent_harness.tools import ToolContext, ToolResult, ToolSet, tool
     from simple_chat_agent import TASK_QUEUE
+    from simple_chat_agent.common.model_policy import (
+        SELECTABLE_ANTHROPIC_MODEL_IDS,
+        SelectableAnthropicModel,
+        anthropic_model_is_allowed,
+    )
     from simple_chat_agent.worker.tools.approval import (
         TOOL_APPROVAL_TIMEOUT,
         ApprovalDecision,
@@ -29,7 +34,7 @@ with workflow.unsafe.imports_passed_through():
 
 
 CREATE_SUBAGENT_TOOL = "create_subagent"
-MAX_SUBAGENT_DELEGATION_DEPTH = 10
+MAX_SUBAGENT_DELEGATION_DEPTH = 3
 _DEFAULT_SUBAGENT_MAX_TOKENS = 16_000
 _MAX_SUBAGENT_MAX_TOKENS = 32_000
 
@@ -56,7 +61,7 @@ class SubagentRequest:
     reference_time: str = ""
     agent_state: AgentState | None = None
     approval_counter: int = 0
-    # Main workflow is depth 0; its first child is depth 1. Depth-10 agents do
+    # Main workflow is depth 0; its first child is depth 1. Depth-3 agents do
     # not receive create_subagent, but retain all of their other granted tools.
     delegation_depth: int = 1
 
@@ -107,9 +112,10 @@ class SubagentProvider:
             "in the same assistant turn run concurrently. Each child returns "
             "findings for you to cross-check and synthesize. Omit tool_names to "
             "grant all currently available tools, or pass a focused subset. "
-            "Subagents may recursively delegate through depth 9; depth-10 agents "
+            "Subagents may recursively delegate through depth 2; depth-3 agents "
             "do not receive create_subagent. Mutating tools still request approval "
-            "through the parent chat."
+            "through the parent chat. The optional model must be one of the "
+            "advertised Claude Sonnet, Haiku, or Opus 4.8 choices."
         ),
         tool_type=ToolType.READ,
     )
@@ -127,7 +133,7 @@ class SubagentProvider:
             "agent to synthesize."
         ),
         tool_names: list[str] | None = None,
-        model: str | None = None,
+        model: SelectableAnthropicModel | None = None,
         max_tokens: int = _DEFAULT_SUBAGENT_MAX_TOKENS,
     ) -> ToolResult:
         if not system_prompt.strip():
@@ -137,6 +143,16 @@ class SubagentProvider:
             )
         if not task.strip():
             return ToolResult(payload={"error": "task is required."}, error=True)
+        if model is not None and not anthropic_model_is_allowed(model):
+            return ToolResult(
+                payload={
+                    "error": (
+                        f"Unsupported subagent model {model!r}. Choose one of: "
+                        f"{', '.join(SELECTABLE_ANTHROPIC_MODEL_IDS)}."
+                    )
+                },
+                error=True,
+            )
 
         available_tool_names = ctx.tool_names()
         current_workflow_id = workflow.info().workflow_id

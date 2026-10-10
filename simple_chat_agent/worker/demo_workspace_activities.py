@@ -16,6 +16,11 @@ from simple_chat_agent.common.external_storage import purge_workflow_payloads
 from simple_chat_agent.worker.demo_workspace_workflow import (
     ProvisionDemoWorkspaceRequest,
 )
+from simple_chat_agent.worker.shutdown import (
+    WORKER_GRACEFUL_SHUTDOWN_SECONDS_ENV,
+    kubernetes_termination_grace_period_seconds,
+    worker_graceful_shutdown_seconds,
+)
 from simple_chat_agent.worker.tools.research import (
     GOOGLE_RESEARCH_API_KEY_NAMES,
     GOOGLE_SEARCH_GROUNDING_MODEL,
@@ -453,6 +458,7 @@ def _common_env(request: ProvisionDemoWorkspaceRequest) -> list[dict[str, Any]]:
         "SIMPLE_CHAT_GITHUB_TOOLS_ENABLED": "0",
         "SIMPLE_CHAT_TASK_QUEUE": request.task_queue,
         "SIMPLE_CHAT_WORKER_VERSIONING_ENABLED": "0",
+        WORKER_GRACEFUL_SHUTDOWN_SECONDS_ENV: str(worker_graceful_shutdown_seconds()),
         "SIMPLE_CHAT_WORKFLOW_PREFIX": request.workflow_prefix,
         "SIMPLE_CHAT_PUBLIC_URL": request.url,
         "SIMPLE_CHAT_DEMO_PARENT_WORKFLOW_ID": request.control_workflow_id,
@@ -589,6 +595,9 @@ def _worker_deployment(
         volume_mounts=[{"name": "chat-data", "mountPath": "/app/.simple_chat_agent"}],
         volumes=[{"name": "chat-data", "emptyDir": {}}],
         automount_service_account_token=True,
+        termination_grace_period_seconds=(
+            kubernetes_termination_grace_period_seconds()
+        ),
     )
 
 
@@ -690,6 +699,7 @@ def _deployment(
     volume_mounts: list[dict[str, Any]] | None = None,
     volumes: list[dict[str, Any]] | None = None,
     automount_service_account_token: bool = False,
+    termination_grace_period_seconds: int | None = None,
 ) -> dict[str, Any]:
     labels = {
         "app": WORKSPACE_LABEL,
@@ -708,6 +718,15 @@ def _deployment(
                 "spec": {
                     "serviceAccountName": WORKSPACE_SERVICE_ACCOUNT,
                     "automountServiceAccountToken": automount_service_account_token,
+                    **(
+                        {
+                            "terminationGracePeriodSeconds": (
+                                termination_grace_period_seconds
+                            )
+                        }
+                        if termination_grace_period_seconds is not None
+                        else {}
+                    ),
                     "containers": [
                         {
                             "name": component,

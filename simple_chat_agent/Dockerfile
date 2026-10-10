@@ -50,6 +50,7 @@ RUN apt-get update \
         jq \
         procps \
         ripgrep \
+        tini \
         util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 65532 sandbox \

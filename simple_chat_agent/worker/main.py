@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 from contextlib import suppress
 
 import uvicorn
@@ -49,6 +50,11 @@ from simple_chat_agent.worker.demo_workspace_activities import (
 )
 from simple_chat_agent.worker.demo_workspace_workflow import DemoWorkspaceWorkflow
 from simple_chat_agent.worker.good_place_guards import good_place_post_guard
+from simple_chat_agent.worker.shutdown import (
+    WORKER_GRACEFUL_SHUTDOWN_SECONDS_ENV,
+    worker_graceful_shutdown_seconds,
+    worker_graceful_shutdown_timeout,
+)
 from simple_chat_agent.worker.streaming_activities import emit_turn_settled
 from simple_chat_agent.worker.tools.subagent import SubagentWorkflow
 from simple_chat_agent.worker.user_chats_workflow import UserChatsWorkflow
@@ -129,10 +135,16 @@ async def main() -> None:
         ],
         workflow_runner=agent_harness_workflow_runner(),
         deployment_config=deployment_config,
+        graceful_shutdown_timeout=worker_graceful_shutdown_timeout(),
+    )
+    print(
+        "Temporal worker graceful shutdown enabled: "
+        f"timeout_seconds={worker_graceful_shutdown_seconds()} "
+        f"env={WORKER_GRACEFUL_SHUTDOWN_SECONDS_ENV}"
     )
     try:
         if not codec_server_enabled():
-            await worker.run()
+            await _run_worker_until_stopped(worker)
             return
 
         codec_server = uvicorn.Server(
@@ -156,19 +168,117 @@ async def _run_worker_and_codec_server(
     worker: Worker,
     codec_server: uvicorn.Server,
 ) -> None:
-    tasks = [
-        asyncio.create_task(worker.run(), name="temporal-worker"),
-        asyncio.create_task(codec_server.serve(), name="codec-server"),
-    ]
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    shutdown_requested = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    registered_signals = _register_shutdown_signal_handlers(
+        loop,
+        shutdown_requested,
+    )
+    worker_task = asyncio.create_task(worker.run(), name="temporal-worker")
+    codec_task = asyncio.create_task(codec_server.serve(), name="codec-server")
+    shutdown_task = asyncio.create_task(
+        shutdown_requested.wait(),
+        name="worker-shutdown-signal",
+    )
+    tasks = [worker_task, codec_task, shutdown_task]
+    try:
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            await _stop_worker_and_codec_server(
+                worker,
+                worker_task,
+                codec_server,
+                codec_task,
+            )
+            raise
 
-    for task in pending:
-        task.cancel()
-    for task in pending:
+        results = await _stop_worker_and_codec_server(
+            worker,
+            worker_task,
+            codec_server,
+            codec_task,
+        )
+    finally:
+        shutdown_task.cancel()
         with suppress(asyncio.CancelledError):
-            await task
-    for task in done:
-        task.result()
+            await shutdown_task
+        _remove_shutdown_signal_handlers(loop, registered_signals)
+
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+
+
+async def _run_worker_until_stopped(worker: Worker) -> None:
+    shutdown_requested = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    registered_signals = _register_shutdown_signal_handlers(
+        loop,
+        shutdown_requested,
+    )
+
+    worker_task = asyncio.create_task(worker.run(), name="temporal-worker")
+    shutdown_task = asyncio.create_task(
+        shutdown_requested.wait(),
+        name="worker-shutdown-signal",
+    )
+    try:
+        done, _ = await asyncio.wait(
+            [worker_task, shutdown_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if shutdown_task in done and not worker_task.done():
+            print("Worker shutdown signal received; draining in-flight activities")
+            await worker.shutdown()
+        await worker_task
+    except asyncio.CancelledError:
+        if not worker_task.done():
+            await worker.shutdown()
+        with suppress(asyncio.CancelledError):
+            await worker_task
+        raise
+    finally:
+        shutdown_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await shutdown_task
+        _remove_shutdown_signal_handlers(loop, registered_signals)
+
+
+async def _stop_worker_and_codec_server(
+    worker: Worker,
+    worker_task: asyncio.Task[None],
+    codec_server: uvicorn.Server,
+    codec_task: asyncio.Task[None],
+) -> list[BaseException | None]:
+    if not codec_task.done():
+        codec_server.should_exit = True
+    if not worker_task.done():
+        print("Worker process stopping; draining in-flight activities")
+        await worker.shutdown()
+    return await asyncio.gather(worker_task, codec_task, return_exceptions=True)
+
+
+def _register_shutdown_signal_handlers(
+    loop: asyncio.AbstractEventLoop,
+    shutdown_requested: asyncio.Event,
+) -> list[signal.Signals]:
+    registered_signals: list[signal.Signals] = []
+    for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(shutdown_signal, shutdown_requested.set)
+        except (NotImplementedError, RuntimeError):
+            continue
+        registered_signals.append(shutdown_signal)
+    return registered_signals
+
+
+def _remove_shutdown_signal_handlers(
+    loop: asyncio.AbstractEventLoop,
+    registered_signals: list[signal.Signals],
+) -> None:
+    for shutdown_signal in registered_signals:
+        loop.remove_signal_handler(shutdown_signal)
 
 
 def _worker_deployment_config(task_queue: str) -> WorkerDeploymentConfig | None:

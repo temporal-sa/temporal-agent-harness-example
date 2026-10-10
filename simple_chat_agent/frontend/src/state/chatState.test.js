@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  applyReplayedStreamEventsInState,
   handleStreamEventInState,
   restoreActiveStreamTurnInState,
   streamEventNeedsSettledTranscriptDelta,
@@ -43,6 +44,28 @@ function event(kind, agent, payload = {}, extra = {}) {
     ...extra,
   };
 }
+
+test("reconnect replay extends the existing live turn instead of rebuilding it", () => {
+  const main = { id: "chat-1", parent_id: null, kind: "main", label: "Main agent" };
+  let state = handleStreamEventInState(
+    initialState(),
+    event(AgentStart, main, { sequence: 1, provider: "claude" }),
+  );
+  state = handleStreamEventInState(
+    state,
+    event(AgentTextDelta, main, { sequence: 1, text: "Hello" }),
+  );
+
+  const replayed = applyReplayedStreamEventsInState(state, [
+    event(AgentTextDelta, main, { sequence: 1, text: " again" }),
+  ]);
+  const agentSegment = replayed.streamTurn.segments.find(
+    (segment) => segment.type === "agent" && segment.agentId === "chat-1",
+  );
+
+  assert.equal(agentSegment.text, "Hello again");
+  assert.equal(replayed.currentAgentSequence, 1);
+});
 
 test("concurrent subagents with colliding turn numbers retain separate traces", () => {
   const main = { id: "chat-1", parent_id: null, kind: "main", label: "Main agent" };
