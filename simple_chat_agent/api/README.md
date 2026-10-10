@@ -1,7 +1,7 @@
 # API Runtime
 
 `simple_chat_agent/api` is the product control plane for the demo. It exposes
-HTTP routes for the browser, owns login and OAuth flows, bridges browser actions
+HTTP routes for the browser, consumes catalog identity and owns tool OAuth flows, bridges browser actions
 to Temporal workflows, and serves the sideband stream transport used by the UI.
 
 The API should not be treated as durable agent memory. Durable conversation
@@ -22,7 +22,7 @@ The API also owns product decisions that should not leak into `agent_harness`:
 - which chat workflows belong to that user;
 - which tools are enabled for a new chat;
 - where uploaded attachment bytes are stored;
-- how Google, GitHub, and MCP OAuth are initiated and completed;
+- how GitHub and MCP OAuth are initiated and completed;
 - how browser snapshots, deltas, and stream events are reconciled.
 
 ## Runtime Initialization
@@ -35,22 +35,19 @@ lifespan hook:
 - a Redis-backed `StreamBroker` (or local JSONL fallback);
 - MCP auth resolvers used by dynamic HTTP MCP tools.
 
-Local development can serve the built frontend from the API process. In
-Kubernetes, the dedicated web deployment serves static assets and the API
-deployment serves only API and OAuth routes.
+Local development can serve the built frontend from the API process. The catalog uses the same API process to serve the built React UI and API routes.
 
 ## Route Modules
 
 | Module | Owns |
 | --- | --- |
-| `main.py` | App construction, Google OAuth, logout, internal stream ingest, shared dependency functions, router wiring, static fallback. |
+| `main.py` | App construction, catalog identity, local login, logout, internal stream ingest, shared dependency functions, router wiring, static fallback. |
 | `routes/sessions.py` | Chat lifecycle, snapshots, transcript pages/deltas, chat/steer/interrupt signals, approvals, artifacts, attachments, and browser SSE routes. |
 | `routes/tools.py` | Tools window data, GitHub OAuth, HTTP MCP configuration, MCP OAuth, and MCP enable/delete operations. |
-| `routes/demo_workspace.py` | Main-to-temp workspace controls, temp workspace login handoff, crash/delete/create actions, and parent workspace state queries. |
 | `schemas.py` | Request shapes accepted from the browser. |
 | `serialization.py` | UI-shaped response dictionaries for workflow state, transcripts, artifacts, and attachments. |
 | `streaming.py` | Redis/JSONL stream broker and SSE helpers. |
-| `auth.py`, `local_auth.py`, `google_oauth.py`, `github_oauth.py` | Login/session/OAuth helpers. |
+| `auth.py`, `local_auth.py`, `github_oauth.py` | Login/session/OAuth helpers. |
 | `features.py`, `thinking.py`, `anthropic_models.py` | Runtime feature gates and model/thinking configuration. |
 | `artifacts.py` | Artifact/attachment response helpers for view and download routes. |
 
@@ -67,8 +64,6 @@ The primary workflow interactions are:
   delete, and tool configuration changes;
 - query bounded state snapshots, message pages, transcript deltas, and small
   state patches;
-- update `DemoWorkspaceWorkflow` when creating, crashing, or deleting isolated
-  demo workspaces.
 
 The API validates ownership before exposing a workflow to the current user. It
 describes the chat through Temporal and verifies that its parent is the current
@@ -113,7 +108,7 @@ Local development keeps the JSONL fallback when `SIMPLE_CHAT_REDIS_URL` is unset
 
 New chats are created through the user's registry workflow, not directly in the
 API. This gives one durable place to track chat records, configured MCP servers,
-and demo workspace state for the user.
+and MCP configuration for the user.
 
 For a new chat, the API chooses:
 
@@ -130,30 +125,13 @@ queries bounded rendered views.
 
 ## Auth And OAuth
 
-The API stores a signed session cookie and derives the current
-`AuthenticatedUser` on each request. The session format is provider-neutral;
-Google OAuth and local testing auth are only ways to mint that session.
+Catalog mode accepts `X-Temporal-Auth-Subject` and `X-Temporal-Auth-Email`
+from the authenticated ingress. The current user is scoped to the catalog's
+task queue so crashable chat registries and data records remain isolated.
+Catalog mode never falls back to local session cookies.
 
-`GET /api/auth/config` tells the UI which login mode to render:
-
-- `google`: Google OAuth is configured.
-- `local`: local testing auth is explicitly enabled and Google OAuth is not
-  configured.
-- `none`: no login method is configured.
-
-`POST /api/auth/local/login` is registered only in `local` mode. If
-`GOOGLE_OAUTH_CLIENT_ID` and `GOOGLE_OAUTH_CLIENT_SECRET` are present, the local
-route is not registered and the UI uses Google login. This keeps the local
-demo/demo login unavailable in shared or deployed Google-authenticated
-environments.
-
-GitHub and MCP OAuth are optional tool-enablement flows. OAuth tokens are stored
-in `AppStore`, keyed by user/provider. Workflows receive stable connection ids
-or MCP server configs, never raw OAuth tokens.
-
-Temporary demo workspaces route Google login through the parent environment so
-the Google OAuth client can use a stable callback domain. The parent returns a
-short-lived session token to the temp workspace login route.
+Local development explicitly opts into local username/password login. GitHub
+and MCP OAuth authorize tools; they do not log users into the application.
 
 ## Attachments And Artifacts
 
@@ -175,21 +153,11 @@ Artifact and attachment records expose expiration metadata. If retained bytes
 expire, read/download routes return clear unavailable responses instead of
 pretending the agent can still inspect the original content.
 
-## Demo Workspace Mode
+## Catalog Workspaces
 
-The parent environment can create isolated demo workspaces. The API starts or
-updates `DemoWorkspaceWorkflow`, records the workspace on the user's registry,
-and blocks temp-workspace registry recreation when the parent workspace is
-deleted, deleting, failed, or otherwise unavailable.
-
-Inside a temp workspace, the API is mostly the same application with different
-environment values:
-
-- a unique workflow prefix;
-- a unique task queue;
-- parent public URL for login handoff;
-- feature flags hiding workspace creation controls and GitHub tooling where
-  appropriate.
+The catalog owns workspace lifecycle. The API uses the injected task queue
+and needs no Kubernetes API access or provisioner workflow.
+See [Catalog deployment](../../docs/catalog.md).
 
 ## Adding API Behavior
 

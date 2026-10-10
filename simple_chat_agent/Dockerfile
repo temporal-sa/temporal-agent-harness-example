@@ -1,5 +1,5 @@
 # Image for the simple_chat_agent. Used for the frontend, API, and worker
-# containers; they differ only by the command they run (see deploy/ manifests).
+# containers; the catalog selects their runtime commands.
 #
 # IMPORTANT: build with the *repo root* as the context (the image needs
 # pyproject.toml, uv.lock, and agent_harness/ from there), e.g.:
@@ -55,8 +55,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 65532 sandbox \
     && useradd --uid 65532 --gid 65532 --create-home --home-dir /home/sandbox sandbox \
-    && mkdir /workspace \
-    && chown 65532:65532 /workspace
+    && mkdir /workspace /workspaces \
+    && chown 65532:65532 /workspace /workspaces
 
 # Bring in the resolved virtualenv, then the application source.
 COPY --from=build /app/.venv /app/.venv

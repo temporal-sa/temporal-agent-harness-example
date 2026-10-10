@@ -7,7 +7,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 
 SESSION_COOKIE = "simple_chat_session"
@@ -24,9 +24,23 @@ class AuthError(Exception):
     pass
 
 
-def user_from_google_subject(*, subject: str, email: str) -> AuthenticatedUser:
+def catalog_auth_enabled() -> bool:
+    return os.environ.get("SIMPLE_CHAT_AUTH_MODE", "catalog") == "catalog"
+
+
+def user_from_catalog_headers(
+    headers: Mapping[str, str], *, task_queue: str
+) -> AuthenticatedUser:
+    # The catalog ingress strips client-supplied identity headers before its
+    # forward-auth service supplies these. Keep the API behind that ingress.
+    subject = headers.get("x-temporal-auth-subject", "").strip()
+    email = headers.get("x-temporal-auth-email", "").strip().lower()
+    if not subject or not email or "@" not in email:
+        raise AuthError("Catalog authentication is required")
     return AuthenticatedUser(
-        user_id=f"user_google_{_short_digest(subject)}",
+        # Crashable environments share the Temporal namespace and data stores.
+        # The catalog's task queue isolates their identity and chat registries.
+        user_id=f"user_catalog_{_short_digest(task_queue + ':' + subject)}",
         username=email,
     )
 

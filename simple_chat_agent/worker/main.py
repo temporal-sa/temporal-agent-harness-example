@@ -37,18 +37,6 @@ from simple_chat_agent.worker.codec_server import (
     codec_server_url,
     create_codec_app,
 )
-from simple_chat_agent.worker.demo_workspace_activities import (
-    configure_demo_workspace,
-    crash_demo_workspace,
-    create_demo_workspace_namespace,
-    delete_demo_workspace,
-    deploy_demo_workspace_workloads,
-    provision_demo_workspace,
-    purge_demo_workspace_payloads,
-    resolve_demo_workspace_images,
-    wait_demo_workspace_deployment,
-)
-from simple_chat_agent.worker.demo_workspace_workflow import DemoWorkspaceWorkflow
 from simple_chat_agent.worker.good_place_guards import good_place_post_guard
 from simple_chat_agent.worker.shutdown import (
     WORKER_GRACEFUL_SHUTDOWN_SECONDS_ENV,
@@ -95,7 +83,7 @@ async def main() -> None:
         client_config["api_key"] = os.environ.get("TEMPORAL_API_KEY")
 
     client = await Client.connect(
-        os.environ.get("TEMPORAL_ENDPOINT", "localhost:7233"), **client_config
+        os.environ.get("TEMPORAL_ADDRESS", os.environ.get("TEMPORAL_ENDPOINT", "localhost:7233")), **client_config
     )
 
     deployment_config = _worker_deployment_config(TASK_QUEUE)
@@ -114,7 +102,6 @@ async def main() -> None:
             SimpleChatWorkflow,
             UserChatsWorkflow,
             SubagentWorkflow,
-            DemoWorkspaceWorkflow,
         ],
         activities=[
             call_agent_api,
@@ -123,15 +110,6 @@ async def main() -> None:
             emit_stream_event_activity,
             emit_stream_events_activity,
             emit_turn_settled,
-            provision_demo_workspace,
-            resolve_demo_workspace_images,
-            create_demo_workspace_namespace,
-            configure_demo_workspace,
-            deploy_demo_workspace_workloads,
-            wait_demo_workspace_deployment,
-            crash_demo_workspace,
-            delete_demo_workspace,
-            purge_demo_workspace_payloads,
         ],
         workflow_runner=agent_harness_workflow_runner(),
         deployment_config=deployment_config,
@@ -286,8 +264,8 @@ def _worker_deployment_config(task_queue: str) -> WorkerDeploymentConfig | None:
         print("Temporal worker versioning disabled")
         return None
 
-    build_id = os.environ.get(WORKER_VERSION_ENV, DEFAULT_WORKER_VERSION).strip()
-    deployment_name = os.environ.get(WORKER_DEPLOYMENT_NAME_ENV, task_queue).strip()
+    build_id = os.environ.get("TEMPORAL_WORKER_BUILD_ID", os.environ.get(WORKER_VERSION_ENV, DEFAULT_WORKER_VERSION)).strip()
+    deployment_name = os.environ.get("TEMPORAL_DEPLOYMENT_NAME", os.environ.get(WORKER_DEPLOYMENT_NAME_ENV, task_queue)).strip()
     if not build_id:
         raise RuntimeError(f"{WORKER_VERSION_ENV} must not be empty")
     if not deployment_name:

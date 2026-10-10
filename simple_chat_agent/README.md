@@ -1,4 +1,4 @@
-# Simple Chat Agent
+# Advanced AI Agent
 
 This is the demo application for the agent harness. It is intentionally not a
 generic agent SDK. It shows how an application can compose the harness with its
@@ -47,7 +47,8 @@ ANTHROPIC_MODEL=claude-sonnet-4-5
 
 SIMPLE_CHAT_JWT_SECRET=replace-me-for-local-dev
 
-# Local-only login. Do not set Google OAuth credentials when using this mode.
+# Explicit local login. The catalog handles deployed authentication.
+SIMPLE_CHAT_AUTH_MODE=local
 SIMPLE_CHAT_LOCAL_AUTH_ENABLED=1
 SIMPLE_CHAT_LOCAL_AUTH_USERNAME=demo
 SIMPLE_CHAT_LOCAL_AUTH_PASSWORD=demo
@@ -118,22 +119,16 @@ Local development uses per-chat JSONL stream files by default. To exercise the
 deployed Redis Streams path locally, start Redis and set
 `SIMPLE_CHAT_REDIS_URL=redis://127.0.0.1:6379/0` for both the API and worker.
 
-For the full local setup, including required CLI tools and optional Google
-OAuth, see [`docs/local-development.md`](../docs/local-development.md).
+For the full local setup, including required CLI tools and optional research tools, see [`docs/local-development.md`](../docs/local-development.md).
 
 ## Authentication Modes
 
-The app always uses the same signed session cookie after login, but it can mint
-that session in two ways:
+The deployed application uses catalog identity headers. In catalog mode it
+never accepts local login cookies. The catalog also provides crashable
+workspaces and their controls. See [Catalog deployment](../docs/catalog.md).
 
-- Google OAuth for shared and deployed environments.
-- Local testing auth for private local runs.
-
-Local testing auth is default-off. When
-`SIMPLE_CHAT_LOCAL_AUTH_ENABLED=1` and Google OAuth is not configured, the API
-registers `POST /api/auth/local/login` and the UI renders the local
-username/password form. If Google OAuth is configured, the local route is not
-registered and the UI uses Google login.
+Local development explicitly sets `SIMPLE_CHAT_AUTH_MODE=local` and
+`SIMPLE_CHAT_LOCAL_AUTH_ENABLED=1`.
 
 ## What To Try
 
@@ -202,7 +197,7 @@ When `GOOGLE_SEARCH_GROUNDING_API_KEY` is set, `search_web` uses Google Search
 grounding and does not call SearXNG. SearXNG remains available only for
 environments without that key. The Kubernetes manifests still deploy SearXNG
 as an internal ClusterIP compatibility service in the primary namespace; it is
-not routed through ingress. Temporary demo workspaces receive the same SearXNG
+not routed through ingress. Catalog crashable environments receive the same search
 URL and Google research API key environment values, including the grounding
 key, so the research tools carry over when those values are configured.
 

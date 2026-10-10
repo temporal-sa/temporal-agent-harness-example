@@ -2,7 +2,7 @@
 
 `simple_chat_agent/worker` contains the Temporal worker process and all workflow
 code for the demo application. It is the durable execution boundary: chat
-state, user chat registry state, demo workspace state, approvals, tool
+state, user chat registry state, approvals, tool
 orchestration, and continue-as-new all live here.
 
 The worker is not an HTTP server for the browser. The API sends signals,
@@ -38,8 +38,6 @@ a `ClaudeAgent` for chat workflows.
 | `streaming_activities.py` | Durable settlement activity used to send `turn_settled` to the API stream endpoint. |
 | `workflow.py` | Per-chat workflow. |
 | `user_chats_workflow.py` | Per-user registry/entity workflow. |
-| `demo_workspace_workflow.py` | Per-user demo workspace controller workflow. |
-| `demo_workspace_activities.py` | Kubernetes provisioning/crash/delete activities for temp workspaces. |
 | `tools/` | Application tool providers and tool activities. |
 | `sandbox/` | Credential-free Bubblewrap executor plus legacy Python sandbox compatibility. |
 
@@ -49,16 +47,15 @@ a `ClaudeAgent` for chat workflows.
 
 - `SimpleChatWorkflow`: one chat conversation.
 - `UserChatsWorkflow`: one user registry, including chat list, MCP server
-  configuration, and demo workspace record.
+  configuration, .
 - `SubagentWorkflow`: recursively delegating child agent workflow used by the
   `create_subagent` tool. The main workflow is depth 0; subagents through depth
   2 may delegate, while depth-3 subagents do not receive `create_subagent`.
   Every descendant keeps the main chat workflow as its approval and artifact
   authority while recording its immediate delegator for stream lineage.
-- `DemoWorkspaceWorkflow`: controller for temporary demo workspaces.
 
 The worker also registers the provider activity, generic tool and guard
-activity routers, turn-settlement activity, and demo workspace activities.
+activity routers, turn-settlement activity, .
 
 ## SimpleChatWorkflow
 
@@ -99,7 +96,7 @@ the place that schedules provider/tool activity work.
 
 `UserChatsWorkflow` is an entity workflow keyed by user id. It creates chat
 child workflows, tracks active chat records, stores configured MCP servers, and
-stores the user's demo workspace record.
+tracks configured MCP servers.
 
 The API asks this workflow to create chats instead of directly starting
 `SimpleChatWorkflow`. That keeps per-user chat state in one durable place and
@@ -109,17 +106,11 @@ The registry has a 15-day run TTL. If it was touched during the run, it
 continues as new and carries its compact state forward. If it was not touched,
 it signals/cancels associated chats and exits.
 
-## DemoWorkspaceWorkflow
+## Catalog Workspaces
 
-`DemoWorkspaceWorkflow` creates and manages isolated temporary demo workspaces.
-It provisions Kubernetes namespaces, copies configuration, deploys web/API/worker
-workloads, waits for readiness, tracks chats created in that workspace, and
-deletes the workspace on explicit delete, crash simulation, or idle timeout.
-
-Workspace ids are deterministic per user so repeated create requests converge on
-the same controller workflow and namespace shape. Temp workspaces use their own
-task queue and workflow prefix so crashing the temp worker does not affect the
-main demo stack.
+The catalog provisions, crashes, scales, and removes workspaces. The worker
+hosts only the application workflows; it requires no Kubernetes permissions.
+See [Catalog deployment](../../docs/catalog.md).
 
 ## Activities
 
@@ -129,7 +120,7 @@ The worker registers three broad activity categories:
   provider module;
 - generic routers: `agent_harness.run_tool_activity` and
   `agent_harness.run_guard_activity`;
-- application activities: turn-settlement, demo workspace Kubernetes actions,
+- application activities: turn-settlement,
   persistent workspace commands, artifact writes, GitHub calls, research calls, and
   other tool side effects.
 
@@ -140,31 +131,14 @@ points.
 
 ## Worker Versioning
 
-Worker versioning is enabled by default in `main.py`.
+The worker reads the catalog's `TEMPORAL_DEPLOYMENT_NAME` and
+`TEMPORAL_WORKER_BUILD_ID`, with the existing `SIMPLE_CHAT_*` settings as local
+fallbacks. Workflows default to PINNED. Local development can disable versioning
+with `SIMPLE_CHAT_WORKER_VERSIONING_ENABLED=0`.
 
-Environment variables:
-
-- `SIMPLE_CHAT_WORKER_VERSION`: build id, default `1.0.0`.
-- `SIMPLE_CHAT_WORKER_DEPLOYMENT_NAME`: deployment name, default task queue.
-- `SIMPLE_CHAT_WORKER_VERSIONING_ENABLED`: set false/0/no/off to disable.
-- `SIMPLE_CHAT_WORKER_GRACEFUL_SHUTDOWN_SECONDS`: time to stop polling and wait
-  for in-flight Activities after shutdown starts, default 1200 seconds. Shared
-  Kubernetes deployments use a 1260-second pod termination grace period so the
-  Worker has an additional minute to report completions and exit.
-
-The default behavior is pinned. Continue-as-new calls use
-`AUTO_UPGRADE`, so a workflow can move to the latest compatible deployment when
-it checkpoints into a new run.
-
-The shared production and testing task queues currently keep the build id at
-`1.0.0`. Their long-lived user-registry and demo-workspace workflows may remain
-pinned to that version between checkpoints, so changing the build id requires a
-planned Worker Deployment rollout that keeps the old-version poller available
-until those executions have migrated. An image tag alone is not a safe build-id
-replacement.
-
-Temporary demo workspaces may disable versioning because each temp workspace has
-a unique task queue and short lifecycle.
+The catalog keeps worker identities separate for crashable environments. Do not
+retire a version while workflows remain pinned to it. This catalog branch starts
+in a fresh namespace; it does not migrate the previous deployments.
 
 ## Codec Server And External Payload Storage
 

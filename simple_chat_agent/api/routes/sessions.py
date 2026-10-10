@@ -90,9 +90,6 @@ class SessionRouteDeps:
     forget_conversation: Callable[..., Any]
     is_temporal_not_found: Callable[[BaseException], bool]
     github_connection_id_for_user: Callable[[AuthenticatedUser], str | None]
-    register_demo_workspace_chat: Callable[..., Any]
-    unregister_demo_workspace_chat: Callable[..., Any]
-    touch_demo_workspace: Callable[..., Any]
 
 
 def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
@@ -170,7 +167,6 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             ),
         )
         await deps.stream_broker().clear(conversation.workflow_id)
-        await deps.register_demo_workspace_chat(conversation)
         return {
             "workflow_id": conversation.workflow_id,
             "run_id": conversation.run_id,
@@ -396,7 +392,6 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
                 title=conversation_title(request.message),
                 user_email=user.username,
             ),
-            deps.touch_demo_workspace(),
         )
         record_timing(timings, "signal", signal_started)
         response.headers["Server-Timing"] = server_timing(timings)
@@ -442,7 +437,6 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
                 title=conversation_title(request.message),
                 user_email=user.username,
             ),
-            deps.touch_demo_workspace(),
         )
 
         async def generate() -> AsyncIterator[dict[str, str]]:
@@ -504,7 +498,6 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id,
             user_email=user.username,
         )
-        await deps.touch_demo_workspace()
         return {"status": "ok"}
 
     @router.post("/api/sessions/{workflow_id}/interrupt")
@@ -533,7 +526,6 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id,
             user_email=user.username,
         )
-        await deps.touch_demo_workspace()
         return {"status": "ok"}
 
     @router.post("/api/sessions/{workflow_id}/approvals/{approval_id}")
@@ -555,7 +547,6 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id,
             user_email=user.username,
         )
-        await deps.touch_demo_workspace()
         return {"status": "ok"}
 
     @router.get("/api/sessions/{workflow_id}/artifacts")
@@ -611,7 +602,6 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id,
             user_email=user.username,
         )
-        await deps.touch_demo_workspace()
         return {"attachment": attachment_dict(artifact)}
 
     @router.post("/api/sessions/{workflow_id}/attachments/text")
@@ -639,7 +629,6 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id,
             user_email=user.username,
         )
-        await deps.touch_demo_workspace()
         return {"attachment": attachment_dict(artifact)}
 
     @router.get("/api/artifacts/{artifact_id}")
@@ -806,7 +795,6 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id=workflow_id,
         )
         await deps.stream_broker().clear(workflow_id)
-        await deps.unregister_demo_workspace_chat(workflow_id)
         return {"status": "ok"}
 
     return router

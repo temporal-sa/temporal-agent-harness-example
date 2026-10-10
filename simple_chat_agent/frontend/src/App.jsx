@@ -294,11 +294,10 @@ export default function App() {
         return;
       }
 
-      const [config, tools, conversations, demoWorkspace] = await Promise.all([
+      const [config, tools, conversations] = await Promise.all([
         loadConfigData(),
         loadToolsData(),
         loadConversationsData(),
-        loadDemoWorkspaceData(),
       ]);
       if (run.cancelled) return;
 
@@ -308,7 +307,6 @@ export default function App() {
         auth: "app",
         user,
         config,
-        demoWorkspace,
         tools,
         conversations,
         agentSettings,
@@ -471,7 +469,7 @@ export default function App() {
       setState((previous) => ({
         ...previous,
         authMode: mode,
-        loginConfigured: mode === "google" || mode === "local",
+        loginConfigured: mode === "catalog" || mode === "local",
         loginSubtitle: loginSubtitleForMode(mode),
       }));
     } catch (error) {
@@ -486,8 +484,8 @@ export default function App() {
 
   function loginSubtitleForMode(mode) {
     if (mode === "local") return "Local testing mode. Use demo/demo unless overridden.";
-    if (mode === "google") return "";
-    return "Authentication is not configured. Set Google OAuth credentials or enable local testing auth.";
+    if (mode === "catalog") return "Open this demo from the catalog to sign in.";
+    return "Enable local testing auth to run this demo locally.";
   }
 
   async function loadConversationsData() {
@@ -520,22 +518,6 @@ export default function App() {
     }
     if (!response.ok) throw new Error(await response.text());
     return response.json();
-  }
-
-  async function loadDemoWorkspaceData() {
-    const response = await fetch("/api/demo-workspace");
-    if (response.status === 401) {
-      showLogin();
-      return null;
-    }
-    if (!response.ok) throw new Error(await response.text());
-    return response.json();
-  }
-
-  async function refreshDemoWorkspace() {
-    const demoWorkspace = await loadDemoWorkspaceData();
-    setState((previous) => ({ ...previous, demoWorkspace }));
-    return demoWorkspace;
   }
 
   async function loadWorkflowStateData(workflowId) {
@@ -1340,7 +1322,6 @@ export default function App() {
     const body = await response.json();
     const conversations = await refreshConversations();
     selectConversation(body.workflow_id, options, conversations);
-    touchDemoWorkspaceCountdown();
     return body;
   }
 
@@ -1381,7 +1362,6 @@ export default function App() {
         const body = await response.json();
         if (body.attachment) addComposerAttachment(body.attachment);
       }
-      touchDemoWorkspaceCountdown();
     } catch (error) {
       setState((previous) => ({
         ...previous,
@@ -1426,7 +1406,6 @@ export default function App() {
       if (!response.ok) throw new Error(await responseErrorText(response));
       const body = await response.json();
       if (body.attachment) addComposerAttachment(body.attachment);
-      touchDemoWorkspaceCountdown();
     } catch (error) {
       setState((previous) => ({
         ...previous,
@@ -1670,333 +1649,9 @@ export default function App() {
       await handleMissingWorkflow();
     }
     if (!response.ok) throw new Error(await responseErrorText(response));
-    if (url.startsWith("/api/sessions/")) {
-      touchDemoWorkspaceCountdown();
-    }
     const contentType = response.headers.get("content-type") || "";
     if (contentType.includes("application/json")) return response.json();
     return {};
-  }
-
-  function touchDemoWorkspaceCountdown() {
-    const now = new Date().toISOString();
-    setState((previous) => {
-      const demoWorkspace = previous.demoWorkspace;
-      const workspace = demoWorkspace?.workspace;
-      if (
-        !demoWorkspace?.in_demo_workspace ||
-        !workspace ||
-        workspace.status !== "active"
-      ) {
-        return previous;
-      }
-      return {
-        ...previous,
-        demoWorkspace: {
-          ...demoWorkspace,
-          workspace: {
-            ...workspace,
-            updated_at: now,
-            last_activity_at: now,
-          },
-        },
-      };
-    });
-  }
-
-  function writeDemoWorkspaceLoadingPage(workspaceTab) {
-    const apiUrl = `${window.location.origin}/api/demo-workspace`;
-    workspaceTab.document.open();
-    workspaceTab.document.write(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Creating demo workspace</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link
-    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+Mono:wght@400;500;600&display=swap"
-    rel="stylesheet"
-  />
-  <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; }
-    body {
-      min-height: 100vh;
-      margin: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: #141414;
-      color: #f8fafc;
-      font: 15px/1.5 "Inter", "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    }
-    main {
-      width: min(420px, calc(100vw - 32px));
-      display: grid;
-      justify-items: center;
-      gap: 14px;
-      text-align: center;
-    }
-    img {
-      width: 132px;
-      height: 132px;
-      object-fit: contain;
-    }
-    h1 {
-      margin: 0;
-      font-size: 22px;
-      font-weight: 650;
-      letter-spacing: 0;
-    }
-    p {
-      margin: 0;
-      color: #92a4c3;
-    }
-    .host {
-      max-width: 100%;
-      overflow: hidden;
-      color: #7c8fb1;
-      font: 12px/1.4 "JetBrains Mono", "Noto Sans Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Courier New", monospace;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .meta {
-      display: grid;
-      max-width: 100%;
-      gap: 4px;
-    }
-    .bar {
-      position: relative;
-      width: 100%;
-      height: 4px;
-      overflow: hidden;
-      border-radius: 999px;
-      background: #273860;
-    }
-    .bar::after {
-      position: absolute;
-      inset: 0;
-      width: 42%;
-      border-radius: inherit;
-      background: #444ce7;
-      content: "";
-      animation: load 1.2s ease-in-out infinite;
-    }
-    @keyframes load {
-      0% { transform: translateX(-110%); }
-      100% { transform: translateX(250%); }
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <img src="/static/animated/temporal-logo-animation-inverted-transparent.gif" alt="" />
-    <h1>Loading</h1>
-    <p id="status">Starting workspace creation...</p>
-    <div class="meta">
-      <div class="host" id="namespace"></div>
-    </div>
-    <div class="bar" aria-hidden="true"></div>
-  </main>
-  <script>
-    const apiUrl = ${JSON.stringify(apiUrl)};
-    const statusNode = document.getElementById("status");
-    const namespaceNode = document.getElementById("namespace");
-    const steps = [
-      "Creating Kubernetes namespace...",
-      "Copying configuration and TLS...",
-      "Creating services, routes, and deployments...",
-      "Waiting for readiness..."
-    ];
-    let stepIndex = 0;
-    let terminal = false;
-    let hasServerStatus = false;
-    function setStatus(text, serverStatus = false) {
-      if (serverStatus) hasServerStatus = true;
-      statusNode.textContent = text;
-    }
-    function rotateStep() {
-      if (terminal || hasServerStatus) return;
-      setStatus(steps[stepIndex % steps.length]);
-      stepIndex += 1;
-    }
-    async function pollWorkspace() {
-      try {
-        const response = await fetch(apiUrl, {
-          credentials: "include",
-          cache: "no-store"
-        });
-        if (!response.ok) return;
-        const body = await response.json();
-        const workspace = body.workspace || {};
-        if (workspace.namespace) namespaceNode.textContent = workspace.namespace;
-        if (workspace.provisioning_message) {
-          setStatus(workspace.provisioning_message, true);
-        }
-        if (workspace.status === "active") {
-          terminal = true;
-          setStatus("Workspace ready. Opening...");
-        } else if (workspace.status === "failed") {
-          terminal = true;
-          setStatus(workspace.error || "Workspace creation failed.");
-        } else if (workspace.status === "provisioning" && !workspace.provisioning_message) {
-          rotateStep();
-        }
-      } catch (_) {
-        rotateStep();
-      }
-    }
-    rotateStep();
-    setInterval(rotateStep, 1800);
-    setInterval(pollWorkspace, 5000);
-    pollWorkspace();
-  <\/script>
-</body>
-</html>`);
-    workspaceTab.document.close();
-  }
-
-  function writeDemoWorkspaceLoadingError(workspaceTab, error) {
-    workspaceTab.document.open();
-    workspaceTab.document.write(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Demo workspace failed</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link
-    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+Mono:wght@400;500;600&display=swap"
-    rel="stylesheet"
-  />
-  <style>
-    :root { color-scheme: dark; }
-    body {
-      min-height: 100vh;
-      margin: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: #141414;
-      color: #f8fafc;
-      font: 15px/1.5 "Inter", "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    }
-    main {
-      width: min(520px, calc(100vw - 32px));
-      display: grid;
-      gap: 12px;
-      text-align: center;
-    }
-    h1 { margin: 0; font-size: 22px; letter-spacing: 0; }
-    pre {
-      margin: 0;
-      overflow-wrap: anywhere;
-      white-space: pre-wrap;
-      color: #ffb199;
-      font: 12px/1.5 "JetBrains Mono", "Noto Sans Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Courier New", monospace;
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>Workspace creation failed</h1>
-    <pre>${String(error)
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")}</pre>
-  </main>
-</body>
-</html>`);
-    workspaceTab.document.close();
-  }
-
-  async function ensureDemoWorkspace() {
-    const current = stateRef.current.demoWorkspace;
-    if (current?.login_url && current?.workspace?.status === "active") {
-      window.open(current.login_url, "_blank", "noopener,noreferrer");
-      return;
-    }
-    const workspaceTab = window.open("", "_blank");
-    if (workspaceTab) {
-      writeDemoWorkspaceLoadingPage(workspaceTab);
-    }
-    setState((previous) => ({ ...previous, demoWorkspaceLoading: true }));
-    try {
-      const response = await post("/api/demo-workspace", {});
-      setState((previous) => ({
-        ...previous,
-        demoWorkspace: response,
-        demoWorkspaceLoading: false,
-      }));
-      if (response.login_url) {
-        if (workspaceTab) {
-          workspaceTab.location.href = response.login_url;
-        } else {
-          window.open(response.login_url, "_blank", "noopener,noreferrer");
-        }
-      }
-    } catch (error) {
-      if (workspaceTab) {
-        writeDemoWorkspaceLoadingError(workspaceTab, error);
-      }
-      setState((previous) => ({
-        ...previous,
-        demoWorkspaceLoading: false,
-        statusNotice: `demo workspace failed: ${error}`,
-      }));
-    }
-  }
-
-  async function crashDemoWorkspace() {
-    if (!confirm("Crash all pods in this demo workspace?")) return;
-    const inDemoWorkspace = Boolean(stateRef.current.demoWorkspace?.in_demo_workspace);
-    setState((previous) => ({ ...previous, demoWorkspaceLoading: true }));
-    try {
-      const response = await post("/api/demo-workspace/crash", {});
-      setState((previous) => ({
-        ...previous,
-        demoWorkspace: response,
-        demoWorkspaceLoading: false,
-        statusNotice: "demo workspace pods deleted",
-      }));
-    } catch (error) {
-      setState((previous) => ({
-        ...previous,
-        demoWorkspaceLoading: false,
-        statusNotice: inDemoWorkspace
-          ? "demo workspace crash requested; reconnecting..."
-          : `demo crash failed: ${error}`,
-      }));
-    }
-  }
-
-  async function deleteDemoWorkspace() {
-    if (!confirm("Delete this demo workspace namespace?")) return;
-    setState((previous) => ({ ...previous, demoWorkspaceLoading: true }));
-    try {
-      const response = await fetch("/api/demo-workspace", { method: "DELETE" });
-      if (response.status === 401) {
-        showLogin();
-        return;
-      }
-      if (!response.ok) throw new Error(await responseErrorText(response));
-      const body = await response.json();
-      setState((previous) => ({
-        ...previous,
-        demoWorkspace: body,
-        demoWorkspaceLoading: false,
-        statusNotice: "demo workspace deleted",
-      }));
-    } catch (error) {
-      setState((previous) => ({
-        ...previous,
-        demoWorkspaceLoading: false,
-        statusNotice: `demo delete failed: ${error}`,
-      }));
-    }
   }
 
   async function handleMissingWorkflow() {
@@ -2321,7 +1976,7 @@ export default function App() {
 
   function handleLoginClick(event) {
     event.preventDefault();
-    if (state.authMode !== "google" || !state.loginConfigured) return;
+    if (state.authMode !== "catalog" || !state.loginConfigured) return;
     const href = event.currentTarget.getAttribute("href");
     setState((previous) => ({ ...previous, loggingIn: true }));
     setTimeout(() => {
@@ -2386,7 +2041,7 @@ export default function App() {
           setState((previous) => ({ ...previous, localLoginPassword: value }))
         }
         onLocalSubmit={handleLocalLoginSubmit}
-        onGoogleLoginClick={handleLoginClick}
+        onCatalogLoginClick={handleLoginClick}
       />
       <div className="app" hidden={state.auth !== "app"}>
         <AppHeader
@@ -2396,9 +2051,6 @@ export default function App() {
           onOpenTools={() =>
             setState((previous) => ({ ...previous, toolsWindowOpen: true }))
           }
-          onEnsureDemoWorkspace={ensureDemoWorkspace}
-          onCrashDemoWorkspace={crashDemoWorkspace}
-          onDeleteDemoWorkspace={deleteDemoWorkspace}
           onLogout={async () => {
             await post("/api/logout", {});
             localStorage.removeItem("simpleChatWorkflowId");

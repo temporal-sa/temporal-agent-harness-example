@@ -174,6 +174,11 @@ def _s3_bucket() -> str | None:
 
 
 def simple_chat_data_converter() -> DataConverter:
+    if os.environ.get("SIMPLE_CHAT_REQUIRE_SHARED_STORAGE", "").lower() in {"1", "true"}:
+        required = ("SIMPLE_CHAT_S3_BUCKET", "SIMPLE_CHAT_ARTIFACTS_TABLE", "SIMPLE_CHAT_DYNAMODB_TABLE")
+        missing = [name for name in required if not os.environ.get(name, "").strip()]
+        if missing:
+            raise RuntimeError("Shared storage is required: " + ", ".join(missing))
     threshold = int(
         os.environ.get(
             "SIMPLE_CHAT_EXTERNAL_STORAGE_THRESHOLD_BYTES",

@@ -71,8 +71,6 @@ export const initialState = {
   localLoginUsername: "demo",
   localLoginPassword: "demo",
   config: null,
-  demoWorkspace: null,
-  demoWorkspaceLoading: false,
   agentSettings: defaultAgentSettings,
   conversations: [],
   tools: [],

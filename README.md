@@ -1,4 +1,8 @@
-# Temporal Agent Harness Example
+# Advanced AI Agent
+
+The catalog owns deployment, login, shared LLM keys, and crashable environments.
+See [Catalog deployment](docs/catalog.md). This branch tracks the catalog
+integration while preserving the durable agent harness.
 
 This repo is not trying to be a generic agent SDK.
 
@@ -6,7 +10,7 @@ It is an example of how a team might build a small, opinionated agent harness ar
 
 The interesting part is not "how to call an LLM." It is how the agent loop, tool registry, guard policy, context manager, and Temporal execution model fit together.
 
-Want to run this locally without setting up Google OAuth? Start here:
+Want to run this locally? Start here:
 [Running Locally](docs/local-development.md).
 
 Want to build your own project on the harness? Start here:

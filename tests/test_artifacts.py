@@ -59,9 +59,6 @@ class ArtifactResponseTests(unittest.TestCase):
                     forget_conversation=Mock(),
                     is_temporal_not_found=Mock(),
                     github_connection_id_for_user=Mock(),
-                    register_demo_workspace_chat=Mock(),
-                    unregister_demo_workspace_chat=Mock(),
-                    touch_demo_workspace=Mock(),
                 )
             )
         )

@@ -94,27 +94,6 @@ class WorkspaceShellToolTests(unittest.TestCase):
 
 
 class WorkspaceExecutorTests(unittest.TestCase):
-    def test_workspace_executor_images_use_tini_as_pid_one(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
-        tini_command = """          command:
-            - /usr/bin/tini
-            - -g
-            - --
-            - python
-            - -m
-            - simple_chat_agent.worker.sandbox.executor
-"""
-        for relative_path in (
-            "simple_chat_agent/deploy/workspace-executor.yaml",
-            "simple_chat_agent/deploy/testing/workspace-executor.yaml",
-        ):
-            manifest = (repo_root / relative_path).read_text(encoding="utf-8")
-            self.assertIn(tini_command, manifest)
-
-        dockerfile = (repo_root / "simple_chat_agent/Dockerfile").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("        tini \\\n", dockerfile)
 
     def test_workspace_key_does_not_expose_workflow_id(self) -> None:
         key = _workspace_key("simple-chat-user@example.com-secret")
