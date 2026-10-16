@@ -55,7 +55,9 @@ test("3f recovery: crash during pytest → banner → divider → confirmed numb
   await expect(page.getByRole("status", { name: "Worker isn't answering" })).toHaveCount(0);
 
   await waitIdle(page, 300_000);
-  await expect(page.getByText(/zebra7/i)).toHaveCount(1);
+  // The check word shows the reply rendered exactly once. Haiku sometimes drops the "7", so match
+  // the word itself.
+  await expect(page.getByText(/zebra/i)).toHaveCount(1);
   await expect(page.getByText("Work kept after worker loss (this session)")).toBeVisible();
   await expect(meter(page, "Recoveries")).toHaveText("1");
 
