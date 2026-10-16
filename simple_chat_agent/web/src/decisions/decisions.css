@@ -1,0 +1,103 @@
+/* Decisions (PRD U4). Visual reference: the wireframes' .decision-card, .stack and .judge rules.
+   Pink means "waiting on a person"; yellow cards are stops. Square corners. */
+
+.dc-dock { display: grid; gap: .6em; margin-bottom: .6em; }
+.dc-dock:empty { display: none; }
+
+.dc-card { border: 1px solid var(--pink); background: rgba(255, 107, 255, .05); padding: .9em 1em; display: grid; gap: .6em; }
+.dc-card.hold { border-color: var(--yellow); background: rgba(254, 203, 47, .05); }
+.dc-card .top { display: flex; gap: .7em; align-items: center; flex-wrap: wrap; }
+.dc-card .top .t { font-weight: 600; }
+.dc-card .spacer { flex: 1; }
+.dc-card .hint { font-size: .72em; color: var(--slate-300); }
+.dc-card .why { font-size: .82em; color: var(--slate-300); margin: 0; }
+.dc-card .args {
+  font-family: var(--mono); font-size: .78em; background: #111116; border: 1px solid var(--border); padding: .5em .7em;
+  color: var(--indigo-100); white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; max-height: 16em; overflow: auto;
+}
+.dc-card .paused { font-size: .82em; color: var(--indigo-100); display: flex; gap: .5em; align-items: center; margin: 0; }
+.dc-card .paused .dot { flex-shrink: 0; }
+.dc-card .acts { display: flex; gap: .6em; flex-wrap: wrap; align-items: center; }
+.dc-card .acts.end { justify-content: flex-end; }
+.dc-card .err { color: var(--red); font-size: .82em; margin: 0; }
+.dc-card .btn.off { opacity: .45; cursor: not-allowed; }
+.dc-card .btn.quiet { border-color: transparent; color: var(--slate-300); }
+.dc-card .all { font-variant-numeric: tabular-nums; min-width: 9.5em; }
+
+/* Badges by tool kind (wireframe .badge.*) */
+.dc-card .badge.edit, .dc-judge .badge.edit { color: var(--cyan); }
+.dc-card .badge.shell { color: var(--purple); }
+.dc-card .badge.git { color: var(--pink); }
+.dc-card .badge.net { color: var(--yellow); }
+.dc-card .badge.read { color: var(--slate-300); }
+.dc-card .badge.art { color: var(--indigo-200); }
+.dc-card .badge.prog { color: var(--yellow); }
+
+/* The stack */
+.dc-card .stack, .dc-card .items, .dc-card .members { display: grid; gap: .3em; margin: 0; padding: 0; list-style: none; }
+.dc-card .grp-wrap { display: grid; gap: .3em; }
+.dc-card .grp {
+  display: flex; gap: .55em; align-items: center; padding: .45em .6em; border: 1px solid var(--border); background: #111116;
+  font-size: .88em; flex-wrap: wrap;
+}
+.dc-card .grp-wrap.open > .grp { border-color: var(--uv-light); }
+.dc-card .grp-acts, .dc-card .item-acts { display: inline-flex; gap: .4em; align-items: center; flex-wrap: wrap; }
+.dc-card .chev { display: inline-flex; gap: .55em; align-items: center; text-align: left; flex-wrap: wrap; min-height: 2em; }
+.dc-card .chev > [aria-hidden="true"]:first-child { font-family: var(--mono); color: var(--indigo-300); font-size: .8em; width: 1em; }
+.dc-card .chev.static { padding-left: 1.55em; }
+.dc-card .chev .label { overflow-wrap: anywhere; }
+.dc-card .items { padding-left: 1.6em; }
+.dc-card .items > .why { font-size: .78em; color: var(--slate-300); padding: .1em .6em; }
+.dc-card .item { display: flex; gap: .55em; align-items: center; padding: .35em .6em; font-size: .82em; flex-wrap: wrap; }
+.dc-card .item.done { opacity: .6; }
+.dc-card .item .ok, .dc-card .item .no {
+  font-family: var(--mono); min-width: 1.9em; height: 1.9em; padding: 0 .35em; display: inline-grid; grid-auto-flow: column; gap: .2em;
+  place-items: center; border: 1px solid var(--slate-500);
+}
+.dc-card .item .ok { color: var(--green); border-color: var(--green); }
+.dc-card .item .no { color: var(--slate-300); }
+.dc-card .item .ok:hover { background: rgba(31, 241, 165, .1); }
+.dc-card .item .no:hover { border-color: var(--pink); color: var(--pink); }
+.dc-card .item .n { font-size: .8em; }
+.dc-card .review { display: grid; gap: .4em; margin-left: 1.6em; }
+.dc-card .members { margin-left: .4em; }
+.dc-card .held { font-size: .78em; color: var(--indigo-100); margin: 0; }
+.dc-card .linkish { color: var(--indigo-200); text-decoration: underline; font-size: inherit; }
+@media (prefers-reduced-motion: no-preference) {
+  .dc-card .arrived > .item, .dc-card .arrived > .grp { animation: dc-arrive 1.6s ease-out 1; }
+  @keyframes dc-arrive { from { background: rgba(97, 105, 237, .28); } to { background: transparent; } }
+}
+
+/* Decline with a reason */
+.dc-card .decline { display: grid; gap: .4em; padding: .5em .6em; border: 1px solid var(--border); background: rgba(13, 13, 16, .9); }
+.dc-card .decline label { font-size: .78em; color: var(--indigo-100); }
+.dc-card .decline textarea {
+  font: inherit; font-size: .88em; color: var(--off-white); background: var(--ink); border: 1px solid var(--uv-light);
+  padding: .5em .7em; resize: vertical; min-height: 2.6em; border-radius: 0;
+}
+.dc-card .decline .hint { margin: 0; }
+
+/* Judge evaluation cards, inline in the transcript */
+.dc-judge {
+  border: 1px solid var(--border); border-left: 2px solid var(--green); background: rgba(31, 241, 165, .04); padding: .55em .8em;
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: .2em .8em; align-items: center; font-size: .85em;
+}
+.dc-judge .badge { color: var(--green); }
+.dc-judge .what { overflow-wrap: anywhere; }
+.dc-judge .args { color: var(--indigo-100); }
+.dc-judge .why { grid-column: 2 / 4; color: var(--slate-300); font-size: .9em; }
+.dc-judge .score { font-family: var(--mono); font-size: .8em; color: var(--green); white-space: nowrap; }
+.dc-judge.escalated, .dc-judge.declined { border-left-color: var(--pink); background: rgba(255, 107, 255, .04); }
+.dc-judge.escalated .badge, .dc-judge.declined .badge, .dc-judge.escalated .score, .dc-judge.declined .score { color: var(--pink); }
+.dc-judge.deciding { border-left-color: var(--slate-500); background: transparent; }
+.dc-judge.deciding .badge { color: var(--slate-300); }
+
+/* Phone: 44 px tap targets, actions wrap under the label */
+@media (max-width: 600px) {
+  .dc-card .btn, .dc-card .chev, .dc-card .linkish { min-height: 44px; }
+  .dc-card .item .ok, .dc-card .item .no { min-width: 44px; height: 44px; }
+  .dc-card .grp-acts { width: 100%; }
+  .dc-judge { grid-template-columns: auto minmax(0, 1fr); }
+  .dc-judge .score { grid-column: 2; }
+  .dc-judge .why { grid-column: 1 / 3; }
+}

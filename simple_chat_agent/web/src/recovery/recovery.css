@@ -1,0 +1,47 @@
+/* Recovery and send states (PRD U4, U6). Visual reference: the wireframes' .banner, .divider
+   and .sendstate rules. Yellow means "waiting", green means "kept"; nothing here is red except a
+   send that really failed. */
+
+.rc-banner {
+  border: 1px solid var(--yellow); background: rgba(254, 203, 47, .08); padding: .75em 1em;
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: .3em 1em; align-items: start; font-size: .9em;
+}
+.rc-banner .ic {
+  width: 1.4em; height: 1.4em; border: 2px solid var(--yellow); display: grid; place-items: center;
+  font-family: var(--mono); font-weight: 600; color: var(--yellow); font-size: .8em;
+}
+.rc-banner .t { font-weight: 600; color: var(--yellow); }
+.rc-banner a { font-family: var(--mono); font-size: .8em; white-space: nowrap; }
+.rc-banner .d { grid-column: 2 / 4; color: var(--indigo-100); margin: 0; }
+.rc-banner .d b { color: var(--off-white); font-weight: 500; }
+@media (max-width: 600px) {
+  .rc-banner { grid-template-columns: auto minmax(0, 1fr); }
+  .rc-banner a { grid-column: 1 / 3; grid-row: 3; white-space: normal; min-height: 44px; display: inline-flex; align-items: center; }
+  .rc-banner .d { grid-column: 1 / 3; }
+}
+
+.rc-divider {
+  display: grid; gap: .45em; padding: .8em 1em; border-top: 1px solid var(--green); border-bottom: 1px solid var(--green);
+  background: linear-gradient(90deg, rgba(31, 241, 165, .08), rgba(195, 255, 98, .03)); font-size: .88em;
+}
+.rc-divider .t {
+  font-family: var(--mono); font-weight: 600; color: var(--green); font-size: .8em; text-transform: uppercase;
+  letter-spacing: .05em; display: flex; gap: .4em .8em; align-items: center; flex-wrap: wrap;
+}
+.rc-divider .t .i {
+  margin-left: auto; color: var(--slate-300); text-transform: none; letter-spacing: 0; font-weight: 500;
+  border-bottom: 1px dotted var(--slate-300); cursor: help;
+}
+.rc-divider .b { margin: 0; }
+.rc-divider .kept { display: flex; flex-wrap: wrap; gap: .4em 1.4em; font-family: var(--mono); font-size: .82em; margin: 0; padding: 0; list-style: none; }
+.rc-divider .kept b { color: var(--green); font-weight: 600; }
+.rc-divider .kept .rep b { color: var(--yellow); }
+.rc-divider .kept b.checking { color: var(--slate-300); font-weight: 500; }
+
+.sendstate { display: flex; gap: .3em; align-items: center; font-family: var(--mono); font-size: .7em; color: var(--slate-300); flex-wrap: wrap; margin: 0; padding: 0; list-style: none; }
+.sendstate li { display: inline-flex; gap: .3em; align-items: center; }
+.sendstate .chip { padding: .15em .45em; border: 1px solid var(--slate-500); }
+.sendstate .done .chip { color: var(--green); border-color: var(--green); }
+.sendstate .now .chip { color: var(--space-black); background: var(--yellow); border-color: var(--yellow); font-weight: 600; }
+.sendstate.failed { color: var(--red); }
+@media (prefers-reduced-motion: no-preference) { .sendstate .chip { transition: background-color .15s, color .15s; } }
