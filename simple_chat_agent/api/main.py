@@ -47,6 +47,7 @@ from simple_chat_agent.api.auth import (
     user_from_local_username,
     user_from_session_token,
 )
+from simple_chat_agent.api.console import mount_console
 from simple_chat_agent.api.features import (
     github_tools_enabled,
 )
@@ -579,6 +580,11 @@ app.include_router(
 _agent_api = AgentApi(current_user=lambda request: _current_user(request))
 app.state.agent_api = _agent_api
 app.include_router(_agent_api.router(app_store=_store), prefix="/api/agent")
+
+# The harness console (P2 step 2.4): its unchanged static UI at /console/, talking to our own
+# owner-scoped routes at /console/api/. CONSOLE_ENABLED; on by default only for
+# AGENT_ENVIRONMENT=local. Mounted last so its static mount can't shadow other routes.
+app.state.console_enabled = mount_console(app, _agent_api, app_store=_store)
 
 
 def main() -> None:
