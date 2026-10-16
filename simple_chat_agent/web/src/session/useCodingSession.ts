@@ -14,7 +14,7 @@ import {
 } from "react";
 import { HarnessProvider, HttpTransport, SessionStore, useAgentSession } from "@temporalio/agent-harness-react";
 
-import { AGENT_API_BASE, CLIENT_HEADERS } from "./api";
+import { AGENT_API_BASE, CLIENT_HEADERS, readLog, uploadAttachment } from "./api";
 import {
   alwaysApproved as deriveAlwaysApproved,
   currentModel,
@@ -26,6 +26,7 @@ import {
 } from "./derive";
 import { advance, landed, observe, startRecord, stuckInTemporal } from "./sendStates";
 import { TelemetryFolder } from "./telemetry";
+import { TimingFolder, timingKey } from "./timings";
 import type {
   ApproveOptions,
   ChangesState,
@@ -87,6 +88,10 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
   if (folder.current?.id !== sessionId) folder.current = { id: sessionId, folder: new TelemetryFolder() };
   const activeFolder = folder.current.folder;
   const telemetry = useMemo(() => activeFolder.update(h.frames), [activeFolder, h.frames]);
+  const timingFolder = useRef<{ id: string; folder: TimingFolder } | null>(null);
+  if (timingFolder.current?.id !== sessionId) timingFolder.current = { id: sessionId, folder: new TimingFolder() };
+  const activeTimings = timingFolder.current.folder;
+  const timings = useMemo(() => activeTimings.update(h.frames), [activeTimings, h.frames]);
 
   // Send records, per session.
   const [sendState, setSendState] = useState<{ id: string; records: readonly SendRecord[] }>({ id: sessionId, records: [] });
@@ -231,6 +236,10 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
     modelAppliesNextTurn: deriveModelAppliesNextTurn(h.messages, h.agentStatus),
     posture,
     alwaysApproved: always,
+
+    modelCallTiming: (agentId, messageId, index) => timings.get(timingKey(agentId, messageId))?.[index],
+    readLog: (logRef, options) => readLog(sessionId, logRef, options),
+    attach: (file) => uploadAttachment(sessionId, file),
 
     send: (text: string) => runMessage("message", "chat", { text }),
     steer: (text: string) => runMessage("steer", "steer", { text }),

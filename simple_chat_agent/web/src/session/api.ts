@@ -2,7 +2,7 @@
 // and session creation. All same-origin. None of these reach a Query-backed path: sessions
 // come from Redis, config is static, `/api/me` reads the cookie or catalog headers.
 
-import type { AgentCatalog, ModelChoice, Posture } from "./types";
+import type { AgentCatalog, Attachment, LogPage, ModelChoice, Posture } from "./types";
 
 /** Sent on every request. The API admits a state-changing request on a same-origin Origin or
  *  this header; sending both keeps the dev proxy and odd browsers working. */
@@ -36,7 +36,8 @@ export function isUnreachable(error: unknown): boolean {
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   for (const [k, v] of Object.entries(CLIENT_HEADERS)) headers.set(k, v);
-  if (init.body !== undefined && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  if (headers.get("Content-Type") === "") headers.delete("Content-Type");
+  else if (init.body !== undefined && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   let response: Response;
   try {
     response = await fetch(path, { ...init, headers, credentials: "same-origin" });
@@ -151,4 +152,23 @@ export function summaryModel(s: Pick<SessionSummary, "model"> | null | undefined
   const m = s?.model;
   if (!m?.provider || !m.model) return null;
   return { provider: m.provider, model: m.model, effort: m.effort ?? null };
+}
+
+// -- tool output (S7) and uploads --------------------------------------------------------------
+
+export const readLog = (sessionId: string, logRef: string, options: { offset?: number; stream?: "stdout" | "stderr" | "both" } = {}) => {
+  const q = new URLSearchParams({ stream: options.stream ?? "both", offset: String(options.offset ?? 0) });
+  return request<LogPage>(`${AGENT_API_BASE}sessions/${encodeURIComponent(sessionId)}/logs/${encodeURIComponent(logRef)}?${q}`);
+};
+
+export async function uploadAttachment(sessionId: string, file: File): Promise<Attachment> {
+  const body = new FormData();
+  body.append("file", file, file.name);
+  const reply = await request<{ attachment: Attachment }>(`${AGENT_API_BASE}sessions/${encodeURIComponent(sessionId)}/attachments`, {
+    method: "POST",
+    body,
+    // Let the browser set the multipart boundary.
+    headers: { "Content-Type": "" },
+  });
+  return reply.attachment;
 }

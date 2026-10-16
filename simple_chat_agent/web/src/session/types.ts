@@ -19,6 +19,10 @@
 //                                 where a worker was lost, one per `TurnRecovery`.
 //                                 export function SendStateTrail(props: SendStateTrailProps)
 //                                 Sending → In Temporal → Accepted → Running, for one record.
+//                                 export function JudgeCard(props: JudgeCardProps)  (decisions/)
+//                                 rendered by the transcript above the tool row it decided.
+//
+// The Workbench also gets `focus` (path chips in the transcript open a file in Changes).
 //
 // Ask Eng U (through the PM) for anything missing here rather than reaching into the harness.
 
@@ -348,6 +352,14 @@ export interface CodingSession {
   /** Tool names approved with "Always approve" this session (from resolved approvals). */
   alwaysApproved: readonly string[];
 
+  /** When one model call ran (from the stream's timestamps), by its agent, message and its
+   *  position among that message's model_interaction parts (0-based). */
+  modelCallTiming(agentId: string, messageId: string, index: number): ModelCallTiming | undefined;
+  /** A page of a command's stored output (S7), by the `log_ref` in its result. */
+  readLog(logRef: string, options?: { offset?: number; stream?: "stdout" | "stderr" | "both" }): Promise<LogPage>;
+  /** Upload a file to the session; mention it in the next message so the agent reads it. */
+  attach(file: File): Promise<Attachment>;
+
   send(text: string): Promise<SendRecord>;
   steer(text: string): Promise<SendRecord>;
   interrupt(reason?: string): Promise<SendRecord>;
@@ -365,11 +377,54 @@ export interface SessionSeed {
   posture?: Posture | null;
 }
 
+export interface ModelCallTiming {
+  /** ms since epoch. */
+  startedAt: number;
+  firstThoughtAt: number | null;
+  /** The first reply text or tool request out of the call. */
+  firstOutputAt: number | null;
+  endedAt: number | null;
+}
+
+/** GET /api/agent/sessions/{id}/logs/{log_ref}. */
+export interface LogPage {
+  text: string;
+  offset: number;
+  next_offset: number | null;
+  total_chars: number | null;
+  finished: boolean;
+  exit_code: number | null;
+}
+
+/** POST /api/agent/sessions/{id}/attachments → `attachment`. */
+export interface Attachment {
+  attachment_id: string;
+  name: string;
+  mime_type: string;
+  size_bytes: number;
+  content_kind: string;
+  text_preview?: string | null;
+}
+
 // -- slot props (Eng W) ---------------------------------------------------------------------
+
+/** Open a file in the Changes tab. `at` changes on every request, so the same path can be
+ *  asked for twice. */
+export interface WorkbenchFocus {
+  tab: "changes";
+  path: string;
+  at: number;
+}
 
 export interface WorkbenchProps {
   session: CodingSession;
   variant: "panel" | "sheet";
+  focus?: WorkbenchFocus | null;
+}
+export interface JudgeCardProps {
+  /** The tool call the judge decided, and the evaluation to show. */
+  part: ToolPart;
+  evaluation: Evaluation;
 }
 export interface DecisionDockProps {
   session: CodingSession;
