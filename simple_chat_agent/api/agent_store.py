@@ -83,7 +83,13 @@ class AgentStore:
         await self.r.set(self._k(session, "owner"), json.dumps({"owner": owner, "root": root or session}), ex=session_ttl_seconds())
 
     async def owner_of(self, session: str) -> str | None:
-        raw = await self.r.get(self._k(session, "owner"))
+        """The session's owner. Reading it extends its life: an active session never
+        outlives its ownership record."""
+        key = self._k(session, "owner")
+        pipe = self.r.pipeline(transaction=True)
+        pipe.get(key)
+        pipe.expire(key, session_ttl_seconds())
+        raw, _ = await pipe.execute()
         return json.loads(raw)["owner"] if raw else None
 
     # -- frames ------------------------------------------------------------------
@@ -176,14 +182,26 @@ class AgentStore:
             pipe.expire(self._k(session, "p"), ttl)
         if pending_removed:
             pipe.srem(self._k(session, "p"), pending_removed)
+            # Remember it finished waiting, so a client retry of the same request id (which the
+            # workflow deduplicates) doesn't put it back in the pending set.
+            pipe.sadd(self._k(session, "done"), pending_removed)
+            pipe.expire(self._k(session, "done"), ttl)
         await pipe.execute()
 
     async def note_sent(self, session: str, message_id: str) -> None:
-        """A message went out through the front door; it is pending until its turn starts."""
+        """A message went out through the front door; it is pending until its turn starts,
+        or until the agent rejects it. A retry of a message that already left the pending
+        set is not re-added."""
+        if await self.r.sismember(self._k(session, "done"), message_id):
+            return
         pipe = self.r.pipeline(transaction=True)
         pipe.sadd(self._k(session, "p"), message_id)
         pipe.expire(self._k(session, "p"), session_ttl_seconds())
         await pipe.execute()
+
+    async def clear_pending(self, session: str) -> None:
+        """The session ended: nothing it held will ever start."""
+        await self.r.delete(self._k(session, "p"))
 
     # -- forwarder lease ---------------------------------------------------------
 
@@ -191,19 +209,30 @@ class AgentStore:
         key = self._k(session, "lease")
         if await self.r.set(key, holder, nx=True, px=ttl_ms):
             return True
-        return await self.r.get(key) == holder
+        return await self.renew_lease(session, holder, ttl_ms)
 
     async def renew_lease(self, session: str, holder: str, ttl_ms: int = 15_000) -> bool:
-        key = self._k(session, "lease")
-        if await self.r.get(key) != holder:
-            return False
-        await self.r.pexpire(key, ttl_ms)
-        return True
+        """Extend the lease only if ``holder`` still owns it (atomic compare-and-set)."""
+        return bool(await self.r.eval(_RENEW_IF_HOLDER, 1, self._k(session, "lease"), holder, ttl_ms))
 
     async def release_lease(self, session: str, holder: str) -> None:
-        key = self._k(session, "lease")
-        if await self.r.get(key) == holder:
-            await self.r.delete(key)
+        """Delete the lease only if ``holder`` still owns it (atomic compare-and-delete)."""
+        await self.r.eval(_DELETE_IF_HOLDER, 1, self._k(session, "lease"), holder)
+
+
+_RENEW_IF_HOLDER = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+"""
+
+_DELETE_IF_HOLDER = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
 
 
 @dataclass
@@ -225,7 +254,8 @@ def fold(meta: SessionMeta, event: str, data: dict[str, Any]) -> PendingChange:
         if data.get("message_id"):
             meta.pending.add(data["message_id"])
             change.added = data["message_id"]
-    elif event == "message_handler_start":
+    elif event in ("message_handler_start", "message_handler_error"):
+        # A handler error with no prior start is the agent refusing a front-door message.
         if data.get("message_id"):
             meta.pending.discard(data["message_id"])
             change.removed = data["message_id"]

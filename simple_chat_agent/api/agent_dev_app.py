@@ -20,6 +20,7 @@ from temporalio.client import Client
 
 from temporal_agent_harness.plugin import AgentHarnessPlugin
 
+from simple_chat_agent.agent.harness_ext import payload_storage
 from simple_chat_agent.api.agent_bridge import Bridge
 from simple_chat_agent.api.agent_routes import create_agent_router
 from simple_chat_agent.api.agent_store import AgentStore
@@ -45,7 +46,7 @@ def build_app(*, task_queue: str, temporal_address: str) -> FastAPI:
             state["client"] = await Client.connect(
                 temporal_address,
                 namespace=os.environ.get("TEMPORAL_NAMESPACE", "default"),
-                plugins=[PydanticAIPlugin(), AgentHarnessPlugin()],
+                plugins=[PydanticAIPlugin(), AgentHarnessPlugin(large_payload_offload=payload_storage())],
             )
         return state["client"]  # type: ignore[return-value]
 

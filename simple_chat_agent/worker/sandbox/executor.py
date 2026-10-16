@@ -598,10 +598,12 @@ def _require_regular(st: os.stat_result, shown: str, *, for_write: bool) -> None
             "a directory" if stat_module.S_ISDIR(st.st_mode) else "not a regular file"
         )
         raise _FileOpError("not_regular_file", f"{shown} is {kind}.")
-    if for_write and st.st_nlink > 1:
+    if st.st_nlink > 1:
+        # Reads too: a second link may point at a file outside this workspace.
+        verb = "modify" if for_write else "read"
         raise _FileOpError(
             "outside_workspace",
-            f"{shown} has {st.st_nlink} hard links; refusing to modify a file "
+            f"{shown} has {st.st_nlink} hard links; refusing to {verb} a file "
             "that may be shared with a path outside the workspace.",
         )
 
@@ -643,7 +645,11 @@ def _read_exact(fd: int, offset: int, length: int) -> bytes:
 def _encode_content(data: bytes) -> tuple[str, str]:
     try:
         return data.decode("utf-8"), "utf-8"
-    except UnicodeDecodeError:
+    except UnicodeDecodeError as exc:
+        # A range read can end inside a multibyte character. If the only problem is a
+        # truncated character in the last 3 bytes, the text is still text.
+        if exc.start >= len(data) - 3 and exc.reason == "unexpected end of data":
+            return data[: exc.start].decode("utf-8"), "utf-8"
         return base64.b64encode(data).decode("ascii"), "base64"
 
 
@@ -717,9 +723,9 @@ def _op_read(root_fd: int, request: FileReadRequest) -> dict[str, Any]:
         _require_regular(st, shown, for_write=False)
         size = st.st_size
         offset = min(request.offset, size)
-        length = request.length
-        if length is None:
-            length = size - offset
+        # Clamp to what the file holds before applying the cap, so a generous length on a
+        # small file is fine.
+        length = size - offset if request.length is None else min(request.length, size - offset)
         if length > MAX_FILE_READ_BYTES:
             raise _FileOpError(
                 "too_large",
@@ -732,13 +738,15 @@ def _op_read(root_fd: int, request: FileReadRequest) -> dict[str, Any]:
             )
         data = _read_exact(fd, offset, length)
         content, encoding = _encode_content(data)
+        # Bytes actually returned (a trailing partial character may have been held back).
+        returned = len(content.encode("utf-8")) if encoding == "utf-8" else len(data)
         return {
             "ok": True,
             "path": shown,
             "size": size,
             "offset": offset,
-            "length": len(data),
-            "eof": offset + len(data) >= size,
+            "length": returned,
+            "eof": offset + returned >= size,
             "encoding": encoding,
             "content": content,
         }
@@ -800,11 +808,12 @@ def _op_write(root_fd: int, request: FileWriteRequest, data: bytes) -> dict[str,
     }
 
 
-def _count_matches(data: bytes, needle: bytes) -> int:
-    """Count occurrences, including overlapping ones."""
+def _count_matches(data: bytes, needle: bytes, *, limit: int = 2) -> int:
+    """Count occurrences, including overlapping ones, stopping at ``limit`` (an edit only
+    needs to know 0, 1 or "more than one")."""
     count = 0
     start = data.find(needle)
-    while start != -1:
+    while start != -1 and count < limit:
         count += 1
         start = data.find(needle, start + 1)
     return count
@@ -833,7 +842,7 @@ def _op_edit(root_fd: int, request: FileEditRequest) -> dict[str, Any]:
             raise _FileOpError(
                 "match_count",
                 f"old_string must match exactly once in {shown}; it matched "
-                f"{matches} times."
+                + ("0 times." if matches == 0 else "more than once.")
                 + (
                     " Include more surrounding context to make it unique."
                     if matches > 1

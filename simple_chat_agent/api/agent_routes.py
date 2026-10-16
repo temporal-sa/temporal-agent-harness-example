@@ -17,7 +17,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -35,8 +35,8 @@ from simple_chat_agent.agent.contracts import (
     FrontDoorApproval,
     FrontDoorMessage,
     ModelChoice,
-    Posture,
 )
+from simple_chat_agent.agent.model_registry import is_allowed
 from simple_chat_agent.api.agent_bridge import Bridge
 from simple_chat_agent.api.agent_store import AgentStore
 
@@ -47,7 +47,8 @@ SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connecti
 
 class CreateSession(BaseModel):
     model: ModelChoice = Field(default_factory=ModelChoice)
-    posture: Posture = "trust_safe"
+    # "auto" needs the judge, which arrives in P1; until then it isn't offered.
+    posture: Literal["ask_everything", "trust_safe", "never_ask"] = "trust_safe"
 
 
 class SubmitMessage(BaseModel):
@@ -87,6 +88,8 @@ def create_agent_router(
 
     @router.post("/sessions")
     async def create_session(body: CreateSession, uid: str = Depends(user_id)):
+        if not is_allowed(body.model):
+            return _error(422, "model_not_allowed", f"{body.model.registry_key} is not available.")
         session_id = f"coding-agent-{uuid.uuid4().hex[:16]}"
         data = CodingAgentInit(
             owner_id=uid,
@@ -95,11 +98,12 @@ def create_agent_router(
             model=body.model,
             posture=body.posture,
         )
+        # Ownership first: a crash after starting the workflow must not orphan it.
+        await store.set_owner(session_id, uid)
         client = await temporal()
         await client.start_workflow(
             AGENT_WORKFLOW_TYPE, args=[AgentConfig(), data], id=session_id, task_queue=task_queue
         )
-        await store.set_owner(session_id, uid)
         return JSONResponse({"session_id": session_id, "agent": AGENT_WORKFLOW_TYPE}, headers=NO_STORE)
 
     @router.get("/attach")

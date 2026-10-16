@@ -39,6 +39,9 @@ _PERMANENT_CODES = frozenset(
         "match_count",
         "exists",
         "invalid_path",
+        "not_a_directory",
+        "not_empty",
+        "invalid_request",
     }
 )
 
@@ -60,7 +63,15 @@ async def _files_call(op: str, body: dict[str, Any]) -> dict[str, Any]:
         raise ApplicationError(
             f"The sandbox failed ({response.status_code}).", type="ExecutorUnavailable"
         )
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError:
+        # A non-JSON answer from a misbehaving proxy or executor: not something to retry.
+        raise ApplicationError(
+            f"The sandbox returned an unreadable response ({response.status_code}).",
+            type="ExecutorBadResponse",
+            non_retryable=response.status_code < 500,
+        )
     if response.status_code >= 400:
         detail = data.get("detail", data) if isinstance(data, dict) else data
         code = detail.get("code") if isinstance(detail, dict) else None
@@ -79,7 +90,7 @@ async def read_file(
     path: str,
     workspace_id: agent.Injected[str],
     offset: int = 0,
-    length: int = 200_000,
+    length: int = 64_000,
 ) -> str:
     """Read a text file from the workspace. `path` is relative to the workspace root.
     Use `offset` and `length` (in bytes) to read part of a large file."""
@@ -91,8 +102,11 @@ async def read_file(
         return f"[{path} is a binary file of {data.get('size')} bytes; inspect it with run_command]"
     content = data.get("content", "")
     if data.get("eof") is False:
-        size = data.get("size")
-        content += f"\n\n[read {len(content)} bytes at offset {offset} of {size}; read more with offset]"
+        size, got = data.get("size"), data.get("length", 0)
+        content += (
+            f"\n\n[showing bytes {offset}-{offset + got} of {size}; "
+            f"continue with offset={offset + got}]"
+        )
     return content
 
 
@@ -113,3 +127,30 @@ async def write_file(path: str, content: str, workspace_id: agent.Injected[str])
 
 
 WORKSPACE_TOOLS = (read_file, write_file)
+
+
+# -- Test-only tool ---------------------------------------------------------------------
+# Offered to the model only when a session sets CodingAgentInit.test_tools (integration
+# tests of interrupt and crash handling need a tool that runs for a while).
+
+WAIT_CONFIG = ActivityConfig(
+    start_to_close_timeout=timedelta(minutes=5),
+    heartbeat_timeout=timedelta(seconds=5),
+    retry_policy=RetryPolicy(maximum_attempts=2),
+)
+
+
+@agent.activity_tool_defn(inherently_safe=True, activity_config=WAIT_CONFIG)
+async def wait_seconds(seconds: int) -> str:
+    """Wait for the given number of seconds (testing only)."""
+    import asyncio
+
+    from temporalio import activity
+
+    for _ in range(max(0, min(seconds, 240))):
+        activity.heartbeat()
+        await asyncio.sleep(1)
+    return f"Waited {seconds} seconds."
+
+
+TEST_TOOLS = (wait_seconds,)

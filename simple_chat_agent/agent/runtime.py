@@ -38,6 +38,8 @@ MODEL_ACTIVITY = ActivityConfig(
 
 MODELS = build_registry()
 ALLOWED_KEYS = frozenset(MODELS)
+_DEFAULT_PROVIDER, _, _DEFAULT_NAME = next(iter(MODELS)).partition(":")
+DEFAULT_MODEL = ModelChoice(provider=_DEFAULT_PROVIDER, model=_DEFAULT_NAME)  # type: ignore[arg-type]
 
 CODING_AGENT = harness_ext.QuietTemporalAgent(
     Agent(

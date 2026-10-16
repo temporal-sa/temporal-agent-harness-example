@@ -240,6 +240,25 @@ class ExecutorFilesConfinementTests(_ExecutorFilesTestBase):
             "outside_workspace",
         )
         self.assertEqual(outside.read_text(encoding="utf-8"), "sibling secret")
+        # Reads are refused too: the second link may live outside the workspace.
+        self.assertCode(self.call("read", path="linked.txt"), "outside_workspace")
+
+    def test_range_read_ending_mid_character_stays_text(self) -> None:
+        # "é" is two bytes; a range that ends between them must not turn the read binary.
+        (self.workspace / "u.txt").write_text("aé" * 10, encoding="utf-8")
+        response = self.call("read", path="u.txt", offset=0, length=2)
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["encoding"], "utf-8")
+        self.assertEqual(body["content"], "a")
+        self.assertEqual(body["length"], 1)
+        self.assertFalse(body["eof"])
+
+    def test_generous_length_on_small_file_is_clamped(self) -> None:
+        (self.workspace / "small.txt").write_text("tiny", encoding="utf-8")
+        response = self.call("read", path="small.txt", length=50_000_000)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["content"], "tiny")
 
     def test_fifo_is_refused_for_read_and_write_without_blocking(self) -> None:
         if not hasattr(os, "mkfifo"):
@@ -393,7 +412,7 @@ class ExecutorFilesOperationTests(_ExecutorFilesTestBase):
             "match_count",
         )
         self.assertEqual(two["match_count"], 2)
-        self.assertIn("2 times", two["message"])
+        self.assertIn("more than once", two["message"])  # counting stops at 2
         self.assertEqual(target.read_text(), "x = 1\ny = 1\n")
 
         one = self.call("edit", path="app.py", old_string="y = 1", new_string="y = 2")

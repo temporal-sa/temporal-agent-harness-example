@@ -50,12 +50,16 @@ async def connect() -> Any:
 
     from temporal_agent_harness.plugin import AgentHarnessPlugin
 
-    from simple_chat_agent.agent.tools.workspace import WORKSPACE_TOOLS
+    from simple_chat_agent.agent.harness_ext import payload_storage
+
+    from simple_chat_agent.agent.tools.workspace import TEST_TOOLS, WORKSPACE_TOOLS
 
     return await Client.connect(
         ADDRESS,
         namespace="default",
-        plugins=[PydanticAIPlugin(), AgentHarnessPlugin(tools=list(WORKSPACE_TOOLS))],
+        plugins=[PydanticAIPlugin(), AgentHarnessPlugin(
+            tools=[*WORKSPACE_TOOLS, *TEST_TOOLS], large_payload_offload=payload_storage()
+        )],
     )
 
 

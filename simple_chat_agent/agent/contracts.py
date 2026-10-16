@@ -78,8 +78,10 @@ class CodingAgentInit(BaseModel):
     depth: int = 0
     system_prompt: str | None = None
     carried: CarriedState | None = None
-    # Test hook: force continue-as-new at the next idle point (P0 step 0.5).
+    # Test hooks: force continue-as-new at the next idle point (P0 step 0.5), and offer
+    # test-only tools such as wait_seconds.
     force_continue_as_new_after_turns: int | None = None
+    test_tools: bool = False
 
 
 class ChatMessage(BaseModel):

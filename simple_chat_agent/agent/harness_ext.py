@@ -39,7 +39,8 @@ from temporalio.exceptions import ApplicationError
 from temporal_agent_harness.ai_sdks.pydantic_ai_harness import (
     PydanticAIStreamObserver,
     _resolve_stream_context,
-    as_pydantic_ai_tool,
+    _runner_from_ctx,
+    _tool_schema,
 )
 from temporal_agent_harness.harness.agent_protocol import (
     SEND_AGENT_MESSAGE_UPDATE,
@@ -277,6 +278,7 @@ def per_run_toolset(
     *,
     id: str,
     injections: dict[str, Any] | None = None,
+    is_interrupted: Callable[[], bool] = lambda: False,
 ) -> FunctionToolset[Any]:
     """Adapt harness tools into a FunctionToolset that may be passed to ``run(toolsets=...)``.
 
@@ -284,13 +286,83 @@ def per_run_toolset(
     ``metadata={'temporal': False}`` (durable_exec/_runtime_toolsets.py). Harness tools run
     in-workflow through run_tool anyway, so the opt-out is exactly right, and building per run
     lets each session inject its own workspace.
+
+    This is the harness's ``as_pydantic_ai_tool`` with one change. The harness adapter turns
+    every exception into a "Tool failed" string the model sees, including the ActivityError a
+    cancelled tool activity raises (Temporal reports workflow-side activity cancellation as
+    ActivityError, not CancelledError). After the user interrupts, that would let the turn
+    carry on. Here a failure while ``is_interrupted()`` re-raises as CancelledError.
     """
     adapted: list[Tool[Any]] = []
     for tool in tools:
-        t = as_pydantic_ai_tool(tool, injections=injections)
-        t.metadata = {**(t.metadata or {}), "temporal": False}
-        adapted.append(t)
+        name, description, schema = _tool_schema(tool)
+        adapted.append(
+            Tool.from_schema(
+                _invoker(tool, name, injections, is_interrupted),
+                name=name,
+                description=description,
+                json_schema=schema,
+                takes_ctx=True,
+            )
+        )
+        adapted[-1].metadata = {"temporal": False}
     return FunctionToolset(adapted, id=id)
+
+
+def _invoker(
+    tool: Callable[..., Awaitable[Any]],
+    name: str,
+    injections: dict[str, Any] | None,
+    is_interrupted: Callable[[], bool],
+) -> Callable[..., Awaitable[Any]]:
+    async def invoke(ctx: RunContext[Any], **kwargs: Any) -> Any:
+        runner = _runner_from_ctx(ctx, tool_name=name)
+        try:
+            return await runner.run_tool(ctx.tool_call_id, tool, injections=injections, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - mirror the harness adapter, except on interrupt
+            if is_interrupted():
+                raise asyncio.CancelledError(f"{name} stopped by the user") from exc
+            return f"Tool {name!r} failed: {exc}"
+
+    return invoke
+
+
+class TurnInterrupted(Exception):
+    """Raised in workflow code to stop a turn the user interrupted."""
+
+
+def is_cancellation(exc: BaseException) -> bool:
+    """True for asyncio cancellation or a Temporal ActivityError caused by cancellation."""
+    from temporalio.exceptions import ActivityError, CancelledError as TemporalCancelled
+
+    if isinstance(exc, (asyncio.CancelledError, TurnInterrupted, TemporalCancelled)):
+        return True
+    if isinstance(exc, ActivityError):
+        return isinstance(exc.cause, TemporalCancelled) or "cancel" in str(exc).lower()
+    return False
+
+
+def publish_rejection(runner: AgentWorkflowRunner, *, message_id: str, reason: str) -> None:
+    """Report a front-door message the agent refused, on the stream, as a harness event.
+
+    The harness has no "rejected" event, and its event union is closed. A
+    ``message_handler_error`` carrying the message's id does the job: the client marks that
+    pending message as failed with the reason, and the bridge stops counting it as pending.
+    """
+    from temporal_agent_harness.harness.agent_protocol import MessageHandlerError
+
+    runner._pub("", 0, MessageHandlerError(message=reason), message_id=message_id)
+
+
+def payload_storage() -> Any:
+    """Large-payload offload shared by worker, API and tests (PRD §3: 256 KB threshold).
+
+    Local disk for development; P1 switches the catalog to S3 (the stores must match across
+    every process that reads or writes payloads).
+    """
+    from temporal_agent_harness.utils.large_payload import local_payload_storage
+
+    return local_payload_storage(payload_size_threshold=256 * 1024)
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +446,11 @@ def is_quiescent(runner: AgentWorkflowRunner) -> bool:
         and not status.pending_callbacks()
         and not status.active_subagents()
     )
+
+
+def is_closed(runner: AgentWorkflowRunner) -> bool:
+    """Whether ``close`` was signalled (``AgentWorkflowRunner._closed``)."""
+    return runner._closed
 
 
 def turn_counter(runner: AgentWorkflowRunner) -> int:

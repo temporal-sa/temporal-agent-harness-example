@@ -49,8 +49,8 @@ with workflow.unsafe.imports_passed_through():
         Posture,
         SetModel,
     )
-    from simple_chat_agent.agent.runtime import CODING_AGENT, is_allowed_model, model_settings
-    from simple_chat_agent.agent.tools.workspace import WORKSPACE_TOOLS
+    from simple_chat_agent.agent.runtime import CODING_AGENT, DEFAULT_MODEL, is_allowed_model, model_settings
+    from simple_chat_agent.agent.tools.workspace import TEST_TOOLS, WORKSPACE_TOOLS
 
 # Wake an idle session this often so a deploy can move it to the new version (PRD A18).
 IDLE_WAKE = timedelta(hours=1)
@@ -58,7 +58,10 @@ IDLE_WAKE = timedelta(hours=1)
 RECENT_REQUEST_IDS = 500
 # Stream events carried across continue-as-new (see _continue_as_new).
 CAN_RETAINED_EVENTS = 500
-INTERRUPTED_TOOL_NOTE = "Not run: the user stopped the turn before this tool finished."
+INTERRUPTED_TOOL_NOTE = (
+    "Stopped by the user before this result was used. The call may or may not have completed;\n"
+    "check before relying on its effect."
+)
 
 
 def posture_policy(posture: Posture) -> ToolApprovalPolicy:
@@ -81,12 +84,12 @@ class CodingAgent:
     def __init__(self, config: AgentConfig, data: CodingAgentInit) -> None:
         carried = data.carried or CarriedState(model=data.model)
         if carried.state_version > CARRIED_STATE_VERSION:
-            # A newer version continued into this one. PINNED + AUTO_UPGRADE never moves a
-            # run backwards, so this means a misrouted deploy; fail loudly, don't guess.
-            raise ApplicationError(
-                f"carried state v{carried.state_version} is newer than this worker understands",
-                type="CarriedStateTooNew",
-                non_retryable=True,
+            # A newer version continued into this one, e.g. Current was rolled back after a
+            # deploy. Fail the workflow TASK (not the workflow): Temporal retries it until a
+            # version that understands this state is Current again. Nothing is lost.
+            raise RuntimeError(
+                f"carried state v{carried.state_version} is newer than this worker "
+                f"understands (v{CARRIED_STATE_VERSION}); waiting for a compatible version"
             )
         self._data = data
         self._stream = WorkflowStream(prior_state=carried.stream_state)
@@ -117,14 +120,16 @@ class CodingAgent:
         # run; callers retry and reach the new run. The Signal front door buffers instead.
         harness_ext.guard_send_agent_message(self._runner, lambda: self._continuing)
 
+        # Messages that arrived during the previous run's handoff go first, before any Signal
+        # delivered in this run's first activation (signal handlers run before `run` starts).
+        for message in self._deferred:
+            self._admit(message)
+        self._deferred = []
+
     # -- Lifecycle --------------------------------------------------------------
 
     @workflow.run
     async def run(self, config: AgentConfig, data: CodingAgentInit) -> None:
-        for message in self._deferred:
-            await self._admit(message)
-        self._deferred = []
-
         loop = asyncio.ensure_future(self._runner.run(self))
         while True:
             try:
@@ -158,6 +163,10 @@ class CodingAgent:
         self._continuing = True
         self._stream.detach_pollers()
         await workflow.wait_condition(workflow.all_handlers_finished)
+        if harness_ext.is_closed(self._runner):
+            # A close arrived during the handoff: finish this run instead of continuing.
+            self._continuing = False
+            return
         # Carry only the tail of the event log. Offsets stay monotonic; a reader that was
         # mid-poll at the handoff resumes inside the retained tail instead of falling behind
         # the truncation and silently skipping the last turn's closing events. (P2: truncate
@@ -213,7 +222,7 @@ class CodingAgent:
         if self._continuing:
             self._deferred.append(message)
             return
-        await self._admit(message)
+        self._admit(message)
 
     @workflow.signal(name=ENQUEUE_APPROVAL_SIGNAL)
     async def enqueue_approval(self, approval: FrontDoorApproval) -> None:
@@ -230,7 +239,7 @@ class CodingAgent:
         except ApplicationError as exc:
             self._reject(approval.request_id, exc)
 
-    async def _admit(self, message: FrontDoorMessage) -> None:
+    def _admit(self, message: FrontDoorMessage) -> None:
         try:
             harness_ext.admit_message(
                 self._runner,
@@ -239,6 +248,9 @@ class CodingAgent:
             )
         except ApplicationError as exc:
             self._reject(message.request_id, exc)
+            harness_ext.publish_rejection(
+                self._runner, message_id=message.request_id, reason=f"Not accepted: {exc.message}"
+            )
 
     def _is_duplicate(self, request_id: str) -> bool:
         if request_id in self._seen_requests:
@@ -257,6 +269,9 @@ class CodingAgent:
         """Ask the coding agent to do something in its workspace, or ask it a question."""
         if self._pending_model is not None:
             self._model, self._pending_model = self._pending_model, None
+        if not is_allowed_model(self._model):
+            # The model left this worker's allowlist (config change or a different deploy).
+            self._model = DEFAULT_MODEL
         self._turns_this_run += 1
         self._interrupted = False
         self._snapshot = None
@@ -265,11 +280,11 @@ class CodingAgent:
         self._run_task = task
         try:
             return ChatReply(text=await task)
-        except BaseException:
-            # Cancelling the run task surfaces as asyncio.CancelledError or, when the model
-            # activity was in flight, as ActivityError("Activity cancelled"). Either way, once
-            # the user interrupted, the failure *is* the interrupt.
-            if not self._interrupted:
+        except BaseException as exc:
+            # Cancelling the run surfaces as asyncio.CancelledError, as ActivityError("Activity
+            # cancelled") from an in-flight activity, or as TurnInterrupted from the
+            # before-request hook. Anything else is a real failure, interrupt or not.
+            if not (self._interrupted and harness_ext.is_cancellation(exc)):
                 raise
             # The turn was stopped. If it reached the model, keep everything up to the last
             # model response, close the tool calls it left open, and record the stop so the
@@ -292,7 +307,10 @@ class CodingAgent:
             after_model_request=self._after_model_request,
         )
         toolset = harness_ext.per_run_toolset(
-            WORKSPACE_TOOLS, id="workspace", injections={"workspace_id": self._workspace_id}
+            [*WORKSPACE_TOOLS, *(TEST_TOOLS if self._data.test_tools else ())],
+            id="workspace",
+            injections={"workspace_id": self._workspace_id},
+            is_interrupted=lambda: self._interrupted,
         )
         result = await CODING_AGENT.run(
             text,
@@ -307,6 +325,9 @@ class CodingAgent:
         return str(result.output)
 
     async def _before_model_request(self, ctx: Any, request_context: Any) -> Any:
+        if self._interrupted:
+            # A tool result arrived after Stop; don't start another model call.
+            raise harness_ext.TurnInterrupted()
         self._snapshot = list(request_context.messages)
         return request_context
 
@@ -319,7 +340,7 @@ class CodingAgent:
         """Switch the provider and/or model. Takes effect from the next turn."""
         if not is_allowed_model(msg.model):
             return Ack(ok=False, detail=f"{msg.model.registry_key} is not an allowed model")
-        if self._run_task is None and not self._runner.current_status.turn_active:
+        if self._run_task is None:
             self._model = msg.model
             return Ack(detail=f"Now using {msg.model.registry_key}.")
         self._pending_model = msg.model

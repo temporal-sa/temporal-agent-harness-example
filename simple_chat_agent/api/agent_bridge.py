@@ -69,9 +69,11 @@ class Bridge:
             self._tasks[session] = asyncio.create_task(self._run(session), name=f"bridge:{session}")
 
     async def aclose(self) -> None:
-        for task in self._tasks.values():
+        # Copy: finishing forwarders remove themselves from _tasks.
+        tasks = list(self._tasks.values())
+        for task in tasks:
             task.cancel()
-        for task in self._tasks.values():
+        for task in tasks:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
 
@@ -91,9 +93,14 @@ class Bridge:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - workers down, network: retry
+                    if await self._session_closed(session):
+                        await self._store.clear_pending(session)
+                        return
                     log.info("bridge %s: attach failed (%s); retrying in %.0fs", session, exc, backoff)
-                    forwarded = 0
                     await asyncio.sleep(backoff)
+                    # Failures count toward the idle limit, so a forwarder whose attach keeps
+                    # failing (workers gone for good) still stops eventually.
+                    idle_for += backoff
                     backoff = min(backoff * 2, 15.0)
                     continue
                 idle_for = 0.0 if forwarded else idle_for + IDLE_RECHECK_SECONDS
@@ -103,6 +110,19 @@ class Bridge:
         finally:
             renew.cancel()
             await self._store.release_lease(session, self._holder)
+            if self._tasks.get(session) is asyncio.current_task():
+                self._tasks.pop(session, None)
+                self._wake.pop(session, None)
+
+    async def _session_closed(self, session: str) -> bool:
+        """True when the workflow has ended (Describe needs no worker)."""
+        from temporalio.client import WorkflowExecutionStatus
+
+        try:
+            desc = await self._temporal.get_workflow_handle(session).describe()
+        except Exception:  # noqa: BLE001 - can't tell; assume open
+            return False
+        return desc.status not in (None, WorkflowExecutionStatus.RUNNING)
 
     async def _renew(self, session: str) -> None:
         while True:

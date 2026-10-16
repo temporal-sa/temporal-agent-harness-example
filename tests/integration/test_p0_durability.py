@@ -62,6 +62,36 @@ class InterruptTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("no", chat_replies(events.collected)[-1]["text"].lower())
             await handle.signal("close")
 
+    async def test_interrupt_during_tool_activity(self) -> None:
+        """Review finding 1: Stop while a tool activity runs must end the turn, not let the
+        model carry on with a "tool failed" result."""
+        runs = int(os.environ.get("P0_INTERRUPT_RUNS", "1"))
+        stopped = 0
+        async with support.running_worker(self.client, self.task_queue):
+            for _ in range(runs):
+                handle = await support.start_session(self.client, self.task_queue, model=HAIKU, test_tools=True)
+                async with support.EventCollector(self.client, handle.id) as events:
+                    await support.send(handle, "chat", {"text": "Call wait_seconds with seconds=60, then reply 'finished'."})
+                    await events.wait_for(lambda c: any(e.event.tool_name == "wait_seconds" for e in c.of("tool_start")))
+                    models_before = len(events.collected.of("model_interaction_started"))
+                    t0 = asyncio.get_running_loop().time()
+                    await support.send(handle, "interrupt", {})
+                    await events.wait_for(lambda c: c.turn_ends() >= 1, timeout=30)
+                    elapsed = asyncio.get_running_loop().time() - t0
+                    reply = chat_replies(events.collected)[-1]
+                    self.assertTrue(reply["interrupted"], reply)
+                    # No new model call started after the stop.
+                    self.assertEqual(len(events.collected.of("model_interaction_started")), models_before)
+                    self.assertLess(elapsed, 10, elapsed)
+                    stopped += 1
+                    # The next turn still works, and the history is valid for the provider.
+                    await support.send(handle, "chat", {"text": "Reply with exactly: ready"})
+                    await events.wait_for(lambda c: len(chat_replies(c)) >= 2 or c.of("message_handler_error"), timeout=120)
+                    errors = [e for e in events.collected.of("message_handler_error") if e.message_id]
+                    self.assertFalse(errors, [e.event.message for e in errors])
+                await handle.signal("close")
+        print(f"\n[0.4] interrupt during tool activity: {stopped}/{runs} stopped cleanly")
+
     async def test_interrupt_during_stream(self) -> None:
         runs = int(os.environ.get("P0_INTERRUPT_RUNS", "1"))
         lags: list[float] = []

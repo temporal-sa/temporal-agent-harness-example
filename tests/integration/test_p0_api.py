@@ -165,6 +165,49 @@ class FrontDoorTests(unittest.IsolatedAsyncioTestCase):
             offsets = [d["resume_offset"] for _, d in sse.frames]
             self.assertEqual(offsets, sorted(offsets))
 
+    async def test_rejected_message_and_retry_do_not_hang_attach(self) -> None:
+        """Review finding 2: a message the agent refuses, and a client retry of a finished
+        request id, must not stay pending (which would hold /attach open forever)."""
+        r = await self.http.post(f"{self.base}/sessions", json={"model": {"provider": "anthropic", "model": "claude-haiku-5-5", "effort": "low"}}, headers=self.h("alice"))
+        session = r.json()["session_id"]
+        async with support.running_worker(self.client, self.task_queue):
+            bad = await self.http.post(
+                f"{self.base}/messages",
+                json={"session_id": session, "message": {"type": "no_such_operation", "payload": {}}},
+                headers=self.h("alice"),
+            )
+            bad_id = bad.json()["message_id"]
+            async with SseReader(self.base, "alice", session) as sse:
+                await sse.wait_for(lambda s: any(d.get("message_id") == bad_id for d in s.of("message_handler_error")), timeout=30)
+            await self._wait_idle(session)
+
+            ok = await self.http.post(
+                f"{self.base}/messages",
+                json={"session_id": session, "message": {"type": "chat", "payload": {"text": "Reply with exactly: hi"}}, "request_id": "retry-1"},
+                headers=self.h("alice"),
+            )
+            async with SseReader(self.base, "alice", session) as sse:
+                await sse.wait_for(lambda s: s.of("turn_end"), timeout=120)
+            await self._wait_idle(session)
+            # The client retries the same request id after it already ran.
+            await self.http.post(
+                f"{self.base}/messages",
+                json={"session_id": session, "message": {"type": "chat", "payload": {"text": "Reply with exactly: hi"}}, "request_id": "retry-1"},
+                headers=self.h("alice"),
+            )
+            await self._wait_idle(session)
+            self.assertEqual(ok.status_code, 200)
+
+    async def _wait_idle(self, session: str, timeout: float = 30) -> None:
+        deadline = time.monotonic() + timeout
+        while True:
+            st = (await self.http.get(f"{self.base}/status/{session}", headers=self.h("alice"))).json()
+            if not st["turn_active"] and not st["pending_turns"]:
+                return
+            if time.monotonic() > deadline:
+                raise AssertionError(f"session never went idle: {st}")
+            await asyncio.sleep(0.3)
+
     async def _signal_count(self, session: str) -> int:
         handle = self.client.get_workflow_handle(session)
         n = 0
