@@ -1,0 +1,12 @@
+{
+  "name": "harness-client-contract",
+  "private": true,
+  "type": "module",
+  "description": "P0 step 0.8: the official @temporalio/agent-harness-client, unpatched, against our agent API.",
+  "scripts": {
+    "contract": "node contract.mjs"
+  },
+  "dependencies": {
+    "@temporalio/agent-harness-client": "0.1.0"
+  }
+}

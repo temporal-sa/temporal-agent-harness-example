@@ -199,7 +199,9 @@ def create_agent_router(
 
 
 async def _frames(store: AgentStore, session_id: str, from_offset: int) -> AsyncIterator[bytes]:
-    """Replay frames after ``from_offset`` from Redis, then tail until the agent is idle.
+    """Replay frames after ``from_offset`` from Redis, then tail until the agent is idle and
+    every frame is delivered (client transport.ts ``attach``: "Ends when the agent is idle and
+    caught up").
 
     ``from_offset`` is the client's last ``resume_offset``; frames at that position were
     already delivered, so replay starts after it. While a turn is open (including while no
@@ -210,9 +212,15 @@ async def _frames(store: AgentStore, session_id: str, from_offset: int) -> Async
     loop = asyncio.get_running_loop()
     last_sent = loop.time()
     while True:
+        # Meta first, frames second. The bridge appends a frame before it saves the meta that
+        # frame produces, so an idle meta read here guarantees the read below already sees the
+        # turn_end. Reading frames first could miss a turn_end appended between the two reads
+        # and end the stream with the client's turn still open, which the client treats as a
+        # dropped connection (client session.ts: "a stream that ends with a turn still open
+        # was cut off").
+        meta = await store.meta(session_id)
         frames = await store.read(session_id, after=after)
         if not frames:
-            meta = await store.meta(session_id)
             if not meta.turn_active and not meta.pending:
                 return
             frames = await store.wait(session_id, after=after, block_ms=1000)

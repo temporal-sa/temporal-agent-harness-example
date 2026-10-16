@@ -10,8 +10,11 @@ Frame format v1 (CTO memo 001, CTO-2). One Redis stream per agent session:
 hence the per-offset ``seq``. Redis stream ids must be greater than 0-0, so the stored
 millisecond part is ``resume_offset + 1``.
 
-Status meta lives in a hash next to it and is served to clients instead of a Temporal Query,
-so ``status`` costs no Actions and still answers while every worker is down.
+Status meta lives in a key next to it and is served to clients instead of a Temporal Query,
+so ``status`` costs no Actions and still answers while every worker is down. Pending message
+ids live in their own set (``{prefix}:s:{session}:p``), changed only by SADD/SREM, because two
+writers touch them: the API adds an id when it sends, the bridge adds and removes ids as frames
+arrive. Keeping them in the meta JSON let the bridge's copy overwrite a send made mid-forward.
 """
 
 from __future__ import annotations
@@ -130,38 +133,57 @@ class AgentStore:
     # -- meta --------------------------------------------------------------------
 
     async def meta(self, session: str) -> SessionMeta:
-        raw = await self.r.get(self._k(session, "m"))
-        if not raw:
-            return SessionMeta()
-        d = json.loads(raw)
+        pipe = self.r.pipeline(transaction=True)
+        pipe.get(self._k(session, "m"))
+        pipe.smembers(self._k(session, "p"))
+        raw, pending = await pipe.execute()
+        d = json.loads(raw) if raw else {}
         return SessionMeta(
             head=d.get("head", 0),
             turn_active=d.get("turn_active", False),
             current_turn=d.get("current_turn", 0),
-            pending=set(d.get("pending", [])),
+            pending=set(pending or ()),
             closed=d.get("closed", False),
         )
 
-    async def save_meta(self, session: str, meta: SessionMeta) -> None:
-        await self.r.set(
+    async def save_meta(
+        self,
+        session: str,
+        meta: SessionMeta,
+        *,
+        pending_added: str | None = None,
+        pending_removed: str | None = None,
+    ) -> None:
+        """Write the meta fields, and apply one pending-set change. ``meta.pending`` itself is
+        never written back: the set is changed only by SADD/SREM, so a stale copy can't drop an
+        id another writer added."""
+        ttl = session_ttl_seconds()
+        pipe = self.r.pipeline(transaction=True)
+        pipe.set(
             self._k(session, "m"),
             json.dumps(
                 {
                     "head": meta.head,
                     "turn_active": meta.turn_active,
                     "current_turn": meta.current_turn,
-                    "pending": sorted(meta.pending),
                     "closed": meta.closed,
                 }
             ),
-            ex=session_ttl_seconds(),
+            ex=ttl,
         )
+        if pending_added:
+            pipe.sadd(self._k(session, "p"), pending_added)
+            pipe.expire(self._k(session, "p"), ttl)
+        if pending_removed:
+            pipe.srem(self._k(session, "p"), pending_removed)
+        await pipe.execute()
 
     async def note_sent(self, session: str, message_id: str) -> None:
         """A message went out through the front door; it is pending until its turn starts."""
-        meta = await self.meta(session)
-        meta.pending.add(message_id)
-        await self.save_meta(session, meta)
+        pipe = self.r.pipeline(transaction=True)
+        pipe.sadd(self._k(session, "p"), message_id)
+        pipe.expire(self._k(session, "p"), session_ttl_seconds())
+        await pipe.execute()
 
     # -- forwarder lease ---------------------------------------------------------
 
@@ -184,8 +206,16 @@ class AgentStore:
             await self.r.delete(key)
 
 
-def fold(meta: SessionMeta, event: str, data: dict[str, Any]) -> None:
-    """Update status meta from one frame (root agent only)."""
+@dataclass
+class PendingChange:
+    added: str | None = None
+    removed: str | None = None
+
+
+def fold(meta: SessionMeta, event: str, data: dict[str, Any]) -> PendingChange:
+    """Update status meta from one frame (root agent only). Returns the pending-set change,
+    for ``save_meta`` to apply to the shared set."""
+    change = PendingChange()
     if event == "turn_started":
         meta.turn_active = True
         meta.current_turn = max(meta.current_turn, int(data.get("turn_number") or 0))
@@ -194,8 +224,12 @@ def fold(meta: SessionMeta, event: str, data: dict[str, Any]) -> None:
     elif event == "message_accepted" and data.get("disposition") != "joined":
         if data.get("message_id"):
             meta.pending.add(data["message_id"])
+            change.added = data["message_id"]
     elif event == "message_handler_start":
-        meta.pending.discard(data.get("message_id") or "")
+        if data.get("message_id"):
+            meta.pending.discard(data["message_id"])
+            change.removed = data["message_id"]
+    return change
 
 
 def _frame(entry_id: str, fields: dict[str, str]) -> StoredFrame:

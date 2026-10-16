@@ -138,8 +138,10 @@ class Bridge:
                 offset, seq, seen = resume_offset, 0, set()
             seen.add(digest)
             await self._store.append(session, event, data, resume_offset, seq)
-            fold(meta, event, data)
+            change = fold(meta, event, data)
             meta.head = resume_offset
-            await self._store.save_meta(session, meta)
+            await self._store.save_meta(
+                session, meta, pending_added=change.added, pending_removed=change.removed
+            )
             count += 1
         return count
