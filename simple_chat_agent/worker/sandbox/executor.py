@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import errno
 import hashlib
 import hmac
 import http.client
@@ -9,17 +12,20 @@ import os
 import re
 import shutil
 import signal
+import secrets
 import socket
+import stat as stat_module
 import subprocess
 import time
-from collections.abc import AsyncIterator
-from contextlib import suppress
+from collections.abc import AsyncIterator, Callable
+from contextlib import ExitStack, asynccontextmanager, suppress
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal, TypeVar
 
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 MAX_COMMAND_CHARS = 100_000
@@ -38,6 +44,17 @@ DEFAULT_LIVE_HEALTH_INTERVAL_SECONDS = 30.0
 DEFAULT_MAX_ORPHAN_ZOMBIES = 8
 _SAFE_EXECUTION_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 
+# /files/* limits (PRD §5 rule 5).
+MAX_FILE_READ_BYTES = 1024 * 1024
+MAX_FILE_WRITE_BYTES = 5 * 1024 * 1024
+MAX_LIST_ENTRIES = 2_000
+MAX_FILE_PATH_BYTES = 4096
+# Request-body guard only: base64 of MAX_FILE_WRITE_BYTES fits comfortably.
+# Anything between the decoded cap and this bound gets a structured too_large.
+MAX_FILE_CONTENT_CHARS = 8 * 1024 * 1024
+MAX_FILE_REQUEST_PATH_CHARS = 65_536
+_T = TypeVar("_T")
+
 
 class ExecuteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -55,8 +72,128 @@ class ExecuteRequest(BaseModel):
     stdin: str | None = Field(default=None, max_length=MAX_STDIN_CHARS)
 
 
+class _FileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_id: str = Field(min_length=1, max_length=512)
+
+
+class FilePathRequest(_FileRequest):
+    path: str = Field(max_length=MAX_FILE_REQUEST_PATH_CHARS)
+
+
+class FileReadRequest(FilePathRequest):
+    offset: int = Field(default=0, ge=0)
+    length: int | None = Field(default=None, ge=0)
+
+
+class FileListRequest(_FileRequest):
+    path: str = Field(default=".", max_length=MAX_FILE_REQUEST_PATH_CHARS)
+
+
+class FileWriteRequest(FilePathRequest):
+    content: str = Field(max_length=MAX_FILE_CONTENT_CHARS)
+    encoding: Literal["utf-8", "base64"] = "utf-8"
+    create_parents: bool = False
+    overwrite: bool = True
+
+
+class FileEditRequest(FilePathRequest):
+    old_string: str = Field(min_length=1, max_length=MAX_FILE_CONTENT_CHARS)
+    new_string: str = Field(max_length=MAX_FILE_CONTENT_CHARS)
+
+
+class FileMkdirRequest(FilePathRequest):
+    parents: bool = False
+
+
+class FileRenameRequest(_FileRequest):
+    source: str = Field(max_length=MAX_FILE_REQUEST_PATH_CHARS)
+    destination: str = Field(max_length=MAX_FILE_REQUEST_PATH_CHARS)
+    overwrite: bool = False
+    create_parents: bool = False
+
+
+class _ReadWriteLock:
+    """An asyncio readers/writer lock that prefers waiting writers."""
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0
+
+    @asynccontextmanager
+    async def shared(self) -> AsyncIterator[None]:
+        async with self._condition:
+            await self._condition.wait_for(
+                lambda: not self._writer and self._waiting_writers == 0
+            )
+            self._readers += 1
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._condition.notify_all()
+
+    @asynccontextmanager
+    async def exclusive(self) -> AsyncIterator[None]:
+        async with self._condition:
+            self._waiting_writers += 1
+            try:
+                await self._condition.wait_for(
+                    lambda: not self._writer and self._readers == 0
+                )
+            finally:
+                self._waiting_writers -= 1
+                if not self._writer and self._waiting_writers == 0:
+                    # A cancelled waiter may have been the only thing holding
+                    # readers back.
+                    self._condition.notify_all()
+            self._writer = True
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._writer = False
+                self._condition.notify_all()
+
+
+@dataclass
+class _WorkspaceLocks:
+    """Per-workspace locking for /execute and /files/*.
+
+    Three kinds of access share one workspace:
+
+    - ``/execute`` (may run for up to 15 minutes) takes ``exec``.
+    - File mutations (write, edit, mkdir, delete, rename) take ``exec`` and
+      then ``files.exclusive()``. They never interleave with a running
+      command's writes or with each other, and readers never see a
+      half-applied mutation.
+    - File reads (stat, read, list) take ``files.shared()`` only.
+
+    So the exclusive side is "exec + files.exclusive": writes block on a
+    running command, but reads do not. A read during a command can observe
+    the command's in-progress writes, exactly as another process on the box
+    would; that is the trade-off for keeping read_file fast while a long
+    pytest runs. A mutation waiting behind ``exec`` has not yet registered on
+    ``files``, so it does not hold up readers; once it owns ``exec`` it waits
+    only for in-flight reads, which are millisecond operations.
+
+    Lock order is always ``_concurrency`` -> ``exec`` -> ``files``, so there is
+    no cycle. A command cannot keep mutating after its ``/execute`` returns:
+    the sandbox has its own PID namespace and ``--die-with-parent``, and the
+    process group is killed on timeout or cancellation.
+    """
+
+    exec: asyncio.Lock = field(default_factory=asyncio.Lock)
+    files: _ReadWriteLock = field(default_factory=_ReadWriteLock)
+
+
 app = FastAPI(title="Agent workspace executor", docs_url=None, redoc_url=None)
-_workspace_locks: dict[str, asyncio.Lock] = {}
+_workspace_locks: dict[str, _WorkspaceLocks] = {}
 _workspace_locks_guard = asyncio.Lock()
 _concurrency = asyncio.Semaphore(
     max(1, int(os.environ.get("WORKSPACE_EXECUTOR_MAX_CONCURRENT", "4")))
@@ -168,6 +305,644 @@ async def execute(
     )
 
 
+# --- /files/* ---------------------------------------------------------------
+#
+# These endpoints run in the executor process, outside Bubblewrap, so every
+# path is confined by hand: it is split into components and walked one
+# component at a time from an fd on the workspace root with dir_fd and
+# O_NOFOLLOW. Symlinks are refused at every level, so nothing the sandboxed
+# command creates can redirect the executor outside the workspace. All type
+# checks use os.fstat on the opened fd.
+
+
+class _FileOpError(Exception):
+    _STATUS = {
+        "not_found": 404,
+        "exists": 409,
+        "not_empty": 409,
+        "match_count": 409,
+        "too_large": 413,
+        "io_error": 500,
+    }
+
+    def __init__(self, code: str, message: str, **extra: Any) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.extra = extra
+
+    @property
+    def status_code(self) -> int:
+        return self._STATUS.get(self.code, 400)
+
+
+@app.exception_handler(_FileOpError)
+async def _file_op_error_handler(_: Request, err: _FileOpError) -> JSONResponse:
+    return JSONResponse(
+        status_code=err.status_code,
+        content={"ok": False, "code": err.code, "message": err.message, **err.extra},
+    )
+
+
+@app.post("/files/stat")
+async def files_stat(
+    request: FilePathRequest, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
+    _authorize(authorization)
+    return await _run_file_op(request.workspace_id, False, _op_stat, request)
+
+
+@app.post("/files/read")
+async def files_read(
+    request: FileReadRequest, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
+    _authorize(authorization)
+    return await _run_file_op(request.workspace_id, False, _op_read, request)
+
+
+@app.post("/files/list")
+async def files_list(
+    request: FileListRequest, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
+    _authorize(authorization)
+    return await _run_file_op(request.workspace_id, False, _op_list, request)
+
+
+@app.post("/files/write")
+async def files_write(
+    request: FileWriteRequest, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
+    _authorize(authorization)
+    data = _decode_write_content(request)
+    return await _run_file_op(
+        request.workspace_id,
+        True,
+        lambda root, req: _op_write(root, req, data),
+        request,
+    )
+
+
+@app.post("/files/edit")
+async def files_edit(
+    request: FileEditRequest, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
+    _authorize(authorization)
+    return await _run_file_op(request.workspace_id, True, _op_edit, request)
+
+
+@app.post("/files/mkdir")
+async def files_mkdir(
+    request: FileMkdirRequest, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
+    _authorize(authorization)
+    return await _run_file_op(request.workspace_id, True, _op_mkdir, request)
+
+
+@app.post("/files/delete")
+async def files_delete(
+    request: FilePathRequest, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
+    _authorize(authorization)
+    return await _run_file_op(request.workspace_id, True, _op_delete, request)
+
+
+@app.post("/files/rename")
+async def files_rename(
+    request: FileRenameRequest, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
+    _authorize(authorization)
+    return await _run_file_op(request.workspace_id, True, _op_rename, request)
+
+
+async def _run_file_op(
+    workspace_id: str,
+    mutates: bool,
+    operation: Callable[[int, _T], dict[str, Any]],
+    request: _T,
+) -> dict[str, Any]:
+    workspace_key = _workspace_key(workspace_id)
+    workspace_dir = _workspace_dir(workspace_key)
+    locks = await _workspace_locks_for(workspace_key)
+
+    def run() -> dict[str, Any]:
+        workspace_dir.mkdir(mode=WORKSPACE_MODE, parents=True, exist_ok=True)
+        try:
+            root_fd = os.open(workspace_dir, _DIR_FLAGS)
+        except OSError as err:
+            raise _FileOpError("io_error", "Workspace is unavailable.") from err
+        try:
+            return operation(root_fd, request)
+        except _FileOpError:
+            raise
+        except OSError as err:
+            raise _os_error(err, "") from err
+        finally:
+            os.close(root_fd)
+
+    async def locked() -> dict[str, Any]:
+        # Lock scheme: see _WorkspaceLocks.
+        if mutates:
+            async with locks.exec, locks.files.exclusive():
+                return await asyncio.to_thread(run)
+        async with locks.files.shared():
+            return await asyncio.to_thread(run)
+
+    # If the client disconnects, the worker thread keeps running; shield the
+    # task so the locks are released only after the filesystem work is done.
+    return await asyncio.shield(asyncio.ensure_future(locked()))
+
+
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+# O_NONBLOCK: opening a FIFO for its fstat must never block.
+_LEAF_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+
+def _split_path(path: str, *, allow_root: bool) -> list[str]:
+    """Split a workspace-relative path into components, or raise.
+
+    Returns [] for the workspace root ("" or "."). "." components are skipped;
+    they never leave the current directory.
+    """
+    if "\x00" in path:
+        raise _FileOpError("invalid_path", "Path contains a NUL byte.")
+    if len(path.encode("utf-8", errors="surrogatepass")) > MAX_FILE_PATH_BYTES:
+        raise _FileOpError("invalid_path", "Path is too long.")
+    if path.startswith("/"):
+        raise _FileOpError(
+            "outside_workspace",
+            "Absolute paths are not allowed; use a path relative to the "
+            "workspace root (for /workspace/src/app.py, use src/app.py).",
+        )
+    parts: list[str] = []
+    if path not in ("", "."):
+        for part in path.split("/"):
+            if part == "":
+                raise _FileOpError(
+                    "invalid_path", f"Path {path!r} has an empty component."
+                )
+            if part == "..":
+                raise _FileOpError(
+                    "outside_workspace", "Path cannot contain '..' components."
+                )
+            if part != ".":
+                parts.append(part)
+    if not parts and not allow_root:
+        raise _FileOpError(
+            "invalid_path", "This operation needs a path below the root."
+        )
+    return parts
+
+
+def _display(parts: list[str]) -> str:
+    return "/".join(parts) or "."
+
+
+def _os_error(err: OSError, shown: str) -> _FileOpError:
+    where = f"{shown}: " if shown else ""
+    reason = err.strerror or err.__class__.__name__
+    code = {
+        errno.ENOENT: "not_found",
+        errno.EEXIST: "exists",
+        errno.ENOTEMPTY: "not_empty",
+        errno.ELOOP: "is_symlink",
+        errno.ENOTDIR: "not_a_directory",
+        errno.EISDIR: "not_regular_file",
+        errno.ENAMETOOLONG: "invalid_path",
+        errno.EINVAL: "invalid_path",
+    }.get(err.errno or 0, "io_error")
+    return _FileOpError(code, f"{where}{reason}.")
+
+
+def _classify_open_failure(
+    dir_fd: int, name: str, shown: str, err: OSError, *, want_dir: bool
+) -> _FileOpError:
+    """Explain why an O_NOFOLLOW open of one component failed.
+
+    Uses fstatat(AT_SYMLINK_NOFOLLOW) on a single name relative to an fd we
+    already hold, never a path string, and only to pick the error code.
+    """
+    if err.errno == errno.ENOENT:
+        return _FileOpError("not_found", f"{shown} does not exist.")
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return _FileOpError("not_found", f"{shown} does not exist.")
+    except OSError:
+        return _os_error(err, shown)
+    if stat_module.S_ISLNK(st.st_mode):
+        return _FileOpError(
+            "is_symlink", f"{shown} is a symbolic link; symlinks are not followed."
+        )
+    if want_dir and not stat_module.S_ISDIR(st.st_mode):
+        return _FileOpError("not_a_directory", f"{shown} is not a directory.")
+    if not stat_module.S_ISREG(st.st_mode) and not stat_module.S_ISDIR(st.st_mode):
+        return _FileOpError(
+            "not_regular_file", f"{shown} is not a regular file or directory."
+        )
+    return _os_error(err, shown)
+
+
+def _walk_dirs(
+    root_fd: int, parts: list[str], stack: ExitStack, *, create: bool = False
+) -> int:
+    """Open each component as a real directory (no symlinks) and return the
+    fd of the last one. The caller's ExitStack closes every fd."""
+    fd = root_fd
+    for index, name in enumerate(parts):
+        shown = _display(parts[: index + 1])
+        try:
+            next_fd = os.open(name, _DIR_FLAGS, dir_fd=fd)
+        except FileNotFoundError as err:
+            if not create:
+                raise _classify_open_failure(fd, name, shown, err, want_dir=True)
+            with suppress(FileExistsError):
+                os.mkdir(name, dir_fd=fd)
+            try:
+                next_fd = os.open(name, _DIR_FLAGS, dir_fd=fd)
+            except OSError as retry_err:
+                raise _classify_open_failure(
+                    fd, name, shown, retry_err, want_dir=True
+                ) from retry_err
+        except OSError as err:
+            raise _classify_open_failure(fd, name, shown, err, want_dir=True) from err
+        stack.callback(os.close, next_fd)
+        fd = next_fd
+    return fd
+
+
+def _open_leaf(
+    dir_fd: int, name: str, shown: str, stack: ExitStack
+) -> tuple[int, os.stat_result]:
+    try:
+        fd = os.open(name, _LEAF_FLAGS, dir_fd=dir_fd)
+    except OSError as err:
+        raise _classify_open_failure(dir_fd, name, shown, err, want_dir=False) from err
+    stack.callback(os.close, fd)
+    return fd, os.fstat(fd)
+
+
+def _open_leaf_if_exists(
+    dir_fd: int, name: str, shown: str, stack: ExitStack
+) -> tuple[int, os.stat_result] | None:
+    try:
+        return _open_leaf(dir_fd, name, shown, stack)
+    except _FileOpError as err:
+        if err.code == "not_found":
+            return None
+        raise
+
+
+def _require_regular(st: os.stat_result, shown: str, *, for_write: bool) -> None:
+    if not stat_module.S_ISREG(st.st_mode):
+        kind = (
+            "a directory" if stat_module.S_ISDIR(st.st_mode) else "not a regular file"
+        )
+        raise _FileOpError("not_regular_file", f"{shown} is {kind}.")
+    if for_write and st.st_nlink > 1:
+        raise _FileOpError(
+            "outside_workspace",
+            f"{shown} has {st.st_nlink} hard links; refusing to modify a file "
+            "that may be shared with a path outside the workspace.",
+        )
+
+
+def _file_type(mode: int) -> str:
+    if stat_module.S_ISREG(mode):
+        return "file"
+    if stat_module.S_ISDIR(mode):
+        return "directory"
+    if stat_module.S_ISLNK(mode):
+        return "symlink"
+    return "other"
+
+
+def _stat_payload(shown: str, st: os.stat_result) -> dict[str, Any]:
+    return {
+        "path": shown,
+        "type": _file_type(st.st_mode),
+        "size": st.st_size,
+        "mode": f"{stat_module.S_IMODE(st.st_mode):04o}",
+        "mtime": st.st_mtime,
+        "nlink": st.st_nlink,
+    }
+
+
+def _read_exact(fd: int, offset: int, length: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = length
+    while remaining > 0:
+        chunk = os.pread(fd, min(remaining, 256 * 1024), offset)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        offset += len(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _encode_content(data: bytes) -> tuple[str, str]:
+    try:
+        return data.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        return base64.b64encode(data).decode("ascii"), "base64"
+
+
+def _decode_write_content(request: FileWriteRequest) -> bytes:
+    too_large = _FileOpError(
+        "too_large",
+        f"Writes are capped at {MAX_FILE_WRITE_BYTES} bytes per call.",
+        limit=MAX_FILE_WRITE_BYTES,
+    )
+    if request.encoding == "base64":
+        if len(request.content) // 4 * 3 > MAX_FILE_WRITE_BYTES + 3:
+            raise too_large
+        try:
+            data = base64.b64decode(request.content, validate=True)
+        except (binascii.Error, ValueError) as err:
+            raise _FileOpError(
+                "invalid_request", "content is not valid base64."
+            ) from err
+    else:
+        if len(request.content) > MAX_FILE_WRITE_BYTES:
+            raise too_large
+        data = request.content.encode("utf-8", errors="surrogatepass")
+    if len(data) > MAX_FILE_WRITE_BYTES:
+        raise too_large
+    return data
+
+
+def _atomic_replace(dir_fd: int, name: str, data: bytes, mode: int) -> None:
+    """Write to a fresh temp file in the same directory, then rename it over
+    the target. The rename replaces the directory entry, so it never writes
+    through an existing inode."""
+    temp_name = f".executor-{secrets.token_hex(8)}.tmp"
+    fd = os.open(
+        temp_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+        dir_fd=dir_fd,
+    )
+    try:
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
+        os.replace(temp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(temp_name, dir_fd=dir_fd)
+        raise
+
+
+def _op_stat(root_fd: int, request: FilePathRequest) -> dict[str, Any]:
+    parts = _split_path(request.path, allow_root=True)
+    if not parts:
+        return {"ok": True, **_stat_payload(".", os.fstat(root_fd))}
+    with ExitStack() as stack:
+        parent = _walk_dirs(root_fd, parts[:-1], stack)
+        _, st = _open_leaf(parent, parts[-1], _display(parts), stack)
+        return {"ok": True, **_stat_payload(_display(parts), st)}
+
+
+def _op_read(root_fd: int, request: FileReadRequest) -> dict[str, Any]:
+    parts = _split_path(request.path, allow_root=False)
+    shown = _display(parts)
+    with ExitStack() as stack:
+        parent = _walk_dirs(root_fd, parts[:-1], stack)
+        fd, st = _open_leaf(parent, parts[-1], shown, stack)
+        _require_regular(st, shown, for_write=False)
+        size = st.st_size
+        offset = min(request.offset, size)
+        length = request.length
+        if length is None:
+            length = size - offset
+        if length > MAX_FILE_READ_BYTES:
+            raise _FileOpError(
+                "too_large",
+                f"{shown} is {size} bytes and reads are capped at "
+                f"{MAX_FILE_READ_BYTES} bytes per call. Read a range with "
+                "offset/length, or use run_command (for example head, sed -n, "
+                "or rg) for large files.",
+                size=size,
+                limit=MAX_FILE_READ_BYTES,
+            )
+        data = _read_exact(fd, offset, length)
+        content, encoding = _encode_content(data)
+        return {
+            "ok": True,
+            "path": shown,
+            "size": size,
+            "offset": offset,
+            "length": len(data),
+            "eof": offset + len(data) >= size,
+            "encoding": encoding,
+            "content": content,
+        }
+
+
+def _op_list(root_fd: int, request: FileListRequest) -> dict[str, Any]:
+    parts = _split_path(request.path, allow_root=True)
+    entries: list[dict[str, Any]] = []
+    truncated = False
+    with ExitStack() as stack:
+        dir_fd = _walk_dirs(root_fd, parts, stack)
+        # scandir(fd) stats entries with fstatat(dir_fd, name, NOFOLLOW).
+        with os.scandir(dir_fd) as iterator:
+            for entry in iterator:
+                if len(entries) >= MAX_LIST_ENTRIES:
+                    truncated = True
+                    break
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                kind = _file_type(st.st_mode)
+                entries.append(
+                    {
+                        "name": entry.name,
+                        "type": kind,
+                        "size": st.st_size if kind == "file" else None,
+                    }
+                )
+    entries.sort(key=lambda item: item["name"])
+    return {
+        "ok": True,
+        "path": _display(parts),
+        "entries": entries,
+        "truncated": truncated,
+        "limit": MAX_LIST_ENTRIES,
+    }
+
+
+def _op_write(root_fd: int, request: FileWriteRequest, data: bytes) -> dict[str, Any]:
+    parts = _split_path(request.path, allow_root=False)
+    shown = _display(parts)
+    with ExitStack() as stack:
+        parent = _walk_dirs(root_fd, parts[:-1], stack, create=request.create_parents)
+        existing = _open_leaf_if_exists(parent, parts[-1], shown, stack)
+        mode = 0o644
+        if existing is not None:
+            _, st = existing
+            _require_regular(st, shown, for_write=True)
+            if not request.overwrite:
+                raise _FileOpError("exists", f"{shown} already exists.")
+            mode = stat_module.S_IMODE(st.st_mode) & 0o777
+        _atomic_replace(parent, parts[-1], data, mode)
+    return {
+        "ok": True,
+        "path": shown,
+        "bytes_written": len(data),
+        "created": existing is None,
+    }
+
+
+def _count_matches(data: bytes, needle: bytes) -> int:
+    """Count occurrences, including overlapping ones."""
+    count = 0
+    start = data.find(needle)
+    while start != -1:
+        count += 1
+        start = data.find(needle, start + 1)
+    return count
+
+
+def _op_edit(root_fd: int, request: FileEditRequest) -> dict[str, Any]:
+    parts = _split_path(request.path, allow_root=False)
+    shown = _display(parts)
+    old = request.old_string.encode("utf-8", errors="surrogatepass")
+    new = request.new_string.encode("utf-8", errors="surrogatepass")
+    with ExitStack() as stack:
+        parent = _walk_dirs(root_fd, parts[:-1], stack)
+        fd, st = _open_leaf(parent, parts[-1], shown, stack)
+        _require_regular(st, shown, for_write=True)
+        if st.st_size > MAX_FILE_WRITE_BYTES:
+            raise _FileOpError(
+                "too_large",
+                f"{shown} is {st.st_size} bytes; edits are capped at "
+                f"{MAX_FILE_WRITE_BYTES} bytes. Use run_command instead.",
+                size=st.st_size,
+                limit=MAX_FILE_WRITE_BYTES,
+            )
+        data = _read_exact(fd, 0, st.st_size)
+        matches = _count_matches(data, old)
+        if matches != 1:
+            raise _FileOpError(
+                "match_count",
+                f"old_string must match exactly once in {shown}; it matched "
+                f"{matches} times."
+                + (
+                    " Include more surrounding context to make it unique."
+                    if matches > 1
+                    else ""
+                ),
+                match_count=matches,
+            )
+        updated = data.replace(old, new, 1)
+        if len(updated) > MAX_FILE_WRITE_BYTES:
+            raise _FileOpError(
+                "too_large",
+                f"The edited file would be {len(updated)} bytes; writes are "
+                f"capped at {MAX_FILE_WRITE_BYTES} bytes.",
+                limit=MAX_FILE_WRITE_BYTES,
+            )
+        _atomic_replace(
+            parent, parts[-1], updated, stat_module.S_IMODE(st.st_mode) & 0o777
+        )
+    return {"ok": True, "path": shown, "bytes_written": len(updated)}
+
+
+def _op_mkdir(root_fd: int, request: FileMkdirRequest) -> dict[str, Any]:
+    parts = _split_path(request.path, allow_root=False)
+    shown = _display(parts)
+    with ExitStack() as stack:
+        parent = _walk_dirs(root_fd, parts[:-1], stack, create=request.parents)
+        try:
+            os.mkdir(parts[-1], dir_fd=parent)
+        except FileExistsError as err:
+            if not request.parents:
+                raise _FileOpError("exists", f"{shown} already exists.") from err
+            # mkdir -p: fine if it is already a real directory.
+            _walk_dirs(parent, parts[-1:], stack)
+            return {"ok": True, "path": shown, "created": False}
+    return {"ok": True, "path": shown, "created": True}
+
+
+def _op_delete(root_fd: int, request: FilePathRequest) -> dict[str, Any]:
+    parts = _split_path(request.path, allow_root=False)
+    shown = _display(parts)
+    with ExitStack() as stack:
+        parent = _walk_dirs(root_fd, parts[:-1], stack)
+        _, st = _open_leaf(parent, parts[-1], shown, stack)
+        if stat_module.S_ISDIR(st.st_mode):
+            try:
+                os.rmdir(parts[-1], dir_fd=parent)
+            except OSError as err:
+                if err.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                    raise _FileOpError(
+                        "not_empty", f"{shown} is a directory that is not empty."
+                    ) from err
+                raise _os_error(err, shown) from err
+            return {"ok": True, "path": shown, "type": "directory"}
+        if not stat_module.S_ISREG(st.st_mode):
+            raise _FileOpError(
+                "not_regular_file",
+                f"{shown} is not a regular file or directory.",
+            )
+        os.unlink(parts[-1], dir_fd=parent)
+    return {"ok": True, "path": shown, "type": "file"}
+
+
+def _op_rename(root_fd: int, request: FileRenameRequest) -> dict[str, Any]:
+    source = _split_path(request.source, allow_root=False)
+    destination = _split_path(request.destination, allow_root=False)
+    source_shown = _display(source)
+    destination_shown = _display(destination)
+    with ExitStack() as stack:
+        source_parent = _walk_dirs(root_fd, source[:-1], stack)
+        _, source_st = _open_leaf(source_parent, source[-1], source_shown, stack)
+        if not (
+            stat_module.S_ISREG(source_st.st_mode)
+            or stat_module.S_ISDIR(source_st.st_mode)
+        ):
+            raise _FileOpError(
+                "not_regular_file",
+                f"{source_shown} is not a regular file or directory.",
+            )
+        destination_parent = _walk_dirs(
+            root_fd, destination[:-1], stack, create=request.create_parents
+        )
+        existing = _open_leaf_if_exists(
+            destination_parent, destination[-1], destination_shown, stack
+        )
+        if existing is not None:
+            _, destination_st = existing
+            replaceable = (
+                request.overwrite
+                and stat_module.S_ISREG(destination_st.st_mode)
+                and stat_module.S_ISREG(source_st.st_mode)
+            )
+            if not replaceable:
+                raise _FileOpError("exists", f"{destination_shown} already exists.")
+        try:
+            os.rename(
+                source[-1],
+                destination[-1],
+                src_dir_fd=source_parent,
+                dst_dir_fd=destination_parent,
+            )
+        except OSError as err:
+            raise _os_error(err, f"{source_shown} -> {destination_shown}") from err
+    return {
+        "ok": True,
+        "source": source_shown,
+        "destination": destination_shown,
+    }
+
+
 def main() -> None:
     global _self_test_error
     _prepare_executor_root()
@@ -186,9 +961,10 @@ async def _execute_events(request: ExecuteRequest) -> AsyncIterator[dict[str, An
     workspace_key = _workspace_key(request.workspace_id)
     workspace_dir = _workspace_dir(workspace_key)
     state_path = _state_path(workspace_key, request.execution_id)
-    lock = await _workspace_lock(workspace_key)
+    locks = await _workspace_locks_for(workspace_key)
 
-    async with _concurrency, lock:
+    # See _WorkspaceLocks: commands exclude file mutations, not file reads.
+    async with _concurrency, locks.exec:
         cached = _load_cached_result(state_path)
         if cached is not None:
             cached["cached"] = True
@@ -510,9 +1286,12 @@ def _state_path(workspace_key: str, execution_id: str) -> Path:
     return _executor_root() / STATE_DIR_NAME / workspace_key / f"{digest}.json"
 
 
-async def _workspace_lock(workspace_key: str) -> asyncio.Lock:
+async def _workspace_locks_for(workspace_key: str) -> _WorkspaceLocks:
     async with _workspace_locks_guard:
-        return _workspace_locks.setdefault(workspace_key, asyncio.Lock())
+        locks = _workspace_locks.get(workspace_key)
+        if locks is None:
+            locks = _workspace_locks[workspace_key] = _WorkspaceLocks()
+        return locks
 
 
 def _launcher_env() -> dict[str, str]:
@@ -562,8 +1341,27 @@ def _credential_boundary_self_test() -> str | None:
         "AWS_WEB_IDENTITY_TOKEN_FILE",
         "AWS_CONTAINER_CREDENTIALS_FULL_URI",
         "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        # Model-provider and integration keys belong to the worker and API
+        # only (PRD §5 rule 6). /files/* runs outside Bubblewrap, so the
+        # executor must never hold them.
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "TYPESAFE_API_KEY",
     )
+    # Any variable whose name contains one of these is treated as a credential.
+    credential_env_name_markers = ("MCP_", "OAUTH", "GITHUB_TOKEN")
     exposed = [name for name in credential_env_names if os.environ.get(name)]
+    exposed.extend(
+        sorted(
+            name
+            for name, value in os.environ.items()
+            if value
+            and name not in exposed
+            and any(marker in name.upper() for marker in credential_env_name_markers)
+        )
+    )
     if exposed:
         return f"Executor credential boundary failed: {', '.join(exposed)} is set."
 
