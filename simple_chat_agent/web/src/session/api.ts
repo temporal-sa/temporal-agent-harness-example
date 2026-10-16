@@ -107,6 +107,10 @@ export interface AgentConfig extends AgentCatalog {
   links?: { console?: ViewLink; temporal_ui?: ViewLink };
   posture_options?: PostureMenuOption[];
   auto_mode?: { available: boolean; judge: string; judge_model: string | null; reason: string | null };
+  tool_risk_classes?: Record<string, string>;
+  remember_allowed_classes?: string[];
+  risk_classes?: string[];
+  default_tool_risk_class?: string;
 }
 
 export const getAgentConfig = () => request<AgentConfig>(`${AGENT_API_BASE}config`);
@@ -172,3 +176,14 @@ export async function uploadAttachment(sessionId: string, file: File): Promise<A
   });
   return reply.attachment;
 }
+
+/** GET /api/agent/status/{id} (Redis, never a Query). */
+export interface AgentStatus {
+  current_turn: number;
+  turn_active: boolean;
+  pending_turns: unknown[];
+  run_id?: string | null;
+  worker?: { state: string; reason: string; since: number } | null;
+}
+
+export const getStatus = (workflowId: string) => request<AgentStatus>(`${AGENT_API_BASE}status/${encodeURIComponent(workflowId)}`);

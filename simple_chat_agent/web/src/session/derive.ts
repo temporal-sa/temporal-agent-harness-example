@@ -117,3 +117,22 @@ export function sessionStatus(input: {
   if (input.anyBusy) return "running";
   return "idle";
 }
+
+/** Tag each waiting call with its approval class from config, and whether "Always approve"
+ *  can apply to it. Neither is hard-coded: both come from /api/agent/config. */
+export function withRiskClass<T extends PendingApproval>(
+  approvals: readonly T[],
+  classes: Readonly<Record<string, string>> | null | undefined,
+  fallback: string | null | undefined,
+  rememberAllowed: readonly string[] | null | undefined,
+): (T & { riskClass: string | null; rememberAllowed: boolean })[] {
+  return approvals.map((w) => {
+    const riskClass = classes?.[w.part.toolName] ?? fallback ?? null;
+    return { ...w, riskClass, rememberAllowed: riskClass !== null && (rememberAllowed ?? []).includes(riskClass) };
+  });
+}
+
+/** Root messages without the workflow's rejection carriers ("x_rejected:<request_id>"). */
+export function visibleMessages<T extends Pick<Message, "id">>(messages: readonly T[]): readonly T[] {
+  return messages.some((m) => m.id.startsWith("x_rejected:")) ? messages.filter((m) => !m.id.startsWith("x_rejected:")) : messages;
+}

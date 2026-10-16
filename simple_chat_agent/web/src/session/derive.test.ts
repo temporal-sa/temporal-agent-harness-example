@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { currentModel, currentPosture, sessionStatus, subagentsOf } from "./derive";
+import { currentModel, currentPosture, sessionStatus, subagentsOf, visibleMessages } from "./derive";
 import { HEALTHY } from "./telemetry";
 import type { AgentNode, Message, PendingApproval } from "./types";
 
@@ -40,5 +40,14 @@ describe("subagents", () => {
     const node = (parentId: string | null, n = 0) => ({ parentId, messages: new Array(n) }) as unknown as AgentNode;
     const out = subagentsOf({ root: node(null, 1), null: node(null), "root-explorer-1": node("root", 1) }, "root");
     expect(Object.keys(out)).toEqual(["root-explorer-1"]);
+  });
+});
+
+describe("rejection carriers", () => {
+  it("are never shown as messages", () => {
+    const list = [{ id: "m1" }, { id: "x_rejected:q1" }];
+    expect(visibleMessages(list).map((m) => m.id)).toEqual(["m1"]);
+    const clean = [{ id: "m1" }];
+    expect(visibleMessages(clean)).toBe(clean);
   });
 });

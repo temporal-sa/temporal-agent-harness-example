@@ -57,8 +57,19 @@ export type {
 };
 /** One agent in the session's tree (root or subagent at any depth). */
 export type AgentNode = AgentView;
-/** A gated tool call waiting on a person, anywhere in the tree. Raw: Eng W groups them. */
-export type PendingApproval = WaitingToolCall;
+/** The approval classes the agent sorts tools into today (config `risk_classes` is the list
+ *  of record; a class not listed here is still passed through as a string). */
+export type RiskClass = "read_only" | "workspace_edit" | "shell" | "network" | "external_side_effect";
+
+/** A gated tool call waiting on a person, anywhere in the tree. Raw: Eng W groups them.
+ *  `riskClass`: config `tool_risk_classes[toolName]`, else `default_tool_risk_class`; null
+ *  only while config hasn't loaded. `rememberAllowed`: its class is in config
+ *  `remember_allowed_classes` (offer "Always approve"). */
+export type PendingApproval = WaitingToolCall & {
+  /** Always set by the facade; optional so hand-built test values stay valid. */
+  riskClass?: RiskClass | (string & {}) | null;
+  rememberAllowed?: boolean;
+};
 
 // -- config and catalog (GET /api/agent/config) ---------------------------------------------
 
@@ -275,11 +286,39 @@ export interface WorkerHealth {
   turnId: string | null;
 }
 
-/** A front-door request the agent refused (`x_rejected`; not emitted by the bridge yet). */
+/** A front-door request the agent refused (`x_rejected`). */
 export interface Rejection {
   requestId: string;
+  kind: "approval" | "message" | null;
+  toolId: string | null;
+  messageId: string | null;
+  /** unknown_approval, already_resolved, unknown_function, malformed_message, busy,
+   *  session_closed or rejected. */
+  code: string | null;
+  /** Kept for the 3.1 shape: same as `code`. */
   type: string | null;
+  /** The agent's reason, for the card. */
   message: string;
+}
+
+/** The workspace sandbox (executor), from the run_command activity's notice while it retries
+ *  an executor that isn't answering. Answering until a notice says otherwise. */
+export interface SandboxHealth {
+  answering: boolean;
+  /** The activity attempt that is waiting. */
+  attempt: number | null;
+  /** When Temporal tries again (ms since epoch). */
+  nextRetryAt: number | null;
+  reason: string | null;
+  toolId: string | null;
+}
+
+/** One chunk of a running tool's live output. `stream` is null until the backend tags it. */
+export interface ToolProgressChunk {
+  text: string;
+  stream: "stdout" | "stderr" | null;
+  /** ms since epoch, from the frame. */
+  at: number | null;
 }
 
 export interface SessionTelemetry {
@@ -293,6 +332,11 @@ export interface SessionTelemetry {
   turnRecoveries: TurnRecovery[];
   recoveryTotals: RecoveryTotals;
   worker: WorkerHealth;
+  sandbox: SandboxHealth;
+  /** The current Temporal run id per agent id (root and subagents), once the bridge reports it. */
+  runIds: Readonly<Record<string, string>>;
+  /** The same by workflow id (x_worker `runs`, `workflow_id` + `run_id`). */
+  runIdsByWorkflow: Readonly<Record<string, string>>;
   rejections: Rejection[];
   /** Frame types we don't know, by count. Ignored otherwise. */
   unknownFrames: Record<string, number>;
@@ -325,6 +369,8 @@ export interface CodingSession {
   messages: readonly Message[];
   /** Sends this browser made that the stream hasn't admitted yet, and failed sends. */
   unsent: readonly Message[];
+  /** Drop a failed send from `unsent`. */
+  dismissUnsent(localId: string): void;
   rootAgentId: string | null;
   /** Every subagent in the tree by agent id (the root excluded). */
   subagents: Readonly<Record<string, AgentNode>>;
@@ -337,6 +383,17 @@ export interface CodingSession {
 
   /** Raw, in the order they started waiting. */
   pendingApprovals: readonly PendingApproval[];
+  /** Every live output chunk per tool id, accumulated (the harness keeps only the latest). */
+  toolProgress: Readonly<Record<string, string>>;
+  toolProgressChunks: Readonly<Record<string, readonly ToolProgressChunk[]>>;
+  /** Same as `telemetry.sandbox`. */
+  sandbox: SandboxHealth;
+  /** Same as `telemetry.runIds`; the root's is `runIds[rootAgentId]`. */
+  runIds: Readonly<Record<string, string>>;
+  /** The session workflow's current run id (stream, else GET status), for Temporal UI links. */
+  runId: string | null;
+  /** A workflow's current run id (the session's or a subagent's), when known. */
+  runIdFor(workflowId: string): string | null;
   /** Local actions, oldest first. */
   sends: readonly SendRecord[];
   /** The latest send record for a message id or tool id, if this browser sent it. */
@@ -375,6 +432,10 @@ export interface SessionSeed {
   /** From the session summary: the model and posture it started with. */
   model?: ModelChoice | null;
   posture?: Posture | null;
+  /** Config `tool_risk_classes`, `default_tool_risk_class` and `remember_allowed_classes`. */
+  toolRiskClasses?: Readonly<Record<string, string>> | null;
+  defaultToolRiskClass?: string | null;
+  rememberAllowedClasses?: readonly string[] | null;
 }
 
 export interface ModelCallTiming {

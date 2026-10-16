@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { advance, approvalPhase, landed, messagePhase, observe, startRecord, stuckInTemporal, WAITING_FOR_WORKER_MS, type StreamView } from "./sendStates";
-import type { Message, ToolPart } from "./types";
+import type { Message, Rejection, ToolPart } from "./types";
 
 const msg = (over: Partial<Message>): Message =>
   ({
@@ -34,10 +34,22 @@ const tool = (over: Partial<ToolPart>): ToolPart => ({
   ...over,
 });
 
-const view = (messages: Message[] = [], tools: ToolPart[] = [], rejections: Record<string, string> = {}): StreamView => ({
+const rej = (message: string, over: Partial<Rejection> = {}): Rejection => ({
+  requestId: "r",
+  kind: "message",
+  toolId: null,
+  messageId: null,
+  code: "rejected",
+  type: "rejected",
+  message,
+  ...over,
+});
+
+const view = (messages: Message[] = [], tools: ToolPart[] = [], rejections: Record<string, string> = {}, byTool: Record<string, Rejection> = {}): StreamView => ({
   message: (id) => messages.find((m) => m.id === id),
   tool: (id) => tools.find((t) => t.toolId === id),
-  rejection: (id) => rejections[id],
+  rejection: (id) => (rejections[id] ? rej(rejections[id]) : undefined),
+  approvalRejection: (id) => byTool[id],
 });
 
 describe("message send states", () => {
@@ -106,6 +118,14 @@ describe("approval send states", () => {
     expect(observe([r], view([], [tool({ state: "approved", approval: { approved: true, reason: null, remember: false } })]), 30)[0]?.phase).toBe("accepted");
     expect(observe([r], view([], [tool({ state: "running" })]), 40)[0]?.phase).toBe("running");
     expect(observe([r], view([], [tool({ state: "denied" })]), 50)[0]?.phase).toBe("done");
+  });
+
+  it("fails on a rejection with its reason, except already_resolved, which counts as answered", () => {
+    const r = landed(startRecord("a1", "approval", 0, { toolId: "t1", approved: true }), 10);
+    const unknown = rej("That approval is unknown.", { kind: "approval", toolId: "t1", code: "unknown_approval" });
+    expect(observe([r], view([], [tool({})], {}, { t1: unknown }), 20)[0]).toMatchObject({ phase: "failed", error: "That approval is unknown." });
+    const resolved = rej("Already decided.", { kind: "approval", toolId: "t1", code: "already_resolved" });
+    expect(observe([r], view([], [tool({ state: "denied" })], {}, { t1: resolved }), 20)[0]).toMatchObject({ phase: "done", error: null });
   });
 
   it("maps tool states", () => {

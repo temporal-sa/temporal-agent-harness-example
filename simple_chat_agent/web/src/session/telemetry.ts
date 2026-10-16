@@ -9,6 +9,7 @@
 // * Retracted recoveries (not a lost worker after all) are kept but never counted or shown.
 
 import type {
+  SandboxHealth,
   ModelCallUsage,
   Recovery,
   RecoveryTotals,
@@ -60,6 +61,8 @@ export const X_USAGE = "x_usage";
 export const X_RECOVERY = "x_recovery";
 export const X_WORKER = "x_worker";
 export const X_REJECTED = "x_rejected";
+/** The sandbox notice. The name is provisional until the run_command activity publishes it. */
+export const X_SANDBOX = "x_sandbox";
 
 export interface RawFrame {
   event: string;
@@ -72,8 +75,13 @@ export interface TelemetryAcc {
   recoveries: Map<string, Recovery>;
   worker: WorkerHealth;
   rejections: Map<string, Rejection>;
+  sandbox: SandboxHealth;
+  runIds: Record<string, string>;
+  runIdsByWorkflow: Record<string, string>;
   unknown: Record<string, number>;
 }
+
+export const SANDBOX_OK: SandboxHealth = { answering: true, attempt: null, nextRetryAt: null, reason: null, toolId: null };
 
 export const HEALTHY: WorkerHealth = {
   answering: true,
@@ -85,7 +93,7 @@ export const HEALTHY: WorkerHealth = {
 };
 
 export function emptyAcc(): TelemetryAcc {
-  return { usage: new Map(), recoveries: new Map(), worker: HEALTHY, rejections: new Map(), unknown: {} };
+  return { usage: new Map(), recoveries: new Map(), worker: HEALTHY, rejections: new Map(), sandbox: SANDBOX_OK, runIds: {}, runIdsByWorkflow: {}, unknown: {} };
 }
 
 // -- field readers (frames are untrusted JSON) ---------------------------------------------
@@ -179,8 +187,15 @@ export function foldFrames(acc: TelemetryAcc, frames: readonly RawFrame[]): bool
   let changed = false;
   for (const frame of frames) {
     const event = frame.event;
-    if (HARNESS_EVENTS.has(event)) continue;
     const d = isObj(frame.data) ? frame.data : null;
+    // Any frame may carry its agent's run id (the bridge adds it); the latest wins.
+    const runId = d && str(d.run_id);
+    const agentId = d && str(d.agent_id);
+    if (runId && agentId && acc.runIds[agentId] !== runId) {
+      acc.runIds = { ...acc.runIds, [agentId]: runId };
+      changed = true;
+    }
+    if (HARNESS_EVENTS.has(event)) continue;
     switch (event) {
       case X_USAGE: {
         const u = d && parseUsage(d);
@@ -203,17 +218,40 @@ export function foldFrames(acc: TelemetryAcc, frames: readonly RawFrame[]): bool
       }
       case X_WORKER: {
         if (!d) break;
+        const runs: Record<string, string> = {};
+        if (isObj(d.runs)) for (const [w, r] of Object.entries(d.runs)) if (typeof r === "string" && r) runs[w] = r;
+        const wf = str(d.workflow_id);
+        if (wf && runId) runs[wf] = runId;
+        if (Object.entries(runs).some(([w, r]) => acc.runIdsByWorkflow[w] !== r)) acc.runIdsByWorkflow = { ...acc.runIdsByWorkflow, ...runs };
         acc.worker = parseWorker(d);
+        changed = true;
+        break;
+      }
+      case X_SANDBOX: {
+        if (!d) break;
+        acc.sandbox = {
+          answering: d.state !== "down" && d.answering !== false,
+          attempt: num(d.attempt),
+          nextRetryAt: ms(d.next_retry_at),
+          reason: str(d.reason),
+          toolId: str(d.tool_id),
+        };
         changed = true;
         break;
       }
       case X_REJECTED: {
         const requestId = d && (str(d.request_id) ?? str(d.message_id) ?? str(d.id));
         if (!d || !requestId) break;
+        const code = str(d.code) ?? str(d.type);
+        const kind = d.kind === "approval" || d.kind === "message" ? d.kind : null;
         acc.rejections.set(requestId, {
           requestId,
-          type: str(d.type),
-          message: str(d.message) ?? "The agent refused this request.",
+          kind,
+          toolId: str(d.tool_id),
+          messageId: str(d.message_id),
+          code,
+          type: code,
+          message: str(d.reason) ?? str(d.message) ?? "The agent refused this request.",
         });
         changed = true;
         break;
@@ -333,6 +371,9 @@ export function summarize(acc: TelemetryAcc): SessionTelemetry {
     turnRecoveries,
     recoveryTotals: recoveryTotals(turnRecoveries),
     worker: acc.worker,
+    sandbox: acc.sandbox,
+    runIds: acc.runIds,
+    runIdsByWorkflow: acc.runIdsByWorkflow,
     rejections: [...acc.rejections.values()],
     unknownFrames: { ...acc.unknown },
   };

@@ -16,6 +16,7 @@ import {
   type Me,
   type ModelChoice,
   type SessionSummary,
+  type WorkbenchFocus,
 } from "../session";
 import { Header } from "../shell/Header";
 import { useMaxWidth, usePresenterMode } from "../shell/presenter";
@@ -23,7 +24,9 @@ import { Rail, Sidebar, type SidebarProps } from "../shell/Sidebar";
 import { SignIn } from "../shell/SignIn";
 import { Unreachable } from "../shell/Unreachable";
 import { ViewLinks, viewDefs } from "../shell/ViewLinks";
-import { Transcript } from "../transcript/Transcript";
+import { TranscriptPane } from "../transcript/Transcript";
+import type { TranscriptContextValue } from "../transcript/context";
+import { postureLabel } from "../composer/choices";
 import { DecisionDock, Workbench, WorkerBanner } from "./slots";
 
 type Boot =
@@ -137,7 +140,22 @@ function Shell({ me, auth, onUnreachable }: { me: Me; auth: AuthConfig; onUnreac
     [refresh, select, fail],
   );
 
-  const summary = useMemo(() => sessions?.find((s) => s.session_id === selected) ?? null, [sessions, selected]);
+  // A session opened by URL that the list doesn't have yet (or that belongs to someone else,
+  // which the API answers with 404).
+  const [extra, setExtra] = useState<SessionSummary | null>(null);
+  const listed = useMemo(() => sessions?.find((s) => s.session_id === selected) ?? null, [sessions, selected]);
+  useEffect(() => {
+    if (!selected || listed || sessions === null) return;
+    let live = true;
+    api.getSession(selected).then(
+      (s) => live && setExtra(s),
+      (err) => live && fail(err, "That session doesn't exist, or isn't yours.", setActionError),
+    );
+    return () => {
+      live = false;
+    };
+  }, [selected, listed, sessions, fail]);
+  const summary = listed ?? (extra?.session_id === selected ? extra : null);
 
   const modelName = useCallback(
     (choice: Partial<ModelChoice> | null | undefined, withProvider = false): string => {
@@ -169,7 +187,7 @@ function Shell({ me, auth, onUnreachable }: { me: Me; auth: AuthConfig; onUnreac
 
   if (!selected) return <Layout parts={shared} session={null} />;
   return (
-    <SessionScreen key={selected} id={selected} summary={summary} render={(session) => <Layout parts={shared} session={session} />} />
+    <SessionScreen key={selected} id={selected} summary={summary} config={config} render={(session) => <Layout parts={shared} session={session} />} />
   );
 }
 
@@ -190,8 +208,27 @@ interface ShellParts {
   onUnreachable(): void;
 }
 
-function SessionScreen({ id, summary, render }: { id: string; summary: SessionSummary | null; render(s: CodingSession): ReactNode }) {
-  const seed = useMemo(() => ({ model: summaryModel(summary), posture: summary?.posture ?? null }), [summary]);
+function SessionScreen({
+  id,
+  summary,
+  config,
+  render,
+}: {
+  id: string;
+  summary: SessionSummary | null;
+  config: AgentConfig | null;
+  render(s: CodingSession): ReactNode;
+}) {
+  const seed = useMemo(
+    () => ({
+      model: summaryModel(summary),
+      posture: summary?.posture ?? null,
+      toolRiskClasses: config?.tool_risk_classes ?? null,
+      defaultToolRiskClass: config?.default_tool_risk_class ?? null,
+      rememberAllowedClasses: config?.remember_allowed_classes ?? null,
+    }),
+    [summary, config],
+  );
   const session = useCodingSession(id, seed);
   return <>{render(session)}</>;
 }
@@ -203,7 +240,7 @@ function Layout({ parts, session }: { parts: ShellParts; session: CodingSession 
   const narrow = useMaxWidth(1600);
   const phone = useMaxWidth(600);
   const [drawer, setDrawer] = useState(false);
-  const [sheet, setSheet] = useState(false);
+  const [sheet, setSheet] = useState<"changes" | "terminal" | null>(null);
   const rail = (presenter || narrow) && !phone;
 
   // A stream that gave up: is the app down, or only this session's stream?
@@ -239,10 +276,46 @@ function Layout({ parts, session }: { parts: ShellParts; session: CodingSession 
     footer: `Signed in as ${parts.me.username}${parts.auth.mode === "catalog" ? " through the catalog" : ""}`,
   };
 
-  const title = parts.summary?.title ?? (parts.selected ? "Session" : null);
+  const title = parts.summary?.title ?? null;
   const demo = parts.summary?.demo ?? null;
   const modelLabel = session ? parts.modelName(session.model, true) || null : null;
   const changesCount = session?.changes?.files.length ?? 0;
+  const commandRunning = session ? runningCommand(session) : false;
+  const [focus, setFocus] = useState<WorkbenchFocus | null>(null);
+  const { config, modelName } = parts;
+  const transcript = useMemo<TranscriptContextValue | null>(
+    () =>
+      session && {
+        session,
+        openFile: (path: string) => {
+          setFocus({ tab: "changes", path, at: Date.now() });
+          if (phone) setSheet("changes");
+        },
+        modelLabel: (provider: string, model: string) => {
+          const name = modelName({ provider: provider as ModelChoice["provider"], model }) || model;
+          const p = config?.providers.find((x) => x.provider === provider)?.label ?? provider;
+          return p ? `${name} (${p})` : name;
+        },
+        providerOfModel: (model: string | null) => {
+          if (!model || !config) return null;
+          const bare = model.includes(":") ? model.split(":").pop()! : model;
+          const entry = config.models.find((m) => m.id === bare || m.registry_key === model);
+          const provider = entry?.provider ?? (/^claude/.test(bare) ? "anthropic" : /^gpt|^o\d/.test(bare) ? "openai" : /^gemini/.test(bare) ? "google" : null);
+          return provider ? config.providers.find((p) => p.provider === provider)?.label ?? provider : null;
+        },
+        postureLabel: (id: string) => postureLabel(config, id),
+        workerAnswering: session.status !== "worker_unresponsive",
+      },
+    [session, config, modelName, phone],
+  );
+  const notices = parts.actionError && (
+    <div className="notice" role="alert">
+      <span>{parts.actionError}</span>
+      <button type="button" className="btn ghost small" onClick={parts.clearActionError}>
+        Dismiss
+      </button>
+    </div>
+  );
 
   return (
     <div className="app">
@@ -261,35 +334,28 @@ function Layout({ parts, session }: { parts: ShellParts; session: CodingSession 
         <div className="slot-side">{rail ? <Rail {...sideProps} onExpand={() => setDrawer(true)} /> : <Sidebar {...sideProps} />}</div>
 
         <main className="slot-main" id="main">
-          <div className="transcript-slot" data-slot="transcript">
-            <div className="col">
-              {parts.actionError && (
+          {session && transcript ? (
+            <TranscriptPane value={transcript}>
+              {notices}
+              {session.connection === "error" && (
                 <div className="notice" role="alert">
-                  <span>{parts.actionError}</span>
-                  <button type="button" className="btn ghost small" onClick={parts.clearActionError}>
-                    Dismiss
+                  <span>Lost the live connection to this session. Nothing is lost in Temporal.</span>
+                  <button type="button" className="btn secondary small" onClick={session.reconnect}>
+                    Reconnect
                   </button>
                 </div>
               )}
-              {session ? (
-                <>
-                  {session.connection === "error" && (
-                    <div className="notice" role="alert">
-                      <span>Lost the live connection to this session. Nothing is lost in Temporal.</span>
-                      <button type="button" className="btn secondary small" onClick={session.reconnect}>
-                        Reconnect
-                      </button>
-                    </div>
-                  )}
-                  {session.connection === "reconnecting" && <div className="sys-line">Reconnecting…</div>}
-                  <WorkerBanner session={session} />
-                  <Transcript session={session} />
-                </>
-              ) : (
+              {session.connection === "reconnecting" && <div className="sys-line">Reconnecting…</div>}
+              <WorkerBanner session={session} temporalUiTemplate={parts.config?.links?.temporal_ui?.url_template ?? null} />
+            </TranscriptPane>
+          ) : (
+            <div className="transcript-slot" data-slot="transcript">
+              <div className="col">
+                {notices}
                 <Landing creating={parts.creating} onCreate={parts.create} />
-              )}
+              </div>
             </div>
-          </div>
+          )}
           {session && (
             <div className="decision-slot" data-slot="decisions">
               <DecisionDock session={session} />
@@ -297,23 +363,29 @@ function Layout({ parts, session }: { parts: ShellParts; session: CodingSession 
           )}
           {session && phone && (
             <div className="slot-sheet" data-slot="sheet">
-              <button type="button" className="sheet-grab" onClick={() => setSheet(true)} aria-haspopup="dialog">
+              <button type="button" className="sheet-grab" onClick={() => setSheet("changes")} aria-haspopup="dialog">
                 Changes ({changesCount})
               </button>
-              <button type="button" className="sheet-grab" onClick={() => setSheet(true)} aria-haspopup="dialog">
-                Plan
+              <button type="button" className="sheet-grab" onClick={() => setSheet("terminal")} aria-haspopup="dialog">
+                Terminal
+                {commandRunning && (
+                  <>
+                    <span aria-hidden="true"> ●</span>
+                    <span className="sr-only"> (running)</span>
+                  </>
+                )}
               </button>
             </div>
           )}
           {session && (
             <div className="composer-slot" data-slot="composer">
-              <Composer session={session} />
+              <Composer session={session} config={parts.config} />
             </div>
           )}
         </main>
 
         <div className="slot-bench" data-slot="workbench">
-          {session && !phone ? <Workbench session={session} variant="panel" /> : null}
+          {session && !phone ? <Workbench session={session} variant="panel" focus={focus} initialTab={focus ? "changes" : undefined} /> : null}
         </div>
       </div>
 
@@ -343,20 +415,27 @@ function Layout({ parts, session }: { parts: ShellParts; session: CodingSession 
 
       {sheet && session && phone && (
         <>
-          <div className="drawer-scrim" onClick={() => setSheet(false)} aria-hidden="true" />
+          <div className="drawer-scrim" onClick={() => setSheet(null)} aria-hidden="true" />
           <div className="sheet" role="dialog" aria-modal="true" aria-label="Workbench">
             <div className="drawer-head">
               <span>Workbench</span>
               <span className="spacer" />
-              <button type="button" className="btn ghost small" onClick={() => setSheet(false)} autoFocus>
+              <button type="button" className="btn ghost small" onClick={() => setSheet(null)} autoFocus>
                 Close
               </button>
             </div>
-            <Workbench session={session} variant="sheet" />
+            <Workbench session={session} variant="sheet" focus={focus} initialTab={sheet ?? "changes"} />
           </div>
         </>
       )}
     </div>
+  );
+}
+
+function runningCommand(session: CodingSession): boolean {
+  const agents = [session.rootAgentId ? session.agent(session.rootAgentId) : undefined, ...Object.values(session.subagents)];
+  return agents.some((a) =>
+    a?.messages.some((m) => m.parts.some((p) => p.type === "tool" && p.toolName === "run_command" && p.state === "running")),
   );
 }
 

@@ -13,7 +13,10 @@
 // * done         message: the handler returned. approval: the tool ended or was denied.
 // * failed       the request failed, the handler raised, or the agent rejected it.
 
-import type { Message, SendKind, SendPhase, SendRecord, ToolPart } from "./types";
+import type { Message, Rejection, SendKind, SendPhase, SendRecord, ToolPart } from "./types";
+
+/** The approval was already answered (another tab, Approve all, the judge): not an error. */
+export const ALREADY_RESOLVED = "already_resolved";
 
 const ORDER: Record<SendPhase, number> = {
   sending: 0,
@@ -108,8 +111,10 @@ export interface StreamView {
   message(id: string): Message | undefined;
   /** A tool part anywhere in the tree by tool id. */
   tool(toolId: string): ToolPart | undefined;
-  /** A rejection published for a request id (x_rejected). */
-  rejection(requestId: string): string | undefined;
+  /** A rejection (x_rejected) for a message's request id. */
+  rejection(requestId: string): Rejection | undefined;
+  /** A rejection of an approval, by the tool call it answered. */
+  approvalRejection?(toolId: string): Rejection | undefined;
 }
 
 /** Advance every unsettled record from what the stream now shows. Returns the same array when
@@ -122,11 +127,14 @@ export function observe(records: readonly SendRecord[], view: StreamView, now: n
     if (r.kind === "approval") {
       const part = r.toolId ? view.tool(r.toolId) : undefined;
       const phase = part ? approvalPhase(part) : null;
-      if (phase) updated = advance(r, phase, now);
+      const rejected = r.toolId ? view.approvalRejection?.(r.toolId) : undefined;
+      if (rejected && rejected.code === ALREADY_RESOLVED) updated = advance(r, "done", now);
+      else if (rejected && !phase) updated = advance(r, "failed", now, rejected.message);
+      else if (phase) updated = advance(r, phase, now);
     } else if (r.messageId) {
       const rejected = view.rejection(r.messageId);
       if (rejected) {
-        updated = advance(r, "failed", now, rejected);
+        updated = advance(r, "failed", now, rejected.message);
       } else {
         const m = view.message(r.messageId);
         const phase = m ? messagePhase(m) : null;

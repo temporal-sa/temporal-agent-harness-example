@@ -131,9 +131,16 @@ describe("other frames", () => {
     expect(back.worker.answering).toBe(true);
   });
 
-  it("records x_rejected by request id", () => {
-    const t = fold([{ event: "x_rejected", data: { request_id: "m1", type: "UnknownApproval", message: "No such approval." } }]);
-    expect(t.rejections).toEqual([{ requestId: "m1", type: "UnknownApproval", message: "No such approval." }]);
+  it("records x_rejected by request id, with its kind, tool, code and reason", () => {
+    const t = fold([
+      {
+        event: "x_rejected",
+        data: { id: "rej:1", agent_id: "root", kind: "approval", request_id: "q1", tool_id: "t9", message_id: null, code: "already_resolved", reason: "That call was already answered.", error_type: "X", timestamp: 1 },
+      },
+    ]);
+    expect(t.rejections).toEqual([
+      { requestId: "q1", kind: "approval", toolId: "t9", messageId: null, code: "already_resolved", type: "already_resolved", message: "That call was already answered." },
+    ]);
   });
 
   it("ignores harness events, counts unknown ones, and survives malformed data", () => {

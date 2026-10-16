@@ -14,7 +14,7 @@ import {
 } from "react";
 import { HarnessProvider, HttpTransport, SessionStore, useAgentSession } from "@temporalio/agent-harness-react";
 
-import { AGENT_API_BASE, CLIENT_HEADERS, readLog, uploadAttachment } from "./api";
+import { AGENT_API_BASE, CLIENT_HEADERS, getStatus, readLog, uploadAttachment } from "./api";
 import {
   alwaysApproved as deriveAlwaysApproved,
   currentModel,
@@ -23,10 +23,13 @@ import {
   sessionStatus,
   subagentsOf,
   toolIndex,
+  visibleMessages,
+  withRiskClass,
 } from "./derive";
 import { advance, landed, observe, startRecord, stuckInTemporal } from "./sendStates";
 import { TelemetryFolder } from "./telemetry";
 import { TimingFolder, timingKey } from "./timings";
+import { ProgressFolder } from "./progress";
 import type {
   ApproveOptions,
   ChangesState,
@@ -92,6 +95,15 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
   if (timingFolder.current?.id !== sessionId) timingFolder.current = { id: sessionId, folder: new TimingFolder() };
   const activeTimings = timingFolder.current.folder;
   const timings = useMemo(() => activeTimings.update(h.frames), [activeTimings, h.frames]);
+  const progressFolder = useRef<{ id: string; folder: ProgressFolder } | null>(null);
+  if (progressFolder.current?.id !== sessionId) progressFolder.current = { id: sessionId, folder: new ProgressFolder() };
+  const activeProgress = progressFolder.current.folder;
+  const progress = useMemo(() => activeProgress.update(h.frames), [activeProgress, h.frames]);
+  const { toolRiskClasses, defaultToolRiskClass, rememberAllowedClasses } = seed;
+  const pendingApprovals = useMemo(
+    () => withRiskClass(h.pendingApprovals, toolRiskClasses, defaultToolRiskClass, rememberAllowedClasses),
+    [h.pendingApprovals, toolRiskClasses, defaultToolRiskClass, rememberAllowedClasses],
+  );
 
   // Send records, per session.
   const [sendState, setSendState] = useState<{ id: string; records: readonly SendRecord[] }>({ id: sessionId, records: [] });
@@ -122,12 +134,13 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
   const rootMessages = h.messages;
   useEffect(() => {
     const byId = new Map(rootMessages.map((m) => [m.id, m]));
-    const rejections = new Map(telemetry.rejections.map((r) => [r.requestId, r.message]));
+    const rejections = new Map(telemetry.rejections.map((r) => [r.requestId, r]));
+    const byTool = new Map(telemetry.rejections.filter((r) => r.kind === "approval" && r.toolId).map((r) => [r.toolId!, r]));
     setSendState((s) => {
       if (s.id !== sessionId) return s;
       const records = observe(
         s.records,
-        { message: (id) => byId.get(id), tool: (id) => tools.get(id), rejection: (id) => rejections.get(id) },
+        { message: (id) => byId.get(id), tool: (id) => tools.get(id), rejection: (id) => rejections.get(id), approvalRejection: (id) => byTool.get(id) },
         Date.now(),
       );
       if (records === s.records) return s;
@@ -185,11 +198,32 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
     [add, update],
   );
 
+  // The session's run id: from the stream once the bridge reports it, else asked once of the
+  // status route when the session opens.
+  const [statusRun, setStatusRun] = useState<{ id: string; runId: string | null } | null>(null);
+  useEffect(() => {
+    let live = true;
+    getStatus(sessionId).then(
+      (s) => live && setStatusRun({ id: sessionId, runId: s.run_id ?? null }),
+      () => undefined,
+    );
+    return () => {
+      live = false;
+    };
+  }, [sessionId]);
+
   // -- derived ---------------------------------------------------------------------------------
 
   const states = h.states as Record<string, unknown>;
   const subagents = useMemo(() => subagentsOf(h.agents, h.rootAgentId), [h.agents, h.rootAgentId]);
-  const anyBusy = h.agentStatus === "busy" || Object.values(subagents).some((a) => a.agentStatus === "busy");
+  // A subagent counts only while it runs and can be read: one whose stream was unavailable
+  // never reports its turn's end, and none outlives its parent's turn.
+  const anyBusy =
+    h.agentStatus === "busy" ||
+    Object.values(subagents).some((a) => a.agentStatus === "busy" && a.lifecycle === "running" && !a.unavailable);
+  // The workflow carries rejections as message_handler_error on "x_rejected:<id>"; the bridge
+  // replaces them with x_rejected frames, but a carrier must never show as a message.
+  const messages = useMemo(() => visibleMessages(h.messages), [h.messages]);
   const model = useMemo(() => currentModel(h.messages, seed.model ?? null), [h.messages, seed.model]);
   const posture = useMemo(() => currentPosture(h.messages, seed.posture ?? null), [h.messages, seed.posture]);
   const always = useMemo(() => deriveAlwaysApproved(h.agents), [h.agents]);
@@ -202,7 +236,7 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
     reconnect,
 
     status: sessionStatus({
-      pendingApprovals: h.pendingApprovals,
+      pendingApprovals,
       anyBusy,
       worker: telemetry.worker,
       waitingForWorker: stuckInTemporal(sends, now),
@@ -210,8 +244,9 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
     agentStatus: h.agentStatus,
     anyBusy,
 
-    messages: h.messages,
+    messages,
     unsent: h.pending,
+    dismissUnsent: (localId: string) => latest.current.dismiss(localId),
     rootAgentId: h.rootAgentId,
     subagents,
     agent: (id: string) => latest.current.agent(id),
@@ -220,7 +255,17 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
     changes: asObject<ChangesState>(states.changes),
     workspace: asObject<WorkspaceState>(states.workspace),
 
-    pendingApprovals: h.pendingApprovals,
+    pendingApprovals,
+    toolProgress: progress.text,
+    toolProgressChunks: progress.chunks,
+    sandbox: telemetry.sandbox,
+    runIds: telemetry.runIds,
+    runId:
+      telemetry.runIdsByWorkflow[sessionId] ??
+      (h.rootAgentId ? telemetry.runIds[h.rootAgentId] : undefined) ??
+      (statusRun?.id === sessionId ? statusRun.runId : null) ??
+      null,
+    runIdFor: (workflowId: string) => telemetry.runIdsByWorkflow[workflowId] ?? (workflowId === sessionId && statusRun?.id === sessionId ? statusRun.runId : null) ?? null,
     sends,
     sendFor: ({ messageId, toolId }) => {
       for (let i = sends.length - 1; i >= 0; i--) {
