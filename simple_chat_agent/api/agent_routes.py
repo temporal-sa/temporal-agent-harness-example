@@ -12,7 +12,7 @@ deliberate:
 * ``messages`` and ``approve`` go through the Signal front door: they land in the workflow's
   history immediately, with or without a running worker. The message id is chosen here, so the
   client can match the later ``message_accepted`` to the message it sent.
-* ``agent-interface`` is built from the agent's contract models, not Queried.
+* ``agent-interface`` is built from the agents' contract models, not Queried.
 * Errors, including FastAPI's own 401 and 422, use the harness body
   ``{"error": <code>, "message": <text>}`` (see :class:`HarnessErrorRoute`).
 """
@@ -31,7 +31,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
@@ -63,9 +63,13 @@ from simple_chat_agent.agent.contracts import (
     ChatMessage,
     ChatReply,
     CodingAgentInit,
+    Findings,
     FrontDoorApproval,
     FrontDoorMessage,
     InterruptRequest,
+    Question,
+    Review,
+    ReviewRequest,
     ModelChoice,
     Posture,
     SetModel,
@@ -93,7 +97,6 @@ MAX_PARENT_HOPS = 4
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 TITLE_MAX = 200
-UPDATE_RPC_TIMEOUT = timedelta(seconds=5)
 SESSIONS_LIST_MAX = 500
 
 
@@ -295,9 +298,42 @@ _CODING_AGENT_HANDLERS: tuple[tuple[str, type[BaseModel], type[BaseModel], str, 
 )
 
 
+# The read-only subagents (simple_chat_agent.agent.subagents), whose models also live in
+# contracts.py. Bare ``@agent.accepts``: the decorator's defaults (reject mid-turn, callable
+# by a parent's model).
+_SUBAGENT_HANDLERS: dict[str, tuple[tuple[str, type[BaseModel], type[BaseModel], str, MidTurn, bool], ...]] = {
+    "ExplorerAgent": (
+        (
+            "investigate",
+            Question,
+            Findings,
+            "Investigate a question about the code and report findings with evidence.",
+            MidTurn.REJECT,
+            True,
+        ),
+    ),
+    "ReviewerAgent": (
+        (
+            "review",
+            ReviewRequest,
+            Review,
+            "Review the current diff and return a verdict with concrete issues.",
+            MidTurn.REJECT,
+            True,
+        ),
+    ),
+}
+
+AGENT_HANDLERS = {AGENT_WORKFLOW_TYPE: _CODING_AGENT_HANDLERS, **_SUBAGENT_HANDLERS}
+
+
 @functools.cache
-def coding_agent_interface() -> tuple[dict[str, Any], ...]:
-    """The ``agent_interface`` answer for a CodingAgent, built once per process."""
+def agent_interface_for(workflow_type: str) -> tuple[dict[str, Any], ...] | None:
+    """The ``agent_interface`` answer for an agent workflow type, built once per process
+    (None for a type we don't run)."""
+    handlers = AGENT_HANDLERS.get(workflow_type)
+    if handlers is None:
+        return None
     return tuple(
         AcceptedFunction(
             name=name,
@@ -307,8 +343,12 @@ def coding_agent_interface() -> tuple[dict[str, Any], ...]:
             mid_turn=mid_turn,
             model_callable=model_callable,
         ).model_dump(mode="json")
-        for name, input_type, output_type, description, mid_turn, model_callable in _CODING_AGENT_HANDLERS
+        for name, input_type, output_type, description, mid_turn, model_callable in handlers
     )
+
+
+def coding_agent_interface() -> tuple[dict[str, Any], ...]:
+    return agent_interface_for(AGENT_WORKFLOW_TYPE)  # type: ignore[return-value]
 
 
 # -- the session directory ---------------------------------------------------------------
@@ -320,8 +360,8 @@ class SessionDirectory:
 
     Redis: a sorted set of session ids by creation time and a hash of records, per owner
     digest. Every change is written to Redis first (browsers read it at once), then sent to the
-    workflow as an Update from a background task, in order per user, so creating a session
-    never waits for a worker. ``sync_workflow=False`` keeps the list in Redis only.
+    workflow as a Signal (signal-with-start), which needs no worker. ``sync_workflow=False``
+    keeps the list in Redis only.
     """
 
     def __init__(
@@ -336,9 +376,6 @@ class SessionDirectory:
         self._temporal = temporal
         self._task_queue = task_queue
         self._sync = sync_workflow and temporal is not None
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._tasks: set[asyncio.Task[None]] = set()
-        self._closing = False
 
     def _keys(self, user_id: str) -> tuple[str, str]:
         base = f"{prefix()}:u:{owner_digest(user_id)}"
@@ -353,7 +390,7 @@ class SessionDirectory:
         pipe.expire(index, ttl)
         pipe.expire(records, ttl)
         await pipe.execute()
-        self._send(user_id, "register_session", record)
+        await self._send(user_id, "register_session_signal", record)
 
     async def get(self, user_id: str, session_id: str) -> dict[str, Any] | None:
         _index, records = self._keys(user_id)
@@ -375,7 +412,7 @@ class SessionDirectory:
         record["title"] = title
         _index, records = self._keys(user_id)
         await self.r.hset(records, session_id, json.dumps(record))
-        self._send(user_id, "rename_session", {"session_id": session_id, "title": title})
+        await self._send(user_id, "rename_session_signal", {"session_id": session_id, "title": title})
         return record
 
     async def remove(self, user_id: str, session_id: str) -> None:
@@ -384,55 +421,17 @@ class SessionDirectory:
         pipe.zrem(index, session_id)
         pipe.hdel(records, session_id)
         await pipe.execute()
-        self._send(user_id, "remove_session", session_id)
-
-    async def aclose(self) -> None:
-        """Cancel pending syncs (Redis already holds the change). Bounded: a cancelled
-        ``execute_update`` can take a while to unwind, and shutdown must not wait on it."""
-        self._closing = True
-        tasks = list(self._tasks)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.wait(tasks, timeout=2.0)
-
-    async def drain(self) -> None:
-        """Wait for queued workflow syncs (tests)."""
-        while self._tasks:
-            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+        await self._send(user_id, "remove_session_signal", session_id)
 
     # -- workflow sync -----------------------------------------------------------------
 
-    def _send(self, user_id: str, update: str, arg: Any) -> None:
-        if not self._sync or self._closing:
+    async def _send(self, user_id: str, signal: str, arg: Any) -> None:
+        """Record the change in the user's ``CodingSessions`` with signal-with-start: one RPC
+        that starts the manager if needed and lands the Signal in its history, with or without
+        a worker running. Awaited inline, so a user's changes reach it in order. A failure
+        (Temporal unreachable) is logged, not raised: Redis already holds the change."""
+        if not self._sync:
             return
-        task = asyncio.create_task(self._send_ordered(user_id, update, arg), name=f"sessions:{update}")
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-
-    async def _send_ordered(self, user_id: str, update: str, arg: Any) -> None:
-        lock = self._locks.setdefault(owner_digest(user_id), asyncio.Lock())
-        # One update id across retries, so Temporal deduplicates a retry of an Update that
-        # was admitted before its RPC timed out. The three Updates are idempotent anyway.
-        update_id = f"{update}-{uuid.uuid4().hex}"
-        async with lock:
-            delay = 1.0
-            for attempt in range(6):
-                try:
-                    await self._update(user_id, update, arg, update_id)
-                    return
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - Temporal unavailable: retry, then log
-                    # A cancel that arrived mid-RPC can surface as the RPC's own error.
-                    if self._closing or (task := asyncio.current_task()) is not None and task.cancelling():
-                        raise asyncio.CancelledError from exc
-                    log.info("session directory %s attempt %d failed: %s", update, attempt + 1, exc)
-                    await asyncio.sleep(delay)
-                    delay = min(delay * 2, 30.0)
-            log.warning("session directory %s for %s not recorded in CodingSessions", update, owner_digest(user_id))
-
-    async def _update(self, user_id: str, update: str, arg: Any, update_id: str) -> None:
         from simple_chat_agent.agent.sessions import (
             SESSIONS_WORKFLOW_TYPE,
             RenameRequest,
@@ -441,37 +440,34 @@ class SessionDirectory:
             sessions_workflow_id,
         )
 
-        assert self._temporal is not None
-        client = await self._temporal()
-        digest = owner_digest(user_id)
-        workflow_id = sessions_workflow_id(digest)
-        await client.start_workflow(
-            SESSIONS_WORKFLOW_TYPE,
-            SessionsState(owner_digest=digest),
-            id=workflow_id,
-            task_queue=self._task_queue,
-            id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
-            search_attributes=owner_search_attributes(user_id),
-            static_summary="coding agent session list",
-            rpc_timeout=UPDATE_RPC_TIMEOUT,
-        )
-        # A fresh handle by id (no first_execution_run_id), so Updates keep working after
-        # the manager continues as new (see main._ensure_user_chats_workflow).
-        handle = client.get_workflow_handle(workflow_id)
-        if update == "register_session":
+        if signal == "register_session_signal":
             payload: Any = SessionRecord(
                 session_id=arg["session_id"],
                 title=arg.get("title") or "New session",
                 model=arg.get("model", ""),
                 created_at=datetime.fromtimestamp(float(arg["created_at"]), timezone.utc).isoformat(),
             )
-        elif update == "rename_session":
+        elif signal == "rename_session_signal":
             payload = RenameRequest(**arg)
         else:
             payload = arg
-        # Bounded RPCs: a cancelled long-poll for an Update's outcome doesn't unwind until the
-        # RPC returns, which would hold up API shutdown while no worker runs.
-        await handle.execute_update(update, payload, id=update_id, rpc_timeout=UPDATE_RPC_TIMEOUT)
+        digest = owner_digest(user_id)
+        try:
+            assert self._temporal is not None
+            client = await self._temporal()
+            await client.start_workflow(
+                SESSIONS_WORKFLOW_TYPE,
+                SessionsState(owner_digest=digest),
+                id=sessions_workflow_id(digest),
+                task_queue=self._task_queue,
+                id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+                search_attributes=owner_search_attributes(user_id),
+                static_summary="coding agent session list",
+                start_signal=signal,
+                start_signal_args=[payload],
+            )
+        except Exception as exc:  # noqa: BLE001 - Redis already holds the change
+            log.warning("session directory %s for %s not recorded in CodingSessions: %s", signal, digest, exc)
 
 
 # -- ownership ---------------------------------------------------------------------------
@@ -831,11 +827,19 @@ def create_agent_router(
     @router.get("/agent-interface/{session_id}")
     async def agent_interface(session_id: str, uid: str = Depends(user_id)):
         root = await require(session_id, uid)
+        workflow_type = AGENT_WORKFLOW_TYPE
         if root != session_id:
-            # Subagents have their own handler set, whose models live with the worker-only
-            # subagent module; not served until they move to a key-free module.
-            raise HarnessError(501, "not_implemented", "Subagent interfaces aren't served here yet.")
-        return JSONResponse(list(coding_agent_interface()), headers={"Cache-Control": "private, max-age=300"})
+            # A subagent: its handler set depends on its type, which Describe (no worker) gives.
+            try:
+                workflow_type = (await (await temporal()).get_workflow_handle(session_id).describe()).workflow_type
+            except RPCError as exc:
+                if exc.status != RPCStatusCode.NOT_FOUND:
+                    raise
+                raise not_found() from None
+        functions = agent_interface_for(workflow_type)
+        if functions is None:
+            raise HarnessError(501, "not_implemented", f"No interface is known for {workflow_type}.")
+        return JSONResponse(list(functions), headers={"Cache-Control": "private, max-age=300"})
 
     @router.get("/attach")
     async def attach(session_id: str, from_offset: int = 0, uid: str = Depends(user_id)):
@@ -982,7 +986,6 @@ class AgentApi:
         )
 
     async def aclose(self) -> None:
-        await self.directory.aclose()
         if self._bridge is not None:
             await self._bridge.aclose()
 

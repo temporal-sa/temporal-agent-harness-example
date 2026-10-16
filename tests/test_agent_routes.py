@@ -565,61 +565,93 @@ class BridgeIntegrationTests(AgentRoutesTestBase):
 class DirectorySyncTests(AgentRoutesTestBase):
     sync_directory = True
 
-    def test_changes_reach_coding_sessions_in_order(self) -> None:
+    def test_changes_reach_coding_sessions_in_order_by_signal_with_start(self) -> None:
         sid = self.create(title="first")["workflow_id"]
         self.client.post(f"/api/agent/sessions/{sid}/title", json={"title": "second"}, headers=A)
         self.client.delete(f"/api/agent/sessions/{sid}", headers=A)
-        self.run_async(self.directory.drain())
         manager = f"coding-sessions-{owner_digest('alice')}"
-        updates = [(wid, name) for wid, name, _ in self.temporal.updates]
-        self.assertEqual(
-            updates, [(manager, "register_session"), (manager, "rename_session"), (manager, "remove_session")]
-        )
-        record = self.temporal.updates[0][2]
-        self.assertEqual((record.session_id, record.title, record.model), (sid, "first", "anthropic:claude-sonnet-5-5"))
-        self.assertEqual(self.temporal.updates[1][2].title, "second")
-        self.assertEqual(self.temporal.updates[2][2], sid)
         starts = [s for s in self.temporal.starts if s["id"] == manager]
-        self.assertTrue(starts)
-        self.assertEqual(starts[0]["workflow"], "CodingSessions")
-        self.assertEqual(starts[0]["id_conflict_policy"], WorkflowIDConflictPolicy.USE_EXISTING)
-        self.assertEqual(starts[0]["task_queue"], "tq-test")
-        self.assertEqual(starts[0]["arg"].owner_digest, owner_digest("alice"))
+        self.assertEqual(
+            [s["start_signal"] for s in starts],
+            ["register_session_signal", "rename_session_signal", "remove_session_signal"],
+        )
+        for start in starts:
+            self.assertEqual(start["workflow"], "CodingSessions")
+            self.assertEqual(start["id_conflict_policy"], WorkflowIDConflictPolicy.USE_EXISTING)
+            self.assertEqual(start["task_queue"], "tq-test")
+            self.assertEqual(start["arg"].owner_digest, owner_digest("alice"))
+            self.assertEqual(start["search_attributes"].get(OWNER_SEARCH_ATTRIBUTE), owner_digest("alice"))
+        record = starts[0]["start_signal_args"][0]
+        self.assertEqual((record.session_id, record.title, record.model), (sid, "first", "anthropic:claude-sonnet-5-5"))
+        self.assertEqual(starts[1]["start_signal_args"][0].title, "second")
+        self.assertEqual(starts[2]["start_signal_args"], [sid])
+        self.assertEqual(self.temporal.updates, [])
+
+    def test_temporal_failure_keeps_the_redis_list(self) -> None:
+        async def broken(*args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("start_signal"):
+                raise RuntimeError("temporal unreachable")
+            return await FakeTemporal.start_workflow(self.temporal, *args, **kwargs)
+
+        self.temporal.start_workflow = broken  # type: ignore[method-assign]
+        sid = self.create()["workflow_id"]
+        self.assertEqual([s["workflow_id"] for s in self.client.get("/api/agent/sessions", headers=A).json()], [sid])
 
 
-class DirectoryShutdownTests(unittest.IsolatedAsyncioTestCase):
-    async def test_aclose_stops_a_sync_whose_rpc_ignores_cancel(self) -> None:
-        """A Temporal RPC that doesn't honour cancellation surfaces as its own error; the
-        retry loop must stop instead of sleeping and retrying through shutdown."""
-        calls = 0
+TEMPORAL_ADDRESS = os.environ.get("TEMPORAL_TEST_ADDRESS", "127.0.0.1:7244")
 
-        class StubbornHandle:
-            async def execute_update(self, *args: Any, **kwargs: Any) -> Any:
-                nonlocal calls
-                calls += 1
-                with contextlib.suppress(asyncio.CancelledError):
-                    await asyncio.sleep(0.3)
-                raise RuntimeError("deadline exceeded")
 
-        class StubbornTemporal:
-            async def start_workflow(self, *args: Any, **kwargs: Any) -> None:
-                return None
+def _temporal_up() -> bool:
+    import socket
 
-            def get_workflow_handle(self, workflow_id: str) -> StubbornHandle:
-                return StubbornHandle()
+    host, _, port = TEMPORAL_ADDRESS.rpartition(":")
+    try:
+        with socket.create_connection((host, int(port)), timeout=0.5):
+            return True
+    except OSError:
+        return False
 
-        async def temporal() -> StubbornTemporal:
-            return StubbornTemporal()
 
-        directory = SessionDirectory(object(), temporal=temporal, task_queue="tq")  # type: ignore[arg-type]
-        directory._send("alice", "remove_session", "s1")
-        await asyncio.sleep(0.05)
-        await asyncio.wait_for(directory.aclose(), timeout=3)
-        await asyncio.sleep(0.5)
-        self.assertEqual(directory._tasks, set())
-        self.assertEqual(calls, 1)
-        directory._send("alice", "remove_session", "s2")  # ignored once closing
-        self.assertEqual(directory._tasks, set())
+@unittest.skipUnless(REDIS_UP and _temporal_up(), "needs Redis and the Temporal dev server")
+class DirectoryNoWorkerTests(unittest.IsolatedAsyncioTestCase):
+    """Against the real dev server, on a task queue no worker polls: every change still lands
+    in the manager's history as a Signal."""
+
+    async def test_signals_land_with_no_worker(self) -> None:
+        from temporalio.api.enums.v1 import EventType
+
+        user = f"no-worker-{uuid.uuid4().hex[:8]}"
+        prefix = f"aah-test-noworker-{uuid.uuid4().hex[:6]}"
+        with mock.patch.dict(os.environ, {"TEMPORAL_ADDRESS": TEMPORAL_ADDRESS, "AGENT_REDIS_PREFIX": prefix}):
+            client = await agent_routes.connect_agent_client()
+            r = aredis.from_url(REDIS_URL, decode_responses=True)
+
+            async def temporal() -> Any:
+                return client
+
+            directory = SessionDirectory(r, temporal=temporal, task_queue=f"no-worker-{uuid.uuid4().hex[:6]}")
+            manager = f"coding-sessions-{owner_digest(user)}"
+            try:
+                await directory.put(user, {"session_id": "s-1", "title": "one", "created_at": 1.0, "model": "m"})
+                await directory.rename(user, "s-1", "renamed")
+                await directory.remove(user, "s-1")
+                history = await client.get_workflow_handle(manager).fetch_history()
+                signals = [
+                    e.workflow_execution_signaled_event_attributes.signal_name
+                    for e in history.events
+                    if e.event_type == EventType.EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED
+                ]
+                self.assertEqual(signals, ["register_session_signal", "rename_session_signal", "remove_session_signal"])
+                # Still waiting for a worker: nothing has run.
+                completed = [e for e in history.events if e.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED]
+                self.assertEqual(completed, [])
+            finally:
+                with contextlib.suppress(Exception):
+                    await client.get_workflow_handle(manager).terminate("test cleanup")
+                keys = [k async for k in r.scan_iter(f"{prefix}:*")]
+                if keys:
+                    await r.delete(*keys)
+                await r.aclose()
 
 
 class ConfigTests(AgentRoutesTestBase):
@@ -710,10 +742,21 @@ class AgentInterfaceTests(AgentRoutesTestBase):
         self.assertEqual((chat["mid_turn"], chat["model_callable"]), ("enqueue", True))
         self.assertIn("text", chat["parameters"]["properties"])
 
-    def test_subagent_interface_not_served_yet(self) -> None:
+    def test_subagent_interfaces_by_workflow_type(self) -> None:
         root = self.create()["workflow_id"]
-        sub = f"{root}-explorer-1"
-        self.temporal.workflows[sub] = FakeWorkflow("ExplorerAgent", parent_id=root)
+        for kind, workflow_type, name, field in (
+            ("explorer", "ExplorerAgent", "investigate", "question"),
+            ("reviewer", "ReviewerAgent", "review", "focus"),
+        ):
+            sub = f"{root}-{kind}-1"
+            self.temporal.workflows[sub] = FakeWorkflow(workflow_type, parent_id=root)
+            r = self.client.get(f"/api/agent/agent-interface/{sub}", headers=A)
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual([f["name"] for f in r.json()], [name])
+            self.assertIn(field, r.json()[0]["parameters"]["properties"])
+            self.assertEqual(self.client.get(f"/api/agent/agent-interface/{sub}", headers=B).status_code, 404)
+        sub = f"{root}-other-1"
+        self.temporal.workflows[sub] = FakeWorkflow("SomeOtherAgent", parent_id=root)
         r = self.client.get(f"/api/agent/agent-interface/{sub}", headers=A)
         self.assertEqual((r.status_code, r.json()["error"]), (501, "not_implemented"))
 
@@ -726,20 +769,28 @@ class StaticTablesTests(unittest.TestCase):
         os.environ.setdefault("OPENAI_API_KEY", "test-key-not-used")
         from temporal_agent_harness.harness.agent_workflow import agent_handlers
 
+        from simple_chat_agent.agent.subagents import ExplorerAgent, ReviewerAgent
         from simple_chat_agent.agent.workflow import CodingAgent
 
-        expected = [
-            {
-                "name": h.name,
-                "description": h.description,
-                "parameters": h.input_type.model_json_schema(),
-                "output": h.output_type.model_json_schema(),
-                "mid_turn": h.mid_turn.value,
-                "model_callable": h.model_callable,
-            }
-            for h in agent_handlers(CodingAgent).values()
-        ]
-        self.assertEqual(list(agent_routes.coding_agent_interface()), expected)
+        for workflow_type, cls in (
+            ("CodingAgent", CodingAgent),
+            ("ExplorerAgent", ExplorerAgent),
+            ("ReviewerAgent", ReviewerAgent),
+        ):
+            expected = [
+                {
+                    "name": h.name,
+                    "description": h.description,
+                    "parameters": h.input_type.model_json_schema(),
+                    "output": h.output_type.model_json_schema(),
+                    "mid_turn": h.mid_turn.value,
+                    "model_callable": h.model_callable,
+                }
+                for h in agent_handlers(cls).values()
+            ]
+            with self.subTest(workflow_type=workflow_type):
+                self.assertEqual(list(agent_routes.agent_interface_for(workflow_type)), expected)
+        self.assertEqual(set(agent_routes.AGENT_HANDLERS), {"CodingAgent", "ExplorerAgent", "ReviewerAgent"})
 
     def test_allowlist_mirrors_model_registry(self) -> None:
         from simple_chat_agent.agent import model_registry
