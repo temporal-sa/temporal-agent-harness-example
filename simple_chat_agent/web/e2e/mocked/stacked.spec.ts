@@ -111,7 +111,6 @@ test("stacked approvals: a held arrival doesn't move the buttons under the point
   // moving the buttons". The card sits on the composer and grows upward, so the "1 more call
   // is waiting" line pushes "Approve all" up by one line (about 24 px) while the pointer is
   // on it. Fails on: expect(await all.boundingBox()).toEqual(before) (y differs).
-  test.fail();
   const api = await mockApi();
   const id = sessionId("stack-still");
   const root = turn(1, "msg-1");

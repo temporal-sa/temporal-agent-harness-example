@@ -121,7 +121,7 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
   );
 
   // One call: the plain card (Frame 4 and "File edit · Trust safe tools").
-  if (items.length === 1 && card.held.length === 0) {
+  if (items.length === 1) {
     const it = items[0]!;
     const a = answers.get(it.toolId);
     const answered = isAnswered(a);
@@ -162,6 +162,7 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
         {declineForm("one")}
         <SendError answer={a} />
         <p className="why">{it.rememberAllowed ? alwaysWhy(it.risk) : `${alwaysApproveReason(it.risk)}.`}</p>
+        <HeldSlot held={card.held.length} onShow={() => setHover(false)} />
       </section>
     );
   }
@@ -202,22 +203,37 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
           />
         ))}
       </ul>
-      {card.held.length > 0 && (
-        <p className="held" role="status">
-          {card.held.length === 1 ? "1 more call is waiting." : `${card.held.length} more calls are waiting.`} It joins this card when you move the pointer
-          off it.{" "}
-          <button type="button" className="linkish" onClick={() => setHover(false)}>
-            Show now
-          </button>
-        </p>
-      )}
       {pausedLine}
       {latest && (
         <div className="acts end">
           <SendStateTrail record={latest} workerAnswering={worker} />
         </div>
       )}
+      <HeldSlot held={card.held.length} onShow={() => setHover(false)} />
     </section>
+  );
+}
+
+/**
+ * Where held arrivals are announced. Always rendered, one line tall, as the card's last row:
+ * the card sits on the composer and grows upward, so a notice that appeared would push every
+ * button above it, including the one under the pointer (owner decision B).
+ */
+function HeldSlot({ held, onShow }: { held: number; onShow(): void }) {
+  return (
+    <div className="held-slot">
+      <p className="held" role="status" title={held ? "It joins this card when you move the pointer off it." : undefined}>
+        {held > 0 && (
+          <>
+            {held === 1 ? "1 more call is waiting." : `${held} more calls are waiting.`}
+            <span className="sr-only"> It joins this card when you move the pointer off it.</span>{" "}
+            <button type="button" className="linkish" onClick={onShow}>
+              Show now
+            </button>
+          </>
+        )}
+      </p>
+    </div>
   );
 }
 

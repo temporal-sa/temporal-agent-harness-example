@@ -61,7 +61,10 @@
 .dc-card .item .n { font-size: .8em; }
 .dc-card .review { display: grid; gap: .4em; margin-left: 1.6em; }
 .dc-card .members { margin-left: .4em; }
-.dc-card .held { font-size: .78em; color: var(--indigo-100); margin: 0; }
+/* Reserved for held arrivals: a fixed one-line slot, so the card never changes height when
+   one is held (the buttons above must not move under the pointer). */
+.dc-card .held-slot { height: 1.6em; margin-top: -.3em; overflow: hidden; }
+.dc-card .held { font-size: .78em; line-height: 2em; color: var(--indigo-100); margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dc-card .linkish { color: var(--indigo-200); text-decoration: underline; font-size: inherit; }
 @media (prefers-reduced-motion: no-preference) {
   .dc-card .arrived > .item, .dc-card .arrived > .grp { animation: dc-arrive 1.6s ease-out 1; }
@@ -95,6 +98,9 @@
 /* Phone: 44 px tap targets, actions wrap under the label */
 @media (max-width: 600px) {
   .dc-card .btn, .dc-card .chev, .dc-card .linkish { min-height: 44px; }
+  .dc-card .held-slot { height: 44px; }
+  .dc-card .held { line-height: 44px; }
+  .dc-card .linkish { display: inline-block; min-width: 44px; }
   .dc-card .item .ok, .dc-card .item .no { min-width: 44px; height: 44px; }
   .dc-card .grp-acts { width: 100%; }
   .dc-judge { grid-template-columns: auto minmax(0, 1fr); }

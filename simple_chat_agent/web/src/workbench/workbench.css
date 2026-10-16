@@ -111,7 +111,7 @@ summary.wb-term-head:focus-visible { outline: none; box-shadow: var(--focus); }
 .wb-sheet .wb-tab { justify-content: center; padding: .6em .3em; }
 .wb-sheet .wb-term { max-height: none; }
 @media (max-width: 600px) {
-  .wb-tab, summary.wb-term-head, .wb-artifacts button, .wb-preview-links a { min-height: 44px; }
+  .wb-tab, summary.wb-term-head, .wb-artifacts button, .wb-preview-links a, .wb-term { min-height: 44px; }
   .wb-preview-links a { display: inline-flex; align-items: center; }
   .wb-preview iframe { height: 60dvh; }
 }
