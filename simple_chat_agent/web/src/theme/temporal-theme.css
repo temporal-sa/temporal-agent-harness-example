@@ -1,0 +1,122 @@
+/* Vendored from temporal-toolkit-demo-buildkit assets/css/temporal-theme.css (guide 02).
+   Kept: fonts (bundled from ./fonts, OFL licenses alongside), tokens, base, typography,
+   buttons, cards, pills and badges, reduced motion. Left out on purpose (owner decision 3a):
+   the starfield, grid floor, glow blobs and Ziggy. Edit app-specific styles in app.css, not
+   here, so this file can be re-vendored. */
+
+/* ---------- Fonts (Aeonik is commercial; Manrope stands in) ---------- */
+@font-face {
+  font-family: "Manrope";
+  src: url("./fonts/manrope-latin.woff2") format("woff2");
+  font-weight: 200 800;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Noto Sans Mono";
+  src: url("./fonts/noto-sans-mono-latin.woff2") format("woff2");
+  font-weight: 400 700;
+  font-display: swap;
+}
+
+/* ---------- Tokens ---------- */
+:root {
+  /* Brand */
+  --space-black: #141414;   /* page / card background */
+  --off-white:   #f8fafc;   /* primary text */
+  --uv:          #444ce7;   /* Temporal ultraviolet */
+  --uv-light:    #6169ed;   /* hover borders */
+  --indigo-100:  #cacbf9;   /* secondary text, eyebrows */
+  --indigo-200:  #a5a9f5;   /* links */
+  --indigo-300:  #7f86f1;
+  --purple:      #b664ff;
+  --pink:        #ff6bff;
+  --green:       #1ff1a5;   /* "good / live" accent, focus, flow lines */
+  --green-soft:  #59fda0;
+  --lime:        #c3ff62;
+  --yellow:      #fecb2f;   /* "in progress" (e.g. ramping) */
+  --cyan:        #4fd8ff;
+  --slate-300:   #92a4c3;   /* muted text */
+  --slate-500:   #465a78;   /* dim borders, inactive */
+  --border:      #243349;   /* card border */
+  --red:         #ff5555;   /* RESERVED for real errors only */
+
+  /* Gradients (verbatim from temporal.io) */
+  --grad-uv:    linear-gradient(45deg, #b664ff 0%, #444ce7 100%);
+  --grad-green: linear-gradient(255deg, #1ff1a5 0%, #c3ff62 100%);
+  --grad-hero:  linear-gradient(254deg, #211b4e 27.97%, #141414 100%);
+
+  --font-sans: "Manrope", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Noto Sans Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  color-scheme: dark;
+}
+
+/* ---------- Base ---------- */
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--space-black) var(--grad-hero) fixed;
+  color: var(--off-white);
+  font-family: var(--font-sans);
+  font-weight: 300;
+  line-height: 1.35;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--indigo-200); }
+strong { font-weight: 600; color: var(--indigo-100); }
+
+/* ---------- Typography ---------- */
+.display { font-weight: 300; line-height: 1.05; font-size: 3.4rem; letter-spacing: -.04em; margin: 0; }
+.heading { font-weight: 400; line-height: 1.2; font-size: 1.15rem; margin: 0; }
+.eyebrow, .mono { font-family: var(--font-mono); font-weight: 500; letter-spacing: -.025em; }
+.eyebrow { text-transform: uppercase; font-size: .72rem; letter-spacing: .05em; color: var(--indigo-100); margin: 0; }
+.muted { color: var(--slate-300); font-size: .72rem; }
+.text-gradient-ultraviolet, .text-gradient-green { -webkit-text-fill-color: transparent; -webkit-background-clip: text; background-clip: text; }
+.text-gradient-ultraviolet { background-image: linear-gradient(255deg, #b664ff 0%, #444ce7 100%); }
+.text-gradient-green { background-image: linear-gradient(90deg, #1ff1a5 0%, #c3ff62 100%); }
+
+/* ---------- Buttons: square corners, mono labels, UV ring on hover ---------- */
+.button {
+  display: inline-flex; align-items: center; justify-content: center; gap: .6rem; white-space: nowrap;
+  padding: .875rem 1.5rem; border: 2px solid transparent; background-origin: border-box;
+  font-family: var(--font-mono); font-weight: 500; font-size: 1rem; color: var(--off-white);
+  text-decoration: none; cursor: pointer; border-radius: 0;
+  transition: color .15s, background-color .15s, border-color .15s, box-shadow .15s;
+}
+.button.small { padding: .45rem .9rem; font-size: .8rem; }
+.button:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--green-soft); }
+.button:disabled { opacity: .5; cursor: wait; }
+.primary.ultraviolet { background-image: var(--grad-uv); }
+.primary.ultraviolet:hover { box-shadow: 0 0 0 4px rgba(68, 76, 231, .7); }
+.primary.ultraviolet:active { color: var(--indigo-100); box-shadow: none; }
+.primary.green { color: var(--space-black); background-image: var(--grad-green); }
+.secondary { background-color: var(--space-black); }
+.secondary.ultraviolet { background: linear-gradient(#141414, #141414) padding-box, linear-gradient(45deg, #444ce7, #b664ff) border-box; }
+.secondary.ultraviolet:hover { border-color: var(--indigo-300); background: var(--space-black); }
+.secondary.green { background: linear-gradient(#141414, #141414) padding-box, linear-gradient(45deg, #1ff1a5, #c3ff62) border-box; }
+.secondary.green:hover { border-color: var(--green-soft); background: var(--space-black); }
+
+/* ---------- Cards ---------- */
+.card {
+  background-color: rgba(20, 20, 20, .82);
+  border: 1px solid var(--border);
+  transition: border-color .2s cubic-bezier(0, 0, .2, 1);
+  padding: .85rem 1rem;
+  min-width: 0; min-height: 0;   /* let grid/flex tracks shrink below content */
+}
+.card:hover { border-color: var(--uv-light); }
+.glass { backdrop-filter: blur(2px); background: linear-gradient(to top right, #141414cc, #1f203f99); }
+
+/* ---------- Pills & badges ---------- */
+.pill { font-family: var(--font-mono); font-size: .72rem; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; padding: .2rem .55rem; color: var(--space-black); background: var(--grad-green); white-space: nowrap; }
+.pill.alt { background: linear-gradient(255deg, #ff6bff 0%, #b664ff 100%); color: var(--off-white); }
+.badge { font-family: var(--font-mono); font-size: .62rem; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; padding: .15rem .45rem; border: 1px solid currentColor; white-space: nowrap; }
+.badge.good { color: var(--green); }
+.badge.progress { color: var(--yellow); }
+.badge.leaving { color: var(--pink); }
+.badge.idle { color: var(--slate-300); }
+.badge.error { color: var(--red); }  /* only for actual failures */
+
+/* ---------- Reduced motion ---------- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+}
