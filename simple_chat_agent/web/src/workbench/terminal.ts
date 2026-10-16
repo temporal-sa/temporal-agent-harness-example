@@ -125,7 +125,7 @@ export function exitBadge(
     case "approved":
     case "running":
     case "awaiting_callback": {
-      if (!opts.workerAnswering) return { text: "paused · waiting for a worker", tone: "wait" };
+      if (!opts.workerAnswering) return { text: "paused · waiting for a Worker", tone: "wait" };
       if (opts.sandboxDown) return { text: "waiting for the sandbox", tone: "wait" };
       const t = opts.elapsedMs != null ? ` ${clock(opts.elapsedMs)}` : "";
       return { text: `running${t}`, tone: "run" };
@@ -192,11 +192,11 @@ const MUTED_NOTE = /^\[(live output limit reached|earlier output dropped|\.\.\. 
 export function reattachLine(resumedOn: string | null): string {
   return resumedOn
     ? `── reattached on ${resumedOn} · same run, not restarted ──`
-    : "── reattached after the worker was lost · same run, not restarted ──";
+    : "── reattached after the Worker was lost · same run, not restarted ──";
 }
 
 export function pauseLine(since: string | null): string {
-  return since ? `── stream paused at ${since} · waiting for a worker ──` : "── stream paused · waiting for a worker ──";
+  return since ? `── stream paused at ${since} · waiting for a Worker ──` : "── stream paused · waiting for a Worker ──";
 }
 
 /** The run_command recovery telemetry reports for this run, if any. */

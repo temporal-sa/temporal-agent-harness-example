@@ -62,9 +62,9 @@ export function bannerView(s: BannerInput): BannerView {
   if (!openTurn) {
     return {
       show,
-      lead: "No worker has picked up your message yet.",
+      lead: "No Worker has picked up your message yet.",
       saved: "your message, in the Workflow's history",
-      waiting: "for a worker to start the turn. It runs when one returns.",
+      waiting: "for a Worker to start the turn. It runs when one returns.",
       workflowId,
       runId,
     };
@@ -88,9 +88,9 @@ export function bannerView(s: BannerInput): BannerView {
     : null;
   return {
     show,
-    lead: at ? `The worker running this turn stopped responding at ${at}.` : "The worker running this turn stopped responding.",
+    lead: at ? `The Worker running this turn stopped responding at ${at}.` : "The Worker running this turn stopped responding.",
     saved,
-    waiting: `for another worker to pick up ${thing}. Your messages still land.`,
+    waiting: `for another Worker to pick up ${thing}. Messages you send now are stored in Temporal and run when a Worker returns.`,
     workflowId,
     runId,
   };

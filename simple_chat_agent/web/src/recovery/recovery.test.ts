@@ -50,7 +50,9 @@ describe("recovery divider", () => {
   it("says Checking… until history confirms, then shows kept and repeated work", () => {
     const live = dividerView(turn([rec()]));
     expect(live.checking).toBe(true);
-    expect(live.title).toBe(`Recovered · worker lost at ${hms(LOST)}`);
+    // Until confirmed, no claim of what was saved (UX review m1).
+    expect(live.title).toBe("Another Worker took over · checking");
+    expect(live.body).toBe("Another Worker (worker-b) is continuing this turn at the model call that was in flight.");
     expect(live.figures).toEqual([
       { label: "Kept", value: CHECKING, tone: "kept" },
       { label: "Repeated", value: CHECKING, tone: "rep" },
@@ -58,17 +60,24 @@ describe("recovery divider", () => {
 
     const confirmed = dividerView(turn([rec({ confirmed: true })]));
     expect(confirmed.checking).toBe(false);
+    expect(confirmed.title).toBe(`Recovered · Worker lost at ${hms(LOST)}`);
     expect(confirmed.figures.map((f) => `${f.label} ${f.value}`)).toEqual([
       "Kept 6 model calls (18.2k tokens)",
       "Kept 9 tool calls",
       "Repeated 1 model call (attempt 2)",
     ]);
-    expect(confirmed.body).toBe("Another worker (worker-b) continued this turn at the model call that was in flight.");
+    expect(confirmed.body).toBe("Another Worker (worker-b) continued this turn at the model call that was in flight.");
   });
 
   it("stays Checking… while any recovery in the turn is unconfirmed", () => {
     const v = dividerView(turn([rec({ confirmed: true }), rec({ id: "x", kind: "command_reattached", confirmed: false })]));
     expect(v.checking).toBe(true);
+  });
+
+  it("claims the command didn't start over only once confirmed", () => {
+    const unconfirmed = dividerView(turn([rec({ kind: "command_reattached", toolName: "workspace.run_command" })]));
+    expect(unconfirmed.body).not.toContain("did not start over");
+    expect(unconfirmed.body).toBe("Another Worker (worker-b) is continuing this turn at the command it was running.");
   });
 
   it("names a reattached command and says it didn't start over", () => {
@@ -111,8 +120,8 @@ describe("send-state trail", () => {
 
   it("says when a send waits in Temporal for a worker", () => {
     expect(trailSteps(record("in_temporal"), { now: 1500 })[1]!.label).toBe("In Temporal");
-    expect(trailSteps(record("in_temporal"), { now: 4000 })[1]!.label).toBe("In Temporal · waiting for a worker");
-    expect(trailSteps(record("in_temporal"), { now: 1200, workerAnswering: false })[1]!.label).toBe("In Temporal · waiting for a worker");
+    expect(trailSteps(record("in_temporal"), { now: 4000 })[1]!.label).toBe("In Temporal · waiting for a Worker");
+    expect(trailSteps(record("in_temporal"), { now: 1200, workerAnswering: false })[1]!.label).toBe("In Temporal · waiting for a Worker");
   });
 
   it("ends a decline at Accepted", () => {

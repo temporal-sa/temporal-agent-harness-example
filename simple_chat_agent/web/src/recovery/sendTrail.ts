@@ -35,7 +35,7 @@ export function trailSteps(
     if (phase === "in_temporal" && state === "now") {
       const since = record.at.in_temporal ?? null;
       const slow = since !== null && opts.now !== undefined && opts.now - since >= WAITING_FOR_WORKER_MS;
-      if (opts.workerAnswering === false || slow) label = "In Temporal · waiting for a worker";
+      if (opts.workerAnswering === false || slow) label = "In Temporal · waiting for a Worker";
     }
     return { phase, label, state };
   });

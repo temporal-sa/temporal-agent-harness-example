@@ -1,31 +1,43 @@
 /* Decisions (PRD U4). Visual reference: the wireframes' .decision-card, .stack and .judge rules.
-   Pink means "waiting on a person"; yellow cards are stops. Square corners. */
+   Pink means "waiting on a person"; yellow cards are stops. Square corners.
+   Sizes are in rem, never nested em, with a 0.75rem floor (UX review M6): nested em made the
+   stacked card's hints 6.6 px at 1366. rem still follows presenter mode's root size. */
 
 .dc-dock { display: grid; gap: .6em; margin-bottom: .6em; }
 .dc-dock:empty { display: none; }
 
-.dc-card { border: 1px solid var(--pink); background: rgba(255, 107, 255, .05); padding: .9em 1em; display: grid; gap: .6em; }
-.dc-card.hold { border-color: var(--yellow); background: rgba(254, 203, 47, .05); }
-.dc-card .top { display: flex; gap: .7em; align-items: center; flex-wrap: wrap; }
-.dc-card .top .t { font-weight: 600; }
-.dc-card .spacer { flex: 1; }
-.dc-card .hint { font-size: .72em; color: var(--slate-300); }
-.dc-card .why { font-size: .82em; color: var(--slate-300); margin: 0; }
-.dc-card .args {
-  font-family: var(--mono); font-size: .78em; background: #111116; border: 1px solid var(--border); padding: .5em .7em;
-  color: var(--indigo-100); white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; max-height: 16em; overflow: auto;
+.dc-card {
+  border: 1px solid var(--pink); background: rgba(255, 107, 255, .05); padding: .9rem 1rem;
+  display: flex; flex-direction: column; gap: .6rem; font-size: .9rem;
+  /* Capped so the composer stays on screen (M2); the header and the actions stay, the body scrolls. */
+  max-height: 50vh; min-height: 0;
 }
-.dc-card .paused { font-size: .82em; color: var(--indigo-100); display: flex; gap: .5em; align-items: center; margin: 0; }
+.dc-card > * { flex: none; }
+.dc-card > .dc-body { flex: 0 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; display: grid; gap: .4rem; align-content: start; }
+.dc-card.hold { border-color: var(--yellow); background: rgba(254, 203, 47, .05); max-height: none; }
+.dc-card .top { display: flex; gap: .7rem; align-items: center; flex-wrap: wrap; }
+.dc-card .top .t { font-weight: 600; }
+.dc-card .top .t:focus-visible { outline: none; box-shadow: var(--focus); }
+.dc-card .spacer { flex: 1; }
+.dc-card .hint { font-size: .75rem; color: var(--slate-300); }
+.dc-card .why { font-size: .8rem; color: var(--slate-300); margin: 0; }
+.dc-card .args {
+  font-family: var(--mono); font-size: .8rem; background: #111116; border: 1px solid var(--border); padding: .5rem .7rem;
+  color: var(--indigo-100); white-space: pre-wrap; overflow-wrap: anywhere; margin: 0;
+}
+.dc-card .wb-diff { font-size: .78rem; }
+.dc-card .paused { font-size: .82rem; color: var(--indigo-100); display: flex; gap: .5rem; align-items: center; margin: 0; }
 .dc-card .paused .dot { flex-shrink: 0; }
-.dc-card .acts { display: flex; gap: .6em; flex-wrap: wrap; align-items: center; }
-.dc-card .acts.end { justify-content: flex-end; }
-.dc-card .err { color: var(--red); font-size: .82em; margin: 0; }
+.dc-card .acts { display: flex; gap: .6rem; flex-wrap: wrap; align-items: center; }
+.dc-card .err { color: var(--red); font-size: .8rem; margin: 0; }
+.dc-card .btn.small { font-size: .78rem; }
 .dc-card .btn.off { opacity: .45; cursor: not-allowed; }
 .dc-card .btn.quiet { border-color: transparent; color: var(--slate-300); }
 .dc-card .all { font-variant-numeric: tabular-nums; min-width: 9.5em; }
 
 /* Badges by tool kind (wireframe .badge.*) */
-.dc-card .badge.edit, .dc-judge .badge.edit { color: var(--cyan); }
+.dc-card .badge, .dc-judge .badge { font-size: .75rem; }
+.dc-card .badge.edit { color: var(--cyan); }
 .dc-card .badge.shell { color: var(--purple); }
 .dc-card .badge.git { color: var(--pink); }
 .dc-card .badge.net { color: var(--yellow); }
@@ -34,62 +46,72 @@
 .dc-card .badge.prog { color: var(--yellow); }
 
 /* The stack */
-.dc-card .stack, .dc-card .items, .dc-card .members { display: grid; gap: .3em; margin: 0; padding: 0; list-style: none; }
-.dc-card .grp-wrap { display: grid; gap: .3em; }
+.dc-card .stack, .dc-card .items, .dc-card .members { display: grid; gap: .3rem; margin: 0; padding: 0; list-style: none; }
+.dc-card .grp-wrap { display: grid; gap: .3rem; }
 .dc-card .grp {
-  display: flex; gap: .55em; align-items: center; padding: .45em .6em; border: 1px solid var(--border); background: #111116;
-  font-size: .88em; flex-wrap: wrap;
+  display: flex; gap: .55rem; align-items: center; padding: .45rem .6rem; border: 1px solid var(--border); background: #111116;
+  font-size: .88rem; flex-wrap: wrap; min-height: 2.9rem;
 }
 .dc-card .grp-wrap.open > .grp { border-color: var(--uv-light); }
-.dc-card .grp-acts, .dc-card .item-acts { display: inline-flex; gap: .4em; align-items: center; flex-wrap: wrap; }
-.dc-card .chev { display: inline-flex; gap: .55em; align-items: center; text-align: left; flex-wrap: wrap; min-height: 2em; }
-.dc-card .chev > [aria-hidden="true"]:first-child { font-family: var(--mono); color: var(--indigo-300); font-size: .8em; width: 1em; }
-.dc-card .chev.static { padding-left: 1.55em; }
-.dc-card .chev .label { overflow-wrap: anywhere; }
-.dc-card .items { padding-left: 1.6em; }
-.dc-card .items > .why { font-size: .78em; color: var(--slate-300); padding: .1em .6em; }
-.dc-card .item { display: flex; gap: .55em; align-items: center; padding: .35em .6em; font-size: .82em; flex-wrap: wrap; }
+.dc-card .grp-acts, .dc-card .item-acts { display: inline-flex; gap: .4rem; align-items: center; flex-wrap: nowrap; }
+.dc-card .chev { display: inline-flex; gap: .55rem; align-items: center; text-align: left; min-height: 2rem; min-width: 0; color: var(--off-white); }
+.dc-card .chev > [aria-hidden="true"]:first-child { font-family: var(--mono); color: var(--indigo-300); font-size: .8rem; width: 1em; flex: none; }
+.dc-card .chev.static { padding-left: calc(1em + .55rem); }
+/* The group title reads as a label, not a link: off-white, with the command in plain mono. */
+.dc-card .title { color: var(--off-white); }
+.dc-card .title .code { color: var(--off-white); font-size: .82rem; }
+.dc-card .items-wrap { display: grid; gap: .3rem; padding-left: 1.6rem; }
+.dc-card .items-wrap > .why { padding: .1rem .6rem; }
+/* A row keeps its height when answered: a badge takes the buttons' place, nothing wraps (M1). */
+.dc-card .item { display: flex; gap: .55rem; align-items: center; padding: .25rem .6rem; font-size: .85rem; flex-wrap: nowrap; height: 2.6rem; }
+.dc-card .item > .chev { flex: 0 1 auto; overflow: hidden; }
+.dc-card .item .label, .dc-card .item .hint { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.dc-card .item .label { font-size: .8rem; flex: 0 1 auto; }
+.dc-card .item .hint { flex: 0 2 auto; }
 .dc-card .item.done { opacity: .6; }
+.dc-card .item .item-acts { flex: none; min-width: 4.3rem; justify-content: flex-end; }
 .dc-card .item .ok, .dc-card .item .no {
-  font-family: var(--mono); min-width: 1.9em; height: 1.9em; padding: 0 .35em; display: inline-grid; grid-auto-flow: column; gap: .2em;
+  font-family: var(--mono); min-width: 1.9rem; height: 1.9rem; padding: 0 .35rem; display: inline-grid; grid-auto-flow: column; gap: .2rem;
   place-items: center; border: 1px solid var(--slate-500);
 }
 .dc-card .item .ok { color: var(--green); border-color: var(--green); }
 .dc-card .item .no { color: var(--slate-300); }
 .dc-card .item .ok:hover { background: rgba(31, 241, 165, .1); }
 .dc-card .item .no:hover { border-color: var(--pink); color: var(--pink); }
-.dc-card .item .n { font-size: .8em; }
-.dc-card .review { display: grid; gap: .4em; margin-left: 1.6em; }
-.dc-card .members { margin-left: .4em; }
-/* Reserved for held arrivals: a fixed one-line slot, so the card never changes height when
-   one is held (the buttons above must not move under the pointer). */
-.dc-card .held-slot { height: 1.6em; margin-top: -.3em; overflow: hidden; }
-.dc-card .held { font-size: .78em; line-height: 2em; color: var(--indigo-100); margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dc-card .item .n { font-size: .75rem; }
+.dc-card .review { display: grid; gap: .4rem; }
+.dc-card .items .review { margin-left: 1.6rem; }
 .dc-card .linkish { color: var(--indigo-200); text-decoration: underline; font-size: inherit; }
 @media (prefers-reduced-motion: no-preference) {
   .dc-card .arrived > .item, .dc-card .arrived > .grp { animation: dc-arrive 1.6s ease-out 1; }
   @keyframes dc-arrive { from { background: rgba(97, 105, 237, .28); } to { background: transparent; } }
 }
 
+/* The footer: one fixed-height line for held arrivals or the latest answer's trail. Quiet: no
+   border or fill, so an empty one reads as spacing. */
+.dc-card .dc-foot { height: 1.7rem; margin-top: -.3rem; display: flex; gap: .8rem; align-items: center; justify-content: space-between; overflow: hidden; }
+.dc-card .dc-foot .held { font-size: .78rem; color: var(--indigo-100); margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.dc-card .dc-foot .held:empty { flex: 0; }
+.dc-card .dc-foot .sendstate { flex-wrap: nowrap; margin-left: auto; }
+
 /* Decline with a reason */
-.dc-card .decline { display: grid; gap: .4em; padding: .5em .6em; border: 1px solid var(--border); background: rgba(13, 13, 16, .9); }
-.dc-card .decline label { font-size: .78em; color: var(--indigo-100); }
+.dc-card .decline { display: grid; gap: .4rem; padding: .5rem .6rem; border: 1px solid var(--border); background: rgba(13, 13, 16, .9); }
+.dc-card .decline label { font-size: .8rem; color: var(--indigo-100); }
 .dc-card .decline textarea {
-  font: inherit; font-size: .88em; color: var(--off-white); background: var(--ink); border: 1px solid var(--uv-light);
-  padding: .5em .7em; resize: vertical; min-height: 2.6em; border-radius: 0;
+  font: inherit; font-size: .9rem; color: var(--off-white); background: var(--ink); border: 1px solid var(--uv-light);
+  padding: .5rem .7rem; resize: vertical; min-height: 2.6rem; border-radius: 0;
 }
-.dc-card .decline .hint { margin: 0; }
 
 /* Judge evaluation cards, inline in the transcript */
 .dc-judge {
-  border: 1px solid var(--border); border-left: 2px solid var(--green); background: rgba(31, 241, 165, .04); padding: .55em .8em;
-  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: .2em .8em; align-items: center; font-size: .85em;
+  border: 1px solid var(--border); border-left: 2px solid var(--green); background: rgba(31, 241, 165, .04); padding: .55rem .8rem;
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: .2rem .8rem; align-items: center; font-size: .85rem;
 }
 .dc-judge .badge { color: var(--green); }
 .dc-judge .what { overflow-wrap: anywhere; }
 .dc-judge .args { color: var(--indigo-100); }
-.dc-judge .why { grid-column: 2 / 4; color: var(--slate-300); font-size: .9em; }
-.dc-judge .score { font-family: var(--mono); font-size: .8em; color: var(--green); white-space: nowrap; }
+.dc-judge .why { grid-column: 2 / 4; color: var(--slate-300); font-size: .8rem; }
+.dc-judge .score { font-family: var(--mono); font-size: .78rem; color: var(--green); white-space: nowrap; }
 .dc-judge.escalated, .dc-judge.declined { border-left-color: var(--pink); background: rgba(255, 107, 255, .04); }
 .dc-judge.escalated .badge, .dc-judge.declined .badge, .dc-judge.escalated .score, .dc-judge.declined .score { color: var(--pink); }
 .dc-judge.deciding { border-left-color: var(--slate-500); background: transparent; }
@@ -98,11 +120,12 @@
 /* Phone: 44 px tap targets, actions wrap under the label */
 @media (max-width: 600px) {
   .dc-card .btn, .dc-card .chev, .dc-card .linkish { min-height: 44px; }
-  .dc-card .held-slot { height: 44px; }
-  .dc-card .held { line-height: 44px; }
-  .dc-card .linkish { display: inline-block; min-width: 44px; }
+  .dc-card .item { height: auto; min-height: 52px; }
   .dc-card .item .ok, .dc-card .item .no { min-width: 44px; height: 44px; }
-  .dc-card .grp-acts { width: 100%; }
+  .dc-card .item .item-acts { min-width: 92px; }
+  .dc-card .grp-acts { width: 100%; flex-wrap: wrap; }
+  .dc-card .dc-foot { height: 44px; }
+  .dc-card .linkish { display: inline-block; min-width: 44px; line-height: 44px; }
   .dc-judge { grid-template-columns: auto minmax(0, 1fr); }
   .dc-judge .score { grid-column: 2; }
   .dc-judge .why { grid-column: 1 / 3; }

@@ -36,7 +36,7 @@ test("3d workers down: reload keeps the transcript and the card; a message waits
     const question = "What is 6 times 7? Answer with only the number.";
     await send(page, question);
     const trail = page.getByRole("list", { name: "Delivery" }).last();
-    await expect(trail.getByText("In Temporal · waiting for a worker")).toBeVisible({ timeout: 20_000 });
+    await expect(trail.getByText("In Temporal · waiting for a Worker")).toBeVisible({ timeout: 20_000 });
     await expect(page.getByText(question)).toHaveCount(1);
   } finally {
     await startWorker(env.taskQueue);

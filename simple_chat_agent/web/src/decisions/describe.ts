@@ -45,22 +45,39 @@ export function riskNoun(risk: Risk, toolName: string): string {
   }
 }
 
-/** Why "Always approve" is greyed out for this class. */
-export function alwaysApproveReason(risk: Risk): string {
+/** Why "Always approve" is greyed out, specific to the call's class (and to commits). */
+export function alwaysApproveReason(risk: Risk, toolName = ""): string {
+  if (toolName === "git_commit") return "Commits need a yes each time";
   switch (risk) {
     case "shell":
-      return "Commits and shell commands need a yes each time";
+      return "Shell commands need a yes each time";
     case "network":
       return "Network calls need a yes each time";
     case "read_only":
+    case null:
       return "Always approve covers file edits only";
     case "external_side_effect":
       return "Calls that act outside the workspace need a yes each time";
-    case null:
-      return "Always approve covers file edits only";
-    default:
-      return `${riskNoun(risk, "")[0]!.toUpperCase()}${riskNoun(risk, "").slice(1)} need a yes each time`;
+    default: {
+      const noun = riskNoun(risk, "");
+      return `${noun[0]!.toUpperCase()}${noun.slice(1)} need a yes each time`;
+    }
   }
+}
+
+/** What a group's calls are, for accessible names: "shell commands", "file edits". */
+export function callNoun(toolName: string, n: number): string {
+  const [one, many] =
+    toolName === "edit_file"
+      ? ["file edit", "file edits"]
+      : toolName === "write_file"
+        ? ["file write", "file writes"]
+        : toolName === "run_command"
+          ? ["shell command", "shell commands"]
+          : toolName === "git_commit"
+            ? ["commit", "commits"]
+            : [`${toolName} call`, `${toolName} calls`];
+  return n === 1 ? one : many;
 }
 
 export type BadgeKind = "edit" | "shell" | "git" | "net" | "read" | "agent" | "art";

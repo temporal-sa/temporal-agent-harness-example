@@ -4,6 +4,8 @@ import type { Recovery, TurnRecovery } from "../session";
 import { count, hms, tokens } from "./format";
 
 export const CHECKING = "Checking…";
+/** The divider's title until history confirms the recovery. */
+export const CHECKING_TITLE = "Another Worker took over · checking";
 export const COMPARISON = "compared with re-running this turn from your message";
 
 export interface DividerFigure {
@@ -34,18 +36,24 @@ function toolName(name: string | null): string | null {
   return name ? name.replace(/^workspace\./, "") : null;
 }
 
-function where(r: TurnRecovery): string {
+function where(r: TurnRecovery, confirmed: boolean): string {
   const reattached = r.recoveries.some((x) => x.kind === "command_reattached");
   const lead = first(r);
   const worker = lead?.resumedOn ? ` (${lead.resumedOn})` : "";
+  // Until history confirms it, say what is happening, not what it saved.
+  if (!confirmed) {
+    if (reattached) return `Another Worker${worker} is continuing this turn at the command it was running.`;
+    if (lead?.kind === "tool_call") return `Another Worker${worker} is continuing this turn at ${toolName(lead.toolName) ?? "the tool call"}.`;
+    return `Another Worker${worker} is continuing this turn at the model call that was in flight.`;
+  }
   if (reattached) {
-    return `Another worker${worker} continued this turn at the command it was running. It reattached to the same run, so the command did not start over.`;
+    return `Another Worker${worker} continued this turn at the command it was running. It reattached to the same run, so the command did not start over.`;
   }
   if (lead?.kind === "tool_call") {
     const name = toolName(lead.toolName);
-    return `Another worker${worker} continued this turn at ${name ?? "the tool call"}, which ran again.`;
+    return `Another Worker${worker} continued this turn at ${name ?? "the tool call"}, which ran again.`;
   }
-  return `Another worker${worker} continued this turn at the model call that was in flight.`;
+  return `Another Worker${worker} continued this turn at the model call that was in flight.`;
 }
 
 function maxAttempt(r: TurnRecovery, kind: string): number | null {
@@ -56,8 +64,12 @@ function maxAttempt(r: TurnRecovery, kind: string): number | null {
 
 export function dividerView(r: TurnRecovery): DividerView {
   const lostAt = hms(r.lostAt);
-  const title = lostAt ? `Recovered · worker lost at ${lostAt}` : "Recovered · worker lost";
-  const body = where(r);
+  const title = !r.confirmed
+    ? CHECKING_TITLE
+    : lostAt
+      ? `Recovered · Worker lost at ${lostAt}`
+      : "Recovered · Worker lost";
+  const body = where(r, r.confirmed);
   if (!r.confirmed) {
     return {
       title,

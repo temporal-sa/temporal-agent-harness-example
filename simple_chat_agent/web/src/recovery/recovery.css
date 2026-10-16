@@ -38,7 +38,7 @@
 .rc-divider .kept .rep b { color: var(--yellow); }
 .rc-divider .kept b.checking { color: var(--slate-300); font-weight: 500; }
 
-.sendstate { display: flex; gap: .3em; align-items: center; font-family: var(--mono); font-size: .7em; color: var(--slate-300); flex-wrap: wrap; margin: 0; padding: 0; list-style: none; }
+.sendstate { display: flex; gap: .3em; align-items: center; font-family: var(--mono); font-size: .75rem; color: var(--slate-300); flex-wrap: wrap; margin: 0; padding: 0; list-style: none; }
 .sendstate li { display: inline-flex; gap: .3em; align-items: center; }
 .sendstate .chip { padding: .15em .45em; border: 1px solid var(--slate-500); }
 .sendstate .done .chip { color: var(--green); border-color: var(--green); }

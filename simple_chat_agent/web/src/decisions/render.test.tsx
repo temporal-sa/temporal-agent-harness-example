@@ -63,11 +63,11 @@ describe("DecisionDock", () => {
     expect(html).toContain("Approve all 5");
     expect(html).toContain("5 tool calls are waiting");
     expect(html).toContain("Edit 3 files");
-    expect(html).toContain("× 2, same command");
+    expect(html).toContain("× 2, same arguments");
     expect(html).toContain("Approve 3");
     expect(html).toContain("Decline 2");
     expect(html).toContain("Always approve file edits");
-    expect(html).toContain("Commits and shell commands need a yes each time");
+    expect(html).toContain("Shell commands need a yes each time");
     expect(html).toContain("The agent is paused in Temporal and nothing is running.");
     expect(html.match(/class="dc-card/g)).toHaveLength(1);
   });
@@ -77,8 +77,8 @@ describe("DecisionDock", () => {
     expect(html).toContain("Needs approval");
     expect(html).toContain("Commit 1 file");
     expect(html).toContain('message: &quot;Use the remaining balance&quot;');
-    expect(html).toMatch(/aria-disabled="true"[^>]*title="Commits and shell commands need a yes each time"/);
-    expect(html).toContain("This request survives reloads and worker restarts.");
+    expect(html).toMatch(/aria-disabled="true"[^>]*title="Commits need a yes each time"/);
+    expect(html).toContain("This request survives reloads and Worker restarts.");
   });
 
   it("renders the checkpoint card after a checkpointed turn", () => {
@@ -127,6 +127,14 @@ describe("Workbench and recovery", () => {
     const run = tool("r1", "run_command", { command: "pytest -q" }, { state: "done", output: "$ pytest -q\nexit 1 · 0.3s\nstdout:\n1 failed, 13 passed in 0.31s" });
     const term = renderToStaticMarkup(<Workbench session={session([run])} variant="sheet" initialTab="terminal" />);
     expect(term).toContain("exit 1 · tests failing");
+    // M7: the output isn't a live region; one status line says what happened.
+    expect(term).not.toContain('role="log"');
+    expect(term).not.toContain("aria-live");
+    expect(term).toContain('<p class="sr-only" role="status">pytest -q finished: exit 1 · tests failing</p>');
+    const running = tool("r2", "run_command", { command: "pytest -q" }, { state: "running" });
+    const live = renderToStaticMarkup(<Workbench session={session([running])} variant="panel" initialTab="terminal" />);
+    expect(live).toContain('role="status">Running pytest -q</p>');
+    expect(live).not.toMatch(/role="status">Running pytest -q \d/);
     const edit = tool("e0", "edit_file", { path: "refund_service/refunds.py" }, { state: "done", output: "Edited refund_service/refunds.py (+1 -1).\n@@ -1 +1 @@\n-a\n+b\n" });
     const changes = renderToStaticMarkup(<Workbench session={session([edit])} variant="panel" initialTab="changes" />);
     expect(changes).toContain('<del class="del">');
@@ -142,7 +150,9 @@ describe("Workbench and recovery", () => {
     expect(html).toContain("Worker isn&#x27;t answering");
     expect(html).toContain("Saved in Temporal:");
     expect(html).toContain("the test run&#x27;s output so far");
-    expect(html).toContain("for another worker to pick up the test run");
+    expect(html).toContain("for another Worker to pick up the test run");
+    expect(html).toContain("Messages you send now are stored in Temporal and run when a Worker returns.");
+    expect(html).not.toContain("still land");
     // No run id yet: the Workflow's page, and the link says so.
     expect(html).toContain('href="http://ui/namespaces/default/workflows/s1"');
     expect(html).toContain("Open the Workflow in Temporal UI");
@@ -157,5 +167,27 @@ describe("Workbench and recovery", () => {
     const html = renderToStaticMarkup(<RecoveryDivider recovery={r} />);
     expect(html).toContain("Checking…");
     expect(html).toContain("compared with re-running this turn from your message");
+  });
+});
+
+describe("approval card styles (UX review)", async () => {
+  const fsName = "node:fs";
+  const fs = (await import(/* @vite-ignore */ fsName)) as { readFileSync(p: URL, enc: "utf8"): string };
+  const css = fs.readFileSync(new URL("./decisions.css", import.meta.url), "utf8");
+
+  it("M2: the card is capped with a scrolling body", () => {
+    expect(css).toMatch(/\.dc-card \{[^}]*max-height: 50vh/);
+    expect(css).toMatch(/\.dc-card > \.dc-body \{[^}]*overflow-y: auto/);
+  });
+
+  it("M6: text is sized in rem with a 0.75rem floor, never nested em", () => {
+    const sizes = [...css.matchAll(/font-size:\s*([^;}\s]+)/g)].map((m) => m[1]!);
+    expect(sizes.filter((v) => /em$/.test(v) && !/rem$/.test(v))).toEqual([]);
+    expect(sizes.filter((v) => parseFloat(v) < 0.75)).toEqual([]);
+  });
+
+  it("M1: answered and waiting rows share a fixed height, and the footer is fixed", () => {
+    expect(css).toMatch(/\.dc-card \.item \{[^}]*height: 2\.6rem/);
+    expect(css).toMatch(/\.dc-card \.dc-foot \{[^}]*height: 1\.7rem/);
   });
 });

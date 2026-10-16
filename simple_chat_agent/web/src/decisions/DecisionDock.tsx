@@ -1,7 +1,7 @@
 // Above the composer (PRD U4): the stacked approval card (owner decisions A and B), then the
 // checkpoint and spend-cap cards.
 
-import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FocusEvent, type ReactNode } from "react";
 
 import type { CodingSession, DecisionDockProps, SendRecord } from "../session";
 import { SendStateTrail } from "../recovery/SendStateTrail";
@@ -13,6 +13,7 @@ import {
   alwaysApproveLabel,
   alwaysApproveReason,
   argSummary,
+  callNoun,
   callTitle,
   editStat,
   reviewOf,
@@ -35,7 +36,7 @@ import {
   type Fold,
   type Group,
 } from "./grouping";
-import { answeredText, groupTitle, stackHeading } from "./labels";
+import { answeredText, groupTitle, SAME, stackHeading } from "./labels";
 import { StopCards } from "./StopCards";
 import "./decisions.css";
 
@@ -49,28 +50,35 @@ export function DecisionDock({ session }: DecisionDockProps) {
 }
 
 export const PAUSED_LINE = "The agent is paused in Temporal and nothing is running.";
-export const SURVIVES_LINE = "This request survives reloads and worker restarts.";
+export const SURVIVES_LINE = "This request survives reloads and Worker restarts.";
 export const STILL_RUNNING_LINE = "Other work in this turn keeps running while these wait.";
-export const DECLINE_HINT = "Optional. The agent sees your reason with the declined call.";
 
 // -- the card -------------------------------------------------------------------------------
 
 interface DeclineTarget {
   key: string;
   ids: string[];
+  /** The submit button's text, and its accessible name. */
   label: string;
+  name?: string;
 }
 
 export function ApprovalCard({ session }: { session: CodingSession }) {
   const pending = useMemo(() => session.pendingApprovals.map(itemOf), [session.pendingApprovals]);
   const answers = useMemo(() => answersFrom(session.sends), [session.sends]);
+  // Arrivals are held while the pointer or keyboard focus is in the card, so nothing moves
+  // under either (owner decision B). "Show now" lets them join at once.
   const [hover, setHover] = useState(false);
+  const [focusIn, setFocusIn] = useState(false);
+  const [joinNow, setJoinNow] = useState(false);
+  const hold = (hover || focusIn) && !joinNow;
 
-  // Card membership: stable order, held arrivals while the pointer is on the card.
+  // Card membership: stable order, held arrivals.
   const prev = useRef<CardState>(EMPTY_CARD);
-  const card = reconcile(prev.current, pending, (id) => isAnswered(answers.get(id)), hover);
+  const card = reconcile(prev.current, pending, (id) => isAnswered(answers.get(id)), hold);
   useEffect(() => {
     prev.current = card;
+    if (joinNow && card.held.length === 0) setJoinNow(false);
   });
 
   // Arrivals after the first render get a one-off highlight.
@@ -89,18 +97,52 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
       return n;
     });
 
+  // Focus after an answer: the answered control goes away, so move focus on (M3) instead of
+  // letting it fall to <body>.
+  const root = useRef<HTMLElement | null>(null);
+  const refocus = useRef<{ row: string; at: number } | null>(null);
+  const focusWasInside = useRef(false);
+  useLayoutEffect(() => {
+    const el = root.current;
+    const active = document.activeElement;
+    // Lost: nothing focused, the focused control went away, or it became disabled (Approve all
+    // once nothing waits).
+    const lost = !active || active === document.body || !active.isConnected || (active as HTMLButtonElement).disabled === true;
+    if (!el) {
+      if (focusIn) setFocusIn(false);
+      if (hover) setHover(false);
+      // The card left (everything settled) while focus was in it: hand focus to the composer.
+      if (focusWasInside.current && lost) {
+        focusWasInside.current = false;
+        document.querySelector<HTMLElement>('[data-slot="composer"] textarea')?.focus();
+      }
+      return;
+    }
+    const r = refocus.current;
+    if (!r) return;
+    if (Date.now() - r.at > 3000) {
+      refocus.current = null;
+      return;
+    }
+    if (!lost && el.contains(active)) return; // the answer hasn't rendered yet
+    refocus.current = null;
+    nextFocus(el, r.row)?.focus();
+  });
+
   if (items.length === 0) return null;
 
   const tools = toolsOf(session);
   const paused = !anythingRunning(session);
   const worker = session.telemetry.worker.answering;
   const isWaiting = (id: string) => !isAnswered(answers.get(id)) && pending.some((p) => p.toolId === id);
-  const approve = (ids: readonly string[], remember = false) => {
+  const approve = (row: string, ids: readonly string[], remember = false) => {
     const live = ids.filter(isWaiting);
+    refocus.current = { row, at: Date.now() };
     if (live.length) void session.approve(live, remember ? { remember: true } : undefined);
   };
-  const decline = (ids: readonly string[], reason: string) => {
+  const decline = (row: string, ids: readonly string[], reason: string) => {
     const live = ids.filter(isWaiting);
+    refocus.current = { row, at: Date.now() };
     if (live.length) void session.decline(live, reason.trim() || undefined);
     setDeclining(null);
   };
@@ -109,7 +151,14 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
 
   const declineForm = (key: string) =>
     declining?.key === key ? (
-      <DeclineForm target={declining} onCancel={() => setDeclining(null)} onDecline={(reason) => decline(declining.ids, reason)} />
+      <DeclineForm
+        target={declining}
+        onCancel={() => {
+          refocus.current = { row: key, at: Date.now() };
+          setDeclining(null);
+        }}
+        onDecline={(reason) => decline(key, declining.ids, reason)}
+      />
     ) : null;
 
   const pausedLine = (
@@ -120,6 +169,36 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
     </p>
   );
 
+  const cardProps = {
+    ref: (el: HTMLElement | null) => {
+      root.current = el;
+    },
+    onPointerEnter: () => setHover(true),
+    onPointerLeave: () => setHover(false),
+    onFocus: () => {
+      focusWasInside.current = true;
+      setFocusIn(true);
+    },
+    onBlur: (e: FocusEvent<HTMLElement>) => {
+      const next = e.relatedTarget as Node | null;
+      if (next && e.currentTarget.contains(next)) return;
+      const leave = () => {
+        focusWasInside.current = false;
+        setFocusIn(false);
+      };
+      if (next) return leave();
+      // No new target: either focus left for nowhere (a click on the page), or the focused
+      // control went away because it was answered. In the second case keep holding until the
+      // refocus above lands, so a held arrival doesn't join in between.
+      const card = e.currentTarget;
+      window.setTimeout(() => {
+        if (refocus.current) return;
+        if (!card.isConnected || !card.contains(document.activeElement)) leave();
+      }, 0);
+    },
+  };
+  const footer = <CardFooter held={card.held.length} onShow={() => setJoinNow(true)} trail={latest} workerAnswering={worker} />;
+
   // One call: the plain card (Frame 4 and "File edit · Trust safe tools").
   if (items.length === 1) {
     const it = items[0]!;
@@ -128,24 +207,29 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
     const badge = toolBadge(it.toolName, it.risk);
     const files = session.changes?.files.length ?? 0;
     const branch = currentBranch(session.workspace, tools);
+    const from = agentKey(it);
     return (
-      <section className="dc-card" aria-label="Needs approval" onPointerEnter={() => setHover(true)} onPointerLeave={() => setHover(false)}>
+      <section className="dc-card single" aria-label="Needs approval" {...cardProps}>
         <div className="top">
           <span className={`badge ${badge.kind}`}>Needs approval</span>
-          <span className="t">{callTitle(it.toolName, it.input, { branch: branch === DETACHED ? null : branch, files })}</span>
-          {it.agentId !== session.rootAgentId && <span className="hint">from {agentLabel(agentKey(it))}</span>}
+          <span className="t" tabIndex={-1} data-heading="">
+            {callTitle(it.toolName, it.input, { branch: branch === DETACHED ? null : branch, files })}
+          </span>
+          {from && <span className="hint">from {agentLabel(from)}</span>}
         </div>
-        <ReviewBody item={it} />
+        <div className="dc-body">
+          <ReviewBody item={it} />
+        </div>
         {pausedLine}
-        <div className="acts">
+        <div className="acts" data-row="one">
           {answered && a ? (
             <span className={`badge ${a.approved ? "good" : "leaving"}`}>{answeredText(a.approved, a.record.remember)}</span>
           ) : (
             <>
-              <button type="button" className="btn green small" onClick={() => approve([it.toolId])}>
+              <button type="button" className="btn green small" data-answer="item" onClick={() => approve("one", [it.toolId])}>
                 Approve
               </button>
-              <AlwaysButton risk={it.risk} allowed={it.rememberAllowed} onClick={() => approve([it.toolId], true)} />
+              <AlwaysButton risk={it.risk} toolName={it.toolName} allowed={it.rememberAllowed} onClick={() => approve("one", [it.toolId], true)} />
               <button
                 type="button"
                 className="btn ghost small"
@@ -156,83 +240,93 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
               </button>
             </>
           )}
-          <span className="spacer" />
-          {latest && <SendStateTrail record={latest} workerAnswering={worker} />}
         </div>
         {declineForm("one")}
         <SendError answer={a} />
-        <p className="why">{it.rememberAllowed ? alwaysWhy(it.risk) : `${alwaysApproveReason(it.risk)}.`}</p>
-        <HeldSlot held={card.held.length} onShow={() => setHover(false)} />
+        <p className="why">{it.rememberAllowed ? alwaysWhy(it.risk) : `${alwaysApproveReason(it.risk, it.toolName)}.`}</p>
+        {footer}
       </section>
     );
   }
 
-  // Several calls: one stacked card.
+  // Several calls: one stacked card. The header stays put; the groups scroll inside a cap.
   const w = stack.waitingIds.length;
   return (
-    <section
-      className="dc-card stacked"
-      aria-label={stackHeading(w)}
-      onPointerEnter={() => setHover(true)}
-      onPointerLeave={() => setHover(false)}
-    >
-      <div className="top">
+    <section className="dc-card stacked" aria-label={stackHeading(w)} {...cardProps}>
+      <div className="top" data-row="all">
         <span className="badge edit">{w} need approval</span>
-        <span className="t" aria-live="polite">
+        <span className="t" aria-live="polite" tabIndex={-1} data-heading="">
           {stackHeading(w)}
         </span>
         <span className="spacer" />
-        <button type="button" className="btn green small all" disabled={w === 0} onClick={() => approve(approveAllTargets(stack))}>
+        <button type="button" className="btn green small all" data-answer="all" disabled={w === 0} onClick={() => approve("all", approveAllTargets(stack))}>
           Approve all {w}
         </button>
       </div>
-      <ul className="stack">
-        {stack.groups.map((g) => (
-          <GroupRows
-            key={g.toolName}
-            group={g}
-            open={open}
-            toggle={toggle}
-            answers={answers}
-            fresh={(id) => !initial.current!.has(id)}
-            agentKey={agentKey}
-            onApprove={approve}
-            onDecline={(target) => setDeclining(target)}
-            declining={declining}
-            declineForm={declineForm}
-          />
-        ))}
-      </ul>
+      <div className="dc-body">
+        <ul className="stack">
+          {stack.groups.map((g) => (
+            <GroupRows
+              key={g.toolName}
+              group={g}
+              open={open}
+              toggle={toggle}
+              answers={answers}
+              fresh={(id) => !initial.current!.has(id)}
+              agentKey={agentKey}
+              onApprove={approve}
+              onDecline={(target) => setDeclining(target)}
+              declining={declining}
+              declineForm={declineForm}
+            />
+          ))}
+        </ul>
+      </div>
       {pausedLine}
-      {latest && (
-        <div className="acts end">
-          <SendStateTrail record={latest} workerAnswering={worker} />
-        </div>
-      )}
-      <HeldSlot held={card.held.length} onShow={() => setHover(false)} />
+      {footer}
     </section>
   );
 }
 
 /**
- * Where held arrivals are announced. Always rendered, one line tall, as the card's last row:
- * the card sits on the composer and grows upward, so a notice that appeared would push every
- * button above it, including the one under the pointer (owner decision B).
+ * Where focus goes after an answer from row `row`: the next waiting call in the same group,
+ * else that group's row, else the next answer control on the card, else the card's heading.
  */
-function HeldSlot({ held, onShow }: { held: number; onShow(): void }) {
+export function nextFocus(card: HTMLElement, row: string): HTMLElement | null {
+  const anchor = card.querySelector<HTMLElement>(`[data-row="${CSS.escape(row)}"]`);
+  const usable = (list: Iterable<HTMLElement>) => [...list].filter((b) => !(b as HTMLButtonElement).disabled && b.isConnected);
+  const after = (b: HTMLElement) => !!anchor && !anchor.contains(b) && !!(anchor.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+  const group = anchor?.closest<HTMLElement>(".grp-wrap");
+  if (group) {
+    const inGroup = usable(group.querySelectorAll<HTMLElement>('[data-answer="item"]'));
+    const next = inGroup.find(after) ?? inGroup[0];
+    if (next) return next;
+    if (group.querySelector('[data-answer="group"]')) return group.querySelector<HTMLElement>("[data-group-toggle]");
+  }
+  const all = usable(card.querySelectorAll<HTMLElement>('[data-answer="item"], [data-answer="group"]'));
+  return all.find(after) ?? all[0] ?? card.querySelector<HTMLElement>("[data-heading]");
+}
+
+/**
+ * The card's last row, a fixed height whatever it shows: held arrivals ("1 more call is
+ * waiting."), else the delivery trail of the latest answer. The card sits on the composer and
+ * grows upward, so a row that appeared would push every button above it (owner decision B).
+ */
+function CardFooter({ held, onShow, trail, workerAnswering }: { held: number; onShow(): void; trail: SendRecord | null; workerAnswering: boolean }) {
   return (
-    <div className="held-slot">
-      <p className="held" role="status" title={held ? "It joins this card when you move the pointer off it." : undefined}>
+    <div className="dc-foot">
+      <p className="held" role="status">
         {held > 0 && (
           <>
             {held === 1 ? "1 more call is waiting." : `${held} more calls are waiting.`}
-            <span className="sr-only"> It joins this card when you move the pointer off it.</span>{" "}
+            <span className="sr-only"> It joins this card when you move the pointer or focus off it.</span>{" "}
             <button type="button" className="linkish" onClick={onShow}>
               Show now
             </button>
           </>
         )}
       </p>
+      {held === 0 && trail && <SendStateTrail record={trail} workerAnswering={workerAnswering} />}
     </div>
   );
 }
@@ -254,16 +348,16 @@ function alwaysWhy(risk: Risk): string {
     : `Always approve lasts for this session. You can undo it from the posture menu.`;
 }
 
-function AlwaysButton({ risk, allowed, onClick }: { risk: Risk; allowed: boolean; onClick(): void }) {
+function AlwaysButton({ risk, toolName, allowed, onClick, name }: { risk: Risk; toolName: string; allowed: boolean; onClick(): void; name?: string }) {
   const id = useId();
   if (allowed) {
     return (
-      <button type="button" className="btn secondary small" onClick={onClick}>
+      <button type="button" className="btn secondary small" aria-label={name} onClick={onClick}>
         {alwaysApproveLabel(risk)}
       </button>
     );
   }
-  const reason = alwaysApproveReason(risk);
+  const reason = alwaysApproveReason(risk, toolName);
   return (
     <>
       <button type="button" className="btn ghost small off" aria-disabled="true" aria-describedby={id} title={reason} onClick={(e) => e.preventDefault()}>
@@ -298,6 +392,8 @@ function SendError({ answer }: { answer: Answer | undefined }) {
   );
 }
 
+export const DECLINE_PLACEHOLDER = "Reason (optional). The agent sees this.";
+
 function DeclineForm({ target, onCancel, onDecline }: { target: DeclineTarget; onCancel(): void; onDecline(reason: string): void }) {
   const [reason, setReason] = useState("");
   const id = useId();
@@ -316,10 +412,9 @@ function DeclineForm({ target, onCancel, onDecline }: { target: DeclineTarget; o
       }}
     >
       <label htmlFor={id}>Reason for the agent</label>
-      <textarea id={id} rows={2} value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Don't install anything. Use what's in the repo." autoFocus />
-      <p className="hint">{DECLINE_HINT}</p>
+      <textarea id={id} rows={2} value={reason} onChange={(e) => setReason(e.target.value)} placeholder={DECLINE_PLACEHOLDER} autoFocus />
       <div className="acts">
-        <button type="submit" className="btn ghost small">
+        <button type="submit" className="btn ghost small" aria-label={target.name}>
           {target.label}
         </button>
         <button type="button" className="btn ghost small quiet" onClick={onCancel}>
@@ -337,7 +432,7 @@ interface GroupRowsProps {
   answers: ReadonlyMap<string, Answer>;
   fresh(id: string): boolean;
   agentKey(it: ApprovalItem): string | null;
-  onApprove(ids: readonly string[], remember?: boolean): void;
+  onApprove(row: string, ids: readonly string[], remember?: boolean): void;
   onDecline(target: DeclineTarget): void;
   declining: DeclineTarget | null;
   declineForm(key: string): ReactNode;
@@ -351,43 +446,62 @@ function GroupRows(p: GroupRowsProps) {
   const title = groupTitle(g);
   const badge = toolBadge(g.toolName, g.risk);
   const panel = useId();
+  const noun = callNoun(g.toolName, n);
+  // One fold (every call identical, or a single call): opening the group shows that fold's
+  // review and calls directly, with no second level to open.
+  const only = g.folds.length === 1 ? g.folds[0]! : null;
   return (
     <li className={`grp-wrap${expanded ? " open" : ""}`}>
-      <div className="grp">
-        <button type="button" className="chev" aria-expanded={expanded} aria-controls={panel} onClick={() => p.toggle(key)}>
+      <div className="grp" data-row={key}>
+        <button type="button" className="chev" data-group-toggle="" aria-expanded={expanded} aria-controls={panel} onClick={() => p.toggle(key)}>
           <span aria-hidden="true">{expanded ? "▾" : "▸"}</span>
           <span className={`badge ${badge.kind}`}>{badge.text}</span>
           <span className="title">
-            {title.text} {title.code && <span className="mono">{title.code}</span>} {title.fold && <span className="hint">{title.fold}</span>}
+            {title.text} {title.code && <span className="mono code">{title.code}</span>} {title.fold && <span className="hint">{title.fold}</span>}
           </span>
           <span className="sr-only">{expanded ? ", hide calls" : ", review each call"}</span>
         </button>
         <span className="spacer" />
-        {n > 0 && (
+        {n > 0 ? (
           <span className="grp-acts">
-            <button type="button" className="btn green small" onClick={() => p.onApprove(groupTargets(g))}>
+            <button type="button" className="btn green small" data-answer="group" aria-label={`Approve ${n} ${noun}`} onClick={() => p.onApprove(key, groupTargets(g))}>
               Approve {n}
             </button>
-            <AlwaysButton risk={g.risk} allowed={g.rememberAllowed} onClick={() => p.onApprove(groupTargets(g), true)} />
+            <AlwaysButton
+              risk={g.risk}
+              toolName={g.toolName}
+              allowed={g.rememberAllowed}
+              name={`${alwaysApproveLabel(g.risk)}, approving these ${n}`}
+              onClick={() => p.onApprove(key, groupTargets(g), true)}
+            />
             <button
               type="button"
               className="btn ghost small"
+              aria-label={`Decline ${n} ${noun}`}
               aria-expanded={p.declining?.key === key}
-              onClick={() => p.onDecline({ key, ids: groupTargets(g), label: `Decline ${n}` })}
+              onClick={() => p.onDecline({ key, ids: groupTargets(g), label: `Decline ${n}`, name: `Decline ${n} ${noun}` })}
             >
               Decline {n}
             </button>
           </span>
+        ) : (
+          <span className="badge good">All answered</span>
         )}
       </div>
       {p.declineForm(key)}
       {expanded && (
-        <ul className="items" id={panel}>
-          {!g.rememberAllowed && n > 0 && <li className="why">{alwaysApproveReason(g.risk)}.</li>}
-          {g.folds.map((f) => (
-            <FoldRows key={f.key} fold={f} {...p} />
-          ))}
-        </ul>
+        <div className="items-wrap" id={panel}>
+          {!g.rememberAllowed && n > 0 && <p className="why">{alwaysApproveReason(g.risk, g.toolName)}.</p>}
+          {only ? (
+            <FoldBody {...p} fold={only} />
+          ) : (
+            <ul className="items">
+              {g.folds.map((f) => (
+                <FoldRows key={f.key} {...p} fold={f} />
+              ))}
+            </ul>
+          )}
+        </div>
       )}
     </li>
   );
@@ -395,6 +509,43 @@ function GroupRows(p: GroupRowsProps) {
 
 function itemLabel(it: Pick<ApprovalItem, "toolName" | "input">): string {
   return argSummary(it.toolName, it.input) || it.toolName;
+}
+
+function fromHint(p: GroupRowsProps, it: ApprovalItem): string | null {
+  const key = p.agentKey(it);
+  return key ? `from ${agentLabel(key)}` : null;
+}
+
+/** A fold opened in place: its arguments or diff, then each call when there are several. */
+function FoldBody(p: GroupRowsProps & { fold: Fold }) {
+  const { fold: f } = p;
+  const label = itemLabel(f);
+  if (f.items.length === 1) {
+    return (
+      <div className="review">
+        <ReviewBody item={f.items[0]!} />
+      </div>
+    );
+  }
+  return (
+    <div className="review">
+      <ReviewBody item={f} />
+      <ul className="members">
+        {f.items.map((it, i) => (
+          <li key={it.toolId} className={p.fresh(it.toolId) ? "arrived" : undefined}>
+            <ItemRow
+              item={it}
+              label={`Call ${i + 1}`}
+              name={`call ${i + 1} of ${f.items.length}: ${label}`}
+              hint={fromHint(p, it)}
+              {...p}
+            />
+            {p.declineForm(`i:${it.toolId}`)}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
 }
 
 function FoldRows(p: GroupRowsProps & { fold: Fold }) {
@@ -412,7 +563,8 @@ function FoldRows(p: GroupRowsProps & { fold: Fold }) {
         <ItemRow
           item={it}
           label={label}
-          hint={[stat, `from ${agentLabel(p.agentKey(it))}`].filter(Boolean).join(" · ")}
+          name={`${callNoun(f.toolName, 1)}: ${label}`}
+          hint={[stat, fromHint(p, it)].filter(Boolean).join(" · ") || null}
           expanded={expanded}
           panel={panel}
           onToggle={() => p.toggle(key)}
@@ -431,18 +583,26 @@ function FoldRows(p: GroupRowsProps & { fold: Fold }) {
   const n = f.waiting.length;
   return (
     <li className={f.items.some((i) => p.fresh(i.toolId)) ? "arrived" : undefined}>
-      <div className={`item${n === 0 ? " done" : ""}`}>
+      <div className={`item${n === 0 ? " done" : ""}`} data-row={key}>
         <button type="button" className="chev" aria-expanded={expanded} aria-controls={panel} onClick={() => p.toggle(key)}>
           <span aria-hidden="true">{expanded ? "▾" : "▸"}</span>
           <span className="mono label">{label}</span>
           <span className="hint">
-            × {f.items.length}, same arguments{stat ? ` · ${stat}` : ""}
+            × {f.items.length}, {SAME}
+            {stat ? ` · ${stat}` : ""}
           </span>
         </button>
         <span className="spacer" />
         {n > 0 ? (
           <span className="item-acts">
-            <button type="button" className="ok" aria-label={`Approve ${n} identical calls: ${label}`} title={`Approve ${n}`} onClick={() => p.onApprove(f.waiting.map((i) => i.toolId))}>
+            <button
+              type="button"
+              className="ok"
+              data-answer="item"
+              aria-label={`Approve ${n} identical calls: ${label}`}
+              title={`Approve ${n}`}
+              onClick={() => p.onApprove(key, f.waiting.map((i) => i.toolId))}
+            >
               ✓<span className="n">{n}</span>
             </button>
             <button
@@ -450,7 +610,7 @@ function FoldRows(p: GroupRowsProps & { fold: Fold }) {
               className="no"
               aria-label={`Decline ${n} identical calls: ${label}`}
               title={`Decline ${n}`}
-              onClick={() => p.onDecline({ key: key, ids: f.waiting.map((i) => i.toolId), label: `Decline ${n}` })}
+              onClick={() => p.onDecline({ key, ids: f.waiting.map((i) => i.toolId), label: `Decline ${n}`, name: `Decline ${n} identical calls: ${label}` })}
             >
               ✕<span className="n">{n}</span>
             </button>
@@ -461,68 +621,65 @@ function FoldRows(p: GroupRowsProps & { fold: Fold }) {
       </div>
       {p.declineForm(key)}
       {expanded && (
-        <div className="review" id={panel}>
-          <ReviewBody item={f} />
-          <ul className="members">
-            {f.items.map((it, i) => (
-              <li key={it.toolId} className={p.fresh(it.toolId) ? "arrived" : undefined}>
-                <ItemRow item={it} label={`Call ${i + 1}`} hint={`from ${agentLabel(p.agentKey(it))}`} {...p} />
-                {p.declineForm(`i:${it.toolId}`)}
-              </li>
-            ))}
-          </ul>
+        <div id={panel}>
+          <FoldBody {...p} fold={f} />
         </div>
       )}
     </li>
   );
 }
 
+/**
+ * One call. Answered, it keeps its row and its height: a badge replaces the two buttons, and
+ * the delivery trail shows once, in the card's footer (M1).
+ */
 function ItemRow(
-  p: GroupRowsProps & { item: ApprovalItem; label: string; hint: string; expanded?: boolean; panel?: string; onToggle?(): void },
+  p: GroupRowsProps & { item: ApprovalItem; label: string; name: string; hint: string | null; expanded?: boolean; panel?: string; onToggle?(): void },
 ) {
   const a = p.answers.get(p.item.toolId);
   const answered = isAnswered(a);
+  const row = `i:${p.item.toolId}`;
+  const inner = (
+    <>
+      <span className="mono label">{p.label}</span>
+      {p.hint && <span className="hint">{p.hint}</span>}
+    </>
+  );
   const name = p.onToggle ? (
     <button type="button" className="chev" aria-expanded={p.expanded} aria-controls={p.panel} onClick={p.onToggle}>
       <span aria-hidden="true">{p.expanded ? "▾" : "▸"}</span>
-      <span className="mono label">{p.label}</span>
-      <span className="hint">{p.hint}</span>
+      {inner}
     </button>
   ) : (
-    <span className="chev static">
-      <span className="mono label">{p.label}</span>
-      <span className="hint">{p.hint}</span>
-    </span>
+    <span className="chev static">{inner}</span>
   );
   return (
     <>
-      <div className={`item${answered ? " done" : ""}`}>
+      <div className={`item${answered ? " done" : ""}`} data-row={row}>
         {name}
         <span className="spacer" />
-        {answered && a ? (
-          <>
+        <span className="item-acts">
+          {answered && a ? (
             <span className={`badge ${a.approved ? "good" : "leaving"}`}>{answeredText(a.approved, a.record.remember)}</span>
-            {a.phase !== "done" && <SendStateTrail record={a.record} />}
-          </>
-        ) : (
-          <span className="item-acts">
-            <button type="button" className="ok" aria-label={`Approve ${p.label}`} title="Approve" onClick={() => p.onApprove([p.item.toolId])}>
-              ✓
-            </button>
-            <button
-              type="button"
-              className="no"
-              aria-label={`Decline ${p.label}`}
-              title="Decline"
-              onClick={() => p.onDecline({ key: `i:${p.item.toolId}`, ids: [p.item.toolId], label: "Decline" })}
-            >
-              ✕
-            </button>
-          </span>
-        )}
+          ) : (
+            <>
+              <button type="button" className="ok" data-answer="item" aria-label={`Approve ${p.name}`} title="Approve" onClick={() => p.onApprove(row, [p.item.toolId])}>
+                ✓
+              </button>
+              <button
+                type="button"
+                className="no"
+                aria-label={`Decline ${p.name}`}
+                title="Decline"
+                onClick={() => p.onDecline({ key: row, ids: [p.item.toolId], label: "Decline", name: `Decline ${p.name}` })}
+              >
+                ✕
+              </button>
+            </>
+          )}
+        </span>
       </div>
       <SendError answer={a} />
     </>
   );
 }
-

@@ -40,7 +40,7 @@ describe("exit badge", () => {
   });
 
   it("pauses while no worker answers, and runs with a clock otherwise", () => {
-    expect(exitBadge(part("running"), { workerAnswering: false })).toEqual({ text: "paused · waiting for a worker", tone: "wait" });
+    expect(exitBadge(part("running"), { workerAnswering: false })).toEqual({ text: "paused · waiting for a Worker", tone: "wait" });
     expect(exitBadge(part("running"), { workerAnswering: true, elapsedMs: 12_400 })).toEqual({ text: "running 0:12", tone: "run" });
     expect(exitBadge(part("running"), { workerAnswering: true })).toEqual({ text: "running", tone: "run" });
     expect(exitBadge(part("awaiting_approval"))).toEqual({ text: "waiting for approval", tone: "wait" });
@@ -71,7 +71,7 @@ describe("live stream markers", () => {
 
   it("marks where the stream paused while no worker answers", () => {
     const lines = runLines(part("running"), { live: [out("tests/test_money.py ....\n")], workerAnswering: false, pausedAt: "14:02:11", sandbox: null, reattach: null });
-    expect(lines.at(-1)).toEqual({ kind: "pause", text: "── stream paused at 14:02:11 · waiting for a worker ──" });
+    expect(lines.at(-1)).toEqual({ kind: "pause", text: "── stream paused at 14:02:11 · waiting for a Worker ──" });
   });
 
   it("names the worker that reattached when telemetry says so", () => {

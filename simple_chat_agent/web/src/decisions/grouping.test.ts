@@ -59,7 +59,7 @@ describe("grouping and folding", () => {
     expect(cmds!.folds).toHaveLength(1);
     expect(cmds!.folds[0]!.items.map((i) => i.toolId)).toEqual(["c1", "c2"]);
     expect(groupTitle(edits!)).toEqual({ text: "Edit 3 files", code: null, fold: null });
-    expect(groupTitle(cmds!)).toEqual({ text: "Run", code: "pytest -q", fold: "× 2, same command" });
+    expect(groupTitle(cmds!)).toEqual({ text: "Run", code: "pytest -q", fold: "× 2, same arguments" });
     expect(stackHeading(s.waitingIds.length)).toBe("5 tool calls are waiting");
   });
 
@@ -88,8 +88,10 @@ describe("grouping and folding", () => {
     const s = buildStack([edit("e1", "a.py"), pytest("c1"), itemOf(pending("g1", "git_commit", { message: "m" }))], new Map());
     const live = s.groups.map((g) => g.rememberAllowed);
     expect(live).toEqual([true, false, false]);
-    expect(alwaysApproveReason(s.groups[1]!.risk)).toBe("Commits and shell commands need a yes each time");
-    expect(alwaysApproveReason(s.groups[2]!.risk)).toBe("Commits and shell commands need a yes each time");
+    // The greyed reason is specific to the class, and to commits (UX review nit).
+    expect(alwaysApproveReason(s.groups[1]!.risk, s.groups[1]!.toolName)).toBe("Shell commands need a yes each time");
+    expect(alwaysApproveReason(s.groups[2]!.risk, s.groups[2]!.toolName)).toBe("Commits need a yes each time");
+    expect(alwaysApproveReason("network", "fetch_url")).toBe("Network calls need a yes each time");
   });
 });
 

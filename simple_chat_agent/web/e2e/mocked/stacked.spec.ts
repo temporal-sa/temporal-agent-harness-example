@@ -22,7 +22,7 @@ test("stacked approvals: one card, two groups, × 2, per-item answers, Approve a
   await expect(card.getByRole("button", { name: "Approve all 5" })).toBeVisible();
 
   // Two groups: the edits and the command, the identical commands folded "× 2".
-  const groups = card.getByRole("listitem").filter({ has: page.getByRole("button", { name: /^Approve \d+$/ }) });
+  const groups = card.getByRole("listitem").filter({ has: page.getByRole("button", { name: /^Approve \d+ / }) });
   await expect(groups).toHaveCount(2);
   const edits = groups.filter({ hasText: "Edit 3 files" });
   const commands = groups.filter({ hasText: PYTEST });

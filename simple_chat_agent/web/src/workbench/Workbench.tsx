@@ -4,7 +4,7 @@
 
 import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
 
-import type { CodingSession, PlanItem, WorkbenchFocus, WorkbenchProps as SlotProps } from "../session";
+import type { CodingSession, PlanItem, ToolPart, WorkbenchFocus, WorkbenchProps as SlotProps } from "../session";
 import { count, hms } from "../recovery/format";
 import { artifactsOf, PREVIEW_SANDBOX, type ArtifactItem } from "./artifacts";
 import { fileChanges, fileStat, focusedFile, workspaceFacts, type WorkspaceFacts } from "./changes";
@@ -334,6 +334,9 @@ function TerminalPanel({ session, runs, facts }: { session: CodingSession; runs:
   const now0 = view(latest);
   return (
     <>
+      <p className="sr-only" role="status">
+        {runAnnouncement(String(latest.part.input.command ?? ""), latest.part.state, now0.badge, worker.answering)}
+      </p>
       {!sandbox.answering && !sandboxOnRun && (
         <p className="wb-sandbox" role="status">
           {SANDBOX_DOWN.replace("the command", "the call")}
@@ -368,6 +371,28 @@ function TerminalPanel({ session, runs, facts }: { session: CodingSession; runs:
   );
 }
 
+/**
+ * What screen readers hear about the latest run: once when it starts, once when it pauses, and
+ * once with its exit badge (UX review M7). The output itself isn't a live region: a test run
+ * would read every line. The text is stable while a run goes on (no clock), so it is announced
+ * only when it changes.
+ */
+export function runAnnouncement(command: string, state: ToolPart["state"], badge: ExitBadge, workerAnswering: boolean): string {
+  switch (state) {
+    case "running":
+    case "approved":
+    case "awaiting_callback":
+      return workerAnswering ? `Running ${command}` : `${command} paused, waiting for a Worker`;
+    case "done":
+    case "failed":
+      return `${command} finished: ${badge.text}`;
+    case "denied":
+      return `${command} declined`;
+    default:
+      return "";
+  }
+}
+
 export function Badge({ badge }: { badge: ExitBadge }) {
   return <span className={`wb-exit ${badge.tone}`}>{badge.text}</span>;
 }
@@ -383,9 +408,8 @@ function Term({ lines, live, label }: { lines: TermLine[]; live: boolean; label:
     <div
       ref={ref}
       className="wb-term"
-      role="log"
+      role="region"
       aria-label={label}
-      aria-live={live ? "polite" : "off"}
       tabIndex={0}
       onScroll={(e) => {
         const el = e.currentTarget;

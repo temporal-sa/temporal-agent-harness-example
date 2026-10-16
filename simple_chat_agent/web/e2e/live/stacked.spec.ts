@@ -4,7 +4,7 @@
 // for five calls in one turn: three different texts and one text twice.
 //
 // Everything is one tool, so Eng W's grouping (decisions/grouping.ts, labels.ts) shows one
-// group, "gated_echo × 5" with "Approve 5" / "Decline 5"; opened, it lists the three distinct
+// group, "gated_echo · 5 calls" with "Approve 5" / "Decline 5"; opened, it lists the three distinct
 // calls as their own rows and the identical pair as one fold row, "× 2, same arguments".
 // One call is answered alone, then Approve all answers the four still waiting. Each call must
 // run exactly once: one tool_end per tool id, distinct activity ids, attempt 1.
@@ -99,15 +99,15 @@ test("3e live: five gated calls, one card, answer one alone, Approve all the res
   await expect(page.getByRole("region", { name: /tool calls? (is|are) waiting$|^Needs approval$/ })).toHaveCount(1);
   await expect(card.getByRole("button", { name: "Approve all 5" })).toBeVisible();
 
-  // One tool, so one group: "gated_echo × 5", Approve 5.
-  const group = card.getByRole("listitem").filter({ has: page.getByRole("button", { name: /^Approve \d+$/ }) });
+  // One tool, so one group: "gated_echo · 5 calls", Approve 5.
+  const group = card.getByRole("listitem").filter({ has: page.getByRole("button", { name: /^Approve \d+ / }) });
   await expect(group).toHaveCount(1);
-  await expect(group).toContainText("gated_echo × 5");
+  await expect(group).toContainText("gated_echo · 5 calls");
   await expect(group.getByRole("button", { name: "Approve 5" })).toBeVisible();
 
   // Opened: three single rows and the identical pair folded "× 2, same arguments".
-  await group.getByRole("button", { name: /gated_echo × 5/ }).click();
-  for (const t of TEXTS) await expect(card.getByRole("button", { name: `Approve ${args(t)}`, exact: true })).toBeVisible();
+  await group.getByRole("button", { name: /gated_echo · 5 calls/ }).click();
+  for (const t of TEXTS) await expect(card.getByRole("button", { name: `Approve gated_echo call: ${args(t)}`, exact: true })).toBeVisible();
   const pair = card.getByRole("button", { name: /× 2, same arguments/ });
   await expect(pair).toHaveCount(1);
   await expect(pair).toContainText(args(TWICE));

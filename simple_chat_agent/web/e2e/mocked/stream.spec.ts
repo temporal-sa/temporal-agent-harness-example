@@ -52,13 +52,13 @@ test("worker lost: banner, then the divider goes from Checking… to confirmed n
   const banner = page.getByRole("status", { name: "Worker isn't answering" });
   await expect(banner).toBeVisible();
   await expect(banner).toContainText("Saved in Temporal:");
-  await expect(banner).toContainText("for another worker to pick up the test run");
+  await expect(banner).toContainText("for another Worker to pick up the test run");
   await expect(page.getByRole("status").filter({ hasText: "Worker isn't answering" }).first()).toBeVisible();
 
   // Another worker takes over: the live (unconfirmed) recovery marker.
   await api.push(id, [workerBack(root), recovery(root, lostAt, false)]);
   await expect(banner).toHaveCount(0);
-  const divider = page.getByRole("region", { name: /^Recovered · worker lost at/ });
+  const divider = page.getByRole("region", { name: /^(Another Worker took over · checking|Recovered · Worker lost at)/ });
   await expect(divider).toBeVisible();
   await expect(divider).toContainText("Checking…");
   await expect(page.getByText("Work kept after worker loss (this session)")).toBeVisible();
