@@ -88,7 +88,9 @@ def create_agent_router(
 
     @router.post("/sessions")
     async def create_session(body: CreateSession, uid: str = Depends(user_id)):
-        if not is_allowed(body.model):
+        # The configured allowlist, not this process's keys: the API holds no LLM keys. The
+        # worker re-checks against the models it can actually call.
+        if not is_allowed(body.model, require_keys=False):
             return _error(422, "model_not_allowed", f"{body.model.registry_key} is not available.")
         session_id = f"coding-agent-{uuid.uuid4().hex[:16]}"
         data = CodingAgentInit(

@@ -13,6 +13,7 @@
 
 | Date | Version | Change | By |
 |---|---|---|---|
+| 2026-10-16 | 1.1 | **P0 spike complete; go/no-go memo recommends GO for P1** (`docs/decisions/P0-go-no-go.md`). All 9 validation steps passed and no kill criterion fired. Design inputs for P1: per-turn byte growth (enforce A17/A20 plus offload, re-measure with a 30-tool Sonnet turn), and bridge-acknowledged truncation at continue-as-new (P2). Seven ecosystem bugs to file upstream. Awaiting owner go for P1. | PM |
 | 2026-10-16 | 1.0 | **Owner approved the plan (PRD v0.3 → v1.0)** by `/yes` in chat. Low-stakes defaults applied, unanswered: D5 rewrite `basic_file_agent` in P4; D7 MCP off in catalog, on locally; D8 console on in catalog once cross-user tests pass; D9 catalog audience is employees only. Eng work begins with the P0 spike on branch `refactor/official-harness`. | Owner |
 | 2026-10-16 | 0.3 | **Owner closed D2:** the catalog brokers the LLM keys at deploy time; this project never provisions or supplies its own keys. Our hard spend caps (A21) still apply. Local dev pulls the shared keys via `scripts/dev-secrets.sh`. | Owner |
 | 2026-10-16 | 0.3 | **Owner accepted D1:** build both judges behind one switch; our LLM judge (Claude Haiku tier) is active; Jev takes over when `TYPESAFE_API_KEY` is set. Approved by `/yes` in chat. | Owner |

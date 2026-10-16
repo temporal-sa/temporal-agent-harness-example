@@ -240,8 +240,15 @@ class ExecutorFilesConfinementTests(_ExecutorFilesTestBase):
             "outside_workspace",
         )
         self.assertEqual(outside.read_text(encoding="utf-8"), "sibling secret")
-        # Reads are refused too: the second link may live outside the workspace.
-        self.assertCode(self.call("read", path="linked.txt"), "outside_workspace")
+        # Reads are allowed: package managers hard-link files into node_modules/.venv.
+        self.assertEqual(self.call("read", path="linked.txt").status_code, 200)
+
+    def test_offset_inside_a_character_is_adjusted(self) -> None:
+        (self.workspace / "m.txt").write_text("éé", encoding="utf-8")  # c3 a9 c3 a9
+        body = self.call("read", path="m.txt", offset=1, length=10).json()
+        self.assertEqual((body["encoding"], body["offset"], body["content"]), ("utf-8", 2, "é"))
+        tiny = self.call("read", path="m.txt", offset=0, length=1).json()
+        self.assertEqual((tiny["content"], tiny["length"]), ("é", 2))
 
     def test_range_read_ending_mid_character_stays_text(self) -> None:
         # "é" is two bytes; a range that ends between them must not turn the read binary.

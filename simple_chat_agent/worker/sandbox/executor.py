@@ -598,12 +598,13 @@ def _require_regular(st: os.stat_result, shown: str, *, for_write: bool) -> None
             "a directory" if stat_module.S_ISDIR(st.st_mode) else "not a regular file"
         )
         raise _FileOpError("not_regular_file", f"{shown} is {kind}.")
-    if st.st_nlink > 1:
-        # Reads too: a second link may point at a file outside this workspace.
-        verb = "modify" if for_write else "read"
+    if for_write and st.st_nlink > 1:
+        # Writes only. Package managers (pnpm, uv link-mode=hardlink) fill node_modules and
+        # .venv with multiply-linked files, so refusing reads would break normal work. A
+        # sandboxed process can only link files it can already reach, so reads gain little.
         raise _FileOpError(
             "outside_workspace",
-            f"{shown} has {st.st_nlink} hard links; refusing to {verb} a file "
+            f"{shown} has {st.st_nlink} hard links; refusing to modify a file "
             "that may be shared with a path outside the workspace.",
         )
 
@@ -737,7 +738,19 @@ def _op_read(root_fd: int, request: FileReadRequest) -> dict[str, Any]:
                 limit=MAX_FILE_READ_BYTES,
             )
         data = _read_exact(fd, offset, length)
+        # A model-chosen offset can land inside a multibyte character: skip up to 3 leading
+        # continuation bytes and report the adjusted offset.
+        lead = 0
+        while offset > 0 and lead < 3 and lead < len(data) and 0x80 <= data[lead] <= 0xBF:
+            lead += 1
+        if lead:
+            offset += lead
+            data = data[lead:]
         content, encoding = _encode_content(data)
+        # The whole range sat inside one character: read through to its end, a byte at a time.
+        while encoding == "utf-8" and data and not content and len(data) < 4 and offset + len(data) < size:
+            data += _read_exact(fd, offset + len(data), 1)
+            content, encoding = _encode_content(data)
         # Bytes actually returned (a trailing partial character may have been held back).
         returned = len(content.encode("utf-8")) if encoding == "utf-8" else len(data)
         return {

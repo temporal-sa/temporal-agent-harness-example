@@ -45,11 +45,13 @@ class ProviderModels:
         return self.models[0]
 
 
-def allowlist() -> dict[Provider, ProviderModels]:
-    """The allowed models per provider, for providers whose key is configured."""
+def allowlist(*, require_keys: bool = True) -> dict[Provider, ProviderModels]:
+    """The allowed models per provider. On the worker (``require_keys``), only providers
+    whose key is configured; the API, which holds no LLM keys, passes ``require_keys=False``
+    and gets the configured list."""
     result: dict[Provider, ProviderModels] = {}
     for provider, defaults in DEFAULT_ALLOWLIST.items():
-        if not any(os.environ.get(name) for name in _KEY_ENV[provider]):
+        if require_keys and not any(os.environ.get(name) for name in _KEY_ENV[provider]):
             continue
         override = os.environ.get(f"AGENT_MODELS_{provider.upper()}", "")
         names = tuple(n.strip() for n in override.split(",") if n.strip()) or defaults
@@ -57,8 +59,8 @@ def allowlist() -> dict[Provider, ProviderModels]:
     return result
 
 
-def is_allowed(choice: ModelChoice) -> bool:
-    entry = allowlist().get(choice.provider)
+def is_allowed(choice: ModelChoice, *, require_keys: bool = True) -> bool:
+    entry = allowlist(require_keys=require_keys).get(choice.provider)
     return entry is not None and choice.model in entry.models
 
 

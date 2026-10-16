@@ -164,7 +164,13 @@ class CodingAgent:
         self._stream.detach_pollers()
         await workflow.wait_condition(workflow.all_handlers_finished)
         if harness_ext.is_closed(self._runner):
-            # A close arrived during the handoff: finish this run instead of continuing.
+            # A close arrived during the handoff: finish this run instead of continuing, and
+            # tell senders their buffered messages won't run.
+            for message in self._deferred:
+                harness_ext.publish_rejection(
+                    self._runner, message_id=message.request_id, reason="The session closed."
+                )
+            self._deferred = []
             self._continuing = False
             return
         # Carry only the tail of the event log. Offsets stay monotonic; a reader that was
@@ -342,6 +348,7 @@ class CodingAgent:
             return Ack(ok=False, detail=f"{msg.model.registry_key} is not an allowed model")
         if self._run_task is None:
             self._model = msg.model
+            self._pending_model = None
             return Ack(detail=f"Now using {msg.model.registry_key}.")
         self._pending_model = msg.model
         return Ack(detail=f"Switching to {msg.model.registry_key} from the next turn.")

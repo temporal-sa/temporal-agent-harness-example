@@ -338,7 +338,7 @@ def is_cancellation(exc: BaseException) -> bool:
     if isinstance(exc, (asyncio.CancelledError, TurnInterrupted, TemporalCancelled)):
         return True
     if isinstance(exc, ActivityError):
-        return isinstance(exc.cause, TemporalCancelled) or "cancel" in str(exc).lower()
+        return isinstance(exc.cause, TemporalCancelled)
     return False
 
 
@@ -349,8 +349,20 @@ def publish_rejection(runner: AgentWorkflowRunner, *, message_id: str, reason: s
     ``message_handler_error`` carrying the message's id does the job: the client marks that
     pending message as failed with the reason, and the bridge stops counting it as pending.
     """
-    from temporal_agent_harness.harness.agent_protocol import MessageHandlerError
+    from temporal_agent_harness.harness.agent_protocol import (
+        MessageAccepted,
+        MessageDisposition,
+        MessageHandlerError,
+    )
 
+    # Accepted first, so a client that hasn't yet matched its pending send still creates
+    # the message before marking it failed (the projection ignores errors for unknown ids).
+    runner._pub(
+        "",
+        0,
+        MessageAccepted(handler="", payload={}, disposition=MessageDisposition.QUEUED),
+        message_id=message_id,
+    )
     runner._pub("", 0, MessageHandlerError(message=reason), message_id=message_id)
 
 

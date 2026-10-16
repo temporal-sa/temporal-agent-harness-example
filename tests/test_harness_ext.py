@@ -82,6 +82,13 @@ class HarnessInternals(unittest.TestCase):
             self.assertIn(attr, src)
         self.assertTrue(callable(getattr(PydanticAIStreamObserver, "_emit_tool_requested", None)))
 
+    def test_adapter_helpers_exist(self) -> None:
+        """per_run_toolset reuses the harness adapter's private schema and runner helpers."""
+        from temporal_agent_harness.ai_sdks import pydantic_ai_harness as h
+
+        self.assertTrue(callable(getattr(h, "_tool_schema", None)))
+        self.assertTrue(callable(getattr(h, "_runner_from_ctx", None)))
+
     def test_harness_handler_still_calls_usage_as_method(self) -> None:
         """If upstream fixes this, harness_ext.stream_usage becomes unnecessary (harmless)."""
         from temporal_agent_harness.ai_sdks import pydantic_ai_harness

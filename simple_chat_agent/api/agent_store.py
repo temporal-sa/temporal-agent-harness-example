@@ -192,12 +192,14 @@ class AgentStore:
         """A message went out through the front door; it is pending until its turn starts,
         or until the agent rejects it. A retry of a message that already left the pending
         set is not re-added."""
-        if await self.r.sismember(self._k(session, "done"), message_id):
-            return
-        pipe = self.r.pipeline(transaction=True)
-        pipe.sadd(self._k(session, "p"), message_id)
-        pipe.expire(self._k(session, "p"), session_ttl_seconds())
-        await pipe.execute()
+        await self.r.eval(
+            _ADD_PENDING_UNLESS_DONE,
+            2,
+            self._k(session, "p"),
+            self._k(session, "done"),
+            message_id,
+            session_ttl_seconds(),
+        )
 
     async def clear_pending(self, session: str) -> None:
         """The session ended: nothing it held will ever start."""
@@ -206,10 +208,8 @@ class AgentStore:
     # -- forwarder lease ---------------------------------------------------------
 
     async def acquire_lease(self, session: str, holder: str, ttl_ms: int = 15_000) -> bool:
-        key = self._k(session, "lease")
-        if await self.r.set(key, holder, nx=True, px=ttl_ms):
-            return True
-        return await self.renew_lease(session, holder, ttl_ms)
+        """Take the lease, or extend it if ``holder`` already has it (one atomic step)."""
+        return bool(await self.r.eval(_ACQUIRE_OR_RENEW, 1, self._k(session, "lease"), holder, ttl_ms))
 
     async def renew_lease(self, session: str, holder: str, ttl_ms: int = 15_000) -> bool:
         """Extend the lease only if ``holder`` still owns it (atomic compare-and-set)."""
@@ -219,6 +219,23 @@ class AgentStore:
         """Delete the lease only if ``holder`` still owns it (atomic compare-and-delete)."""
         await self.r.eval(_DELETE_IF_HOLDER, 1, self._k(session, "lease"), holder)
 
+
+_ADD_PENDING_UNLESS_DONE = """
+if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 0 then
+  redis.call('SADD', KEYS[1], ARGV[1])
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+"""
+
+_ACQUIRE_OR_RENEW = """
+local current = redis.call('GET', KEYS[1])
+if current == false or current == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+  return 1
+end
+return 0
+"""
 
 _RENEW_IF_HOLDER = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then

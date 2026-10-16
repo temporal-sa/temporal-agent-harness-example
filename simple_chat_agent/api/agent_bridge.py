@@ -79,7 +79,10 @@ class Bridge:
 
     async def _run(self, session: str) -> None:
         if not await self._store.acquire_lease(session, self._holder):
-            return  # another replica is forwarding this session
+            # Another replica is forwarding this session.
+            if self._tasks.get(session) is asyncio.current_task():
+                self._tasks.pop(session, None)
+            return
         renew = asyncio.create_task(self._renew(session))
         wake = self._wake.setdefault(session, asyncio.Event())
         idle_for = 0.0
@@ -103,6 +106,11 @@ class Bridge:
                     idle_for += backoff
                     backoff = min(backoff * 2, 15.0)
                     continue
+                if not forwarded and (await self._store.meta(session)).pending:
+                    # Attach on a closed, idle workflow returns nothing without raising.
+                    if await self._session_closed(session):
+                        await self._store.clear_pending(session)
+                        return
                 idle_for = 0.0 if forwarded else idle_for + IDLE_RECHECK_SECONDS
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(wake.wait(), timeout=IDLE_RECHECK_SECONDS)
