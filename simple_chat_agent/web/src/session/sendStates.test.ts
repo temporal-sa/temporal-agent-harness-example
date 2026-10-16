@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { advance, approvalPhase, landed, messagePhase, observe, startRecord, stuckInTemporal, WAITING_FOR_WORKER_MS, type StreamView } from "./sendStates";
+import { recordForUnsent, advance, approvalPhase, landed, messagePhase, observe, startRecord, stuckInTemporal, WAITING_FOR_WORKER_MS, type StreamView } from "./sendStates";
 import type { Message, Rejection, ToolPart } from "./types";
 
 const msg = (over: Partial<Message>): Message =>
@@ -139,5 +139,16 @@ describe("waiting for a worker", () => {
     const r = landed(startRecord("s1", "message", 0), 1000, "m1");
     expect(stuckInTemporal([r], 1000 + WAITING_FOR_WORKER_MS - 1)).toBe(false);
     expect(stuckInTemporal([r], 1000 + WAITING_FOR_WORKER_MS)).toBe(true);
+  });
+});
+
+describe("unsent messages find their record (UX verification 3)", () => {
+  it("by the error text for a failed send, else the send still going", () => {
+    const failed = { ...advance(startRecord("a", "message", 0), "failed", 1, "Bad Gateway", { status: 502 }) };
+    const going = startRecord("b", "steer", 2);
+    const records = [failed, going];
+    expect(recordForUnsent(records, { id: "local-1", handler: "chat", status: "error", error: "Bad Gateway" })).toBe(failed);
+    expect(recordForUnsent(records, { id: "local-2", handler: "steer", status: "sending", error: null })).toBe(going);
+    expect(recordForUnsent(records, { id: "local-3", handler: "chat", status: "error", error: "other" })).toBeUndefined();
   });
 });

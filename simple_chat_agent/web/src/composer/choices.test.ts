@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { alwaysApprovedText, pickerState, postureLabel, postureOptions } from "./choices";
+import { alwaysApprovedText, pickerState, postureLabel, postureOptions, postureShort } from "./choices";
 import { advance, landed, startRecord } from "../session/sendStates";
 import type { AgentConfig } from "../session";
 
@@ -44,3 +44,11 @@ describe("posture menu", () => {
   });
 });
 
+
+describe("phone labels (UX verification 4)", () => {
+  it("shortens the posture for the one-row composer", () => {
+    expect(postureShort("auto")).toBe("Auto");
+    expect(postureShort("trust_safe")).toBe("Safe");
+    expect(postureShort(null)).toBe("Approvals");
+  });
+});

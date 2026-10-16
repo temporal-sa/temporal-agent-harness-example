@@ -17,7 +17,7 @@ export interface ErrorLike {
 const BY_CODE: Record<string, string> = {
   // API (agent_routes.py)
   not_found: "No such session. It doesn't exist, or it belongs to someone else.",
-  session_closed: "This session has ended. Start a new session to keep going.",
+  session_closed: "This session is closed. Start a new one.",
   model_not_allowed: "That model isn't available here. Pick another one.",
   posture_not_allowed: "That approval setting isn't available here. Pick another one.",
   seed_failed: "Couldn't set up the demo workspace. Nothing was started; try again in a moment.",
@@ -48,7 +48,7 @@ const BY_CODE: Record<string, string> = {
 };
 
 const BY_STATUS = (status: number): string | null => {
-  if (status === 0) return "Couldn't reach the app. Check your connection; your session is safe in Temporal.";
+  if (status === 0) return "Couldn't reach the app. Check your connection and try again; your session is safe in Temporal.";
   if (status === 401) return "You're signed out. Reload the page to sign in again.";
   if (status === 403 || status === 404) return BY_CODE.not_found ?? null;
   if (status === 413) return BY_CODE.too_large ?? null;

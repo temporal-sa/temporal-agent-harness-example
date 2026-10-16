@@ -97,3 +97,10 @@ export function escapeStops(mode: ComposerMode, target: Element | null, alreadyH
   if (target.closest('[role="dialog"], [aria-modal="true"], [role="menu"], [data-slot="decisions"]')) return false;
   return target.closest('.composer, [data-slot="transcript"]') !== null;
 }
+
+const SHORT: Record<string, string> = { ask_everything: "Ask all", trust_safe: "Safe", auto: "Auto", never_ask: "Never" };
+
+/** A short posture label for the phone's one-row composer (the button's name stays full). */
+export function postureShort(id: string | null): string {
+  return (id && SHORT[id]) || "Approvals";
+}

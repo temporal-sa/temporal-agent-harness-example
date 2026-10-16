@@ -22,6 +22,7 @@ import {
   currentModel,
   currentPosture,
   modelAppliesNextTurn as deriveModelAppliesNextTurn,
+  modelInUse as deriveModelInUse,
   sessionStatus,
   subagentsOf,
   toolIndex,
@@ -295,6 +296,7 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
 
     model,
     modelAppliesNextTurn: deriveModelAppliesNextTurn(h.messages, h.agentStatus),
+    modelInUse: deriveModelInUse(h.messages, seed.model ?? null, h.agentStatus),
     posture,
     alwaysApproved: always,
 

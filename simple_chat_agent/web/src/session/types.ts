@@ -418,6 +418,8 @@ export interface CodingSession {
   model: ModelChoice | null;
   /** True while a set_model sent during the open turn waits for the next turn. */
   modelAppliesNextTurn: boolean;
+  /** The model the open turn actually runs on (the previous one while a change waits). */
+  modelInUse: ModelChoice | null;
   posture: Posture | null;
   /** Tool names approved with "Always approve" this session (root agent), emptied once a
    *  forget_always_allowed is admitted. */

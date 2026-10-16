@@ -169,3 +169,35 @@ export const WAITING_FOR_WORKER_MS = 5_000;
 export function stuckInTemporal(records: readonly SendRecord[], now: number): boolean {
   return records.some((r) => r.phase === "in_temporal" && now - (r.at.in_temporal ?? now) >= WAITING_FOR_WORKER_MS);
 }
+
+const KIND_OF_HANDLER: Record<string, SendKind> = {
+  chat: "message",
+  steer: "steer",
+  interrupt: "interrupt",
+  set_model: "set_model",
+  set_posture: "set_posture",
+  forget_always_allowed: "forget_always_allowed",
+};
+
+/**
+ * The send record behind a message the stream hasn't admitted. The harness keeps it under a
+ * local id that our records never see, so match on what we do know: its handler, and for a
+ * failed send the error text (the same Error reached both), else the oldest send still going.
+ */
+export function recordForUnsent(
+  records: readonly SendRecord[],
+  message: Pick<Message, "id" | "handler" | "status" | "error">,
+): SendRecord | undefined {
+  const byId = records.find((r) => r.messageId === message.id);
+  if (byId) return byId;
+  const kind = KIND_OF_HANDLER[message.handler];
+  if (!kind) return undefined;
+  if (message.status === "error") {
+    for (let i = records.length - 1; i >= 0; i--) {
+      const r = records[i]!;
+      if (r.kind === kind && r.phase === "failed" && (message.error === null || r.error === message.error)) return r;
+    }
+    return undefined;
+  }
+  return records.find((r) => r.kind === kind && r.phase === "sending");
+}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { alwaysApprovedFrom, currentModel, currentPosture, sessionStatus, subagentsOf, toChatAttachments, visibleMessages } from "./derive";
+import { modelInUse, alwaysApprovedFrom, currentModel, currentPosture, sessionStatus, subagentsOf, toChatAttachments, visibleMessages } from "./derive";
 import { HEALTHY } from "./telemetry";
 import type { AgentNode, Message, PendingApproval } from "./types";
 
@@ -98,5 +98,15 @@ describe("settings replies (SettingsAck)", () => {
   it("applies the asked-for value while the reply is pending", () => {
     const pending = control("set_posture", { posture: "auto" }, { status: "running", output: null, endedAt: null });
     expect(currentPosture([pending], "trust_safe")).toBe("auto");
+  });
+});
+
+describe("model in use (UX verification nit)", () => {
+  it("is the previous model while a change waits for the next turn", () => {
+    const seed = { provider: "anthropic" as const, model: "claude-sonnet-5-5" };
+    const chat = control("chat", { text: "go" }, { turnNumber: 2, status: "running" });
+    const change = control("set_model", { model: { provider: "anthropic", model: "claude-opus-5" } }, { turnNumber: 2 });
+    expect(modelInUse([chat, change], seed, "busy")).toEqual(seed);
+    expect(modelInUse([chat, change], seed, "idle")).toMatchObject({ model: "claude-opus-5" });
   });
 });

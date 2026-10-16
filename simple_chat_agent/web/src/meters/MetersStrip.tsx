@@ -9,6 +9,8 @@ const PROVIDER_LABELS: Record<string, string> = { anthropic: "Anthropic", openai
 
 export interface MeterValues {
   hero: string | null;
+  /** The phone's one-line strip: just the tokens kept, or "Checking…". */
+  heroShort: string | null;
   heroConfirmed: boolean;
   tokens: string;
   tokensReported: boolean;
@@ -43,7 +45,9 @@ export function meterValues(telemetry: SessionTelemetry): MeterValues {
   const tokens = tokensValue(totals);
   const cache = cacheValue(totals);
   let hero: string | null = null;
+  let heroShort: string | null = null;
   if (recoveryTotals.count > 0) {
+    heroShort = recoveryTotals.confirmed ? `${formatTokens(recoveryTotals.kept.tokensIn + recoveryTotals.kept.tokensOut)} tokens` : CHECKING;
     const k = recoveryTotals.kept;
     hero = recoveryTotals.confirmed
       ? `${plural(k.modelCalls, "model call")} · ${formatTokens(k.tokensIn + k.tokensOut)} tokens · ${plural(k.toolCalls, "tool call")}`
@@ -54,6 +58,7 @@ export function meterValues(telemetry: SessionTelemetry): MeterValues {
     .join(" · ");
   return {
     hero,
+    heroShort,
     heroConfirmed: recoveryTotals.confirmed,
     tokens: tokens.text,
     tokensReported: tokens.reported,
@@ -105,9 +110,9 @@ export function MetersStrip({ telemetry, modelLabel }: { telemetry: SessionTelem
         </span>
       </div>
       <div className="meters-compact" role="group" aria-label="Session meters">
-        {v.hero !== null && (
+        {v.heroShort !== null && (
           <span>
-            Kept <b className="g">{v.hero}</b>
+            <b className="g">{v.heroShort}</b> kept
           </span>
         )}
         <span>

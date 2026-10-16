@@ -5,12 +5,15 @@
 import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 
 export function Menu({
+  rootClass,
   label,
   buttonLabel,
   buttonClass,
   buttonContent,
   children,
 }: {
+  /** Extra class on the wrapper (layout hooks). */
+  rootClass?: string;
   label: string;
   /** The button's accessible name, e.g. "Model: GPT-5.5". */
   buttonLabel?: string;
@@ -56,7 +59,7 @@ export function Menu({
   }
 
   return (
-    <div className="menu-root" ref={root} onKeyDown={onKeyDown}>
+    <div className={`menu-root${rootClass ? ` ${rootClass}` : ""}`} ref={root} onKeyDown={onKeyDown}>
       <button
         ref={button}
         type="button"

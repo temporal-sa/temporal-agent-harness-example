@@ -11,6 +11,7 @@ import { StreamingMarkdown } from "./Markdown";
 import { ErrorNote } from "./ErrorNote";
 import { errorCopy } from "../session/errors";
 import { settingsAck } from "../session/derive";
+import { recordForUnsent } from "../session/sendStates";
 import { SubagentCard } from "./SubagentCard";
 import { Thinking } from "./Thinking";
 import { ToolGroup, ToolRow } from "./ToolRow";
@@ -249,8 +250,17 @@ export function Transcript() {
   );
 }
 
+/** "Not sent." and why, from the send's error code and status (UX verification 3). */
+export function notSentText(record: SendRecord | undefined, message: Pick<Message, "error">): string {
+  const why = errorCopy(
+    record ? { code: record.errorCode, status: record.errorStatus, message: record.error } : { message: message.error },
+    "Check your connection and try again.",
+  );
+  return `Not sent. ${why.text}`;
+}
+
 function UnsentMessage({ message, session }: { message: Message; session: CodingSession }) {
-  const record = session.sendFor({ messageId: message.id });
+  const record = recordForUnsent(session.sends, message);
   return (
     <div className="user-turn">
       <div className={`msg-user${message.handler === "steer" ? " steer" : ""}`}>
@@ -259,9 +269,7 @@ function UnsentMessage({ message, session }: { message: Message; session: Coding
       </div>
       {message.status === "error" ? (
         <div className="notice err" role="alert">
-          <span>
-            Not sent. {errorCopy(record ? { code: record.errorCode, status: record.errorStatus, message: record.error } : { message: message.error }, "Check your connection and try again.").text}
-          </span>
+          <span title={record?.error ?? message.error ?? undefined}>{notSentText(record, message)}</span>
           <button type="button" className="btn ghost small" onClick={() => session.dismissUnsent(message.id)}>
             Dismiss
           </button>
@@ -277,18 +285,42 @@ function UnsentMessage({ message, session }: { message: Message; session: Coding
  *  offers a way back. */
 export function TranscriptPane({ value }: { value: TranscriptContextValue }) {
   const scroller = useRef<HTMLDivElement>(null);
+  const content = useRef<HTMLDivElement>(null);
   const [following, setFollowing] = useState(true);
   const followingRef = useRef(true);
+  // Our own scrolls fire scroll events too; only the user's scrolling changes "following".
+  const ours = useRef(false);
 
+  const pin = () => {
+    const el = scroller.current;
+    if (!el || !followingRef.current) return;
+    const bottom = el.scrollHeight - el.clientHeight;
+    if (Math.abs(el.scrollTop - bottom) < 1) return;
+    ours.current = true;
+    el.scrollTop = bottom;
+  };
+
+  // New frames, and any growth of the column (smoothed typing, a card opening, a row
+  // expanding) or of the pane itself (the decision card taking room): follow to the bottom.
+  useLayoutEffect(pin);
   useLayoutEffect(() => {
     const el = scroller.current;
-    if (el && followingRef.current) el.scrollTop = el.scrollHeight;
-  });
+    const col = content.current;
+    if (!el || !col || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => pin());
+    ro.observe(col);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   function onScroll() {
     const el = scroller.current;
     if (!el) return;
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (ours.current) {
+      ours.current = false;
+      return;
+    }
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
     followingRef.current = atBottom;
     if (atBottom !== following) setFollowing(atBottom);
   }
@@ -296,7 +328,7 @@ export function TranscriptPane({ value }: { value: TranscriptContextValue }) {
   return (
     <TranscriptContext.Provider value={value}>
       <div className="transcript-slot" data-slot="transcript" ref={scroller} onScroll={onScroll} aria-live="off">
-        <div className="col">
+        <div className="col" ref={content}>
           <Transcript />
         </div>
         {!following && (
@@ -306,7 +338,7 @@ export function TranscriptPane({ value }: { value: TranscriptContextValue }) {
             onClick={() => {
               followingRef.current = true;
               setFollowing(true);
-              scroller.current?.scrollTo({ top: scroller.current.scrollHeight });
+              pin();
             }}
           >
             Jump to latest

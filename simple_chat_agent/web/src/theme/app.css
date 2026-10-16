@@ -144,11 +144,13 @@ html[data-presenter="on"] .body { grid-template-columns: var(--rail-w) minmax(0,
 .side-empty { font-size: .8em; color: var(--slate-300); padding: .5em; }
 .side-error { font-size: .8em; color: var(--yellow); padding: .5em; }
 
-.dot { width: .55em; height: .55em; background: var(--slate-500); display: inline-block; flex-shrink: 0; }
-.dot.run { background: var(--green); }
-.dot.wait { background: var(--yellow); }
-.dot.you { background: var(--pink); }
-.dot.closed { background: transparent; border: 1px solid var(--slate-500); }
+/* Status squares carry a shape as well as a color (UX review m10, verification 5):
+   running ■, waiting for you ◆, Worker isn't answering ▲, not open ▫, ended ⊘ (a slashed box). */
+.dot { width: .55em; height: .55em; background: transparent; border: 1.5px solid var(--slate-500); display: inline-block; flex-shrink: 0; }
+.dot.run { background: var(--green); border-color: var(--green); }
+.dot.you { background: var(--pink); border-color: var(--pink); transform: rotate(45deg) scale(.9); }
+.dot.wait { background: var(--yellow); border: 0; width: .7em; height: .62em; clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.dot.closed { background: linear-gradient(to top right, transparent 45%, var(--slate-500) 45%, var(--slate-500) 58%, transparent 58%); }
 
 .rail-side {
   height: 100%; border-right: 1px solid var(--border); background: rgba(13, 13, 16, .6); padding: .8em .4em;
@@ -173,7 +175,10 @@ html[data-presenter="on"] .body { grid-template-columns: var(--rail-w) minmax(0,
 /* Main column */
 .transcript-slot { overflow-y: auto; padding: 1.4em 1.6em 0; display: grid; align-content: start; justify-items: center; }
 .col { width: 100%; max-width: 46em; display: grid; gap: .9em; align-content: start; padding-bottom: 1em; }
-.decision-slot { display: grid; justify-items: center; align-content: start; padding: 0 1.6em; overflow-y: auto; }
+/* Sized to the card (which caps itself at 50vh and scrolls only its list of calls). The slot
+   never scrolls: a scrolling slot hid the card's header behind the transcript. */
+.decision-slot { display: grid; justify-items: center; align-content: start; padding: 0 1.6em; overflow: visible; }
+.decision-slot:has(> :empty) { display: none; }
 .decision-slot > * { width: 100%; max-width: 46em; }
 .composer-slot { padding: .8em 1.6em 1em; display: grid; justify-items: center; }
 .composer-slot > * { width: 100%; max-width: 46em; }
@@ -227,7 +232,7 @@ html[data-presenter="on"] .body { grid-template-columns: var(--rail-w) minmax(0,
   .slot-main { flex: 1; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto auto; }
   .pinned-slot { padding: 0 .6em; }
   .pinned-slot:not(:empty) { padding-top: .5em; }
-  .decision-slot { max-height: 45dvh; overflow-y: auto; }
+
   .transcript-slot { overflow-y: auto; padding: .9em .8em 0; }
   .decision-slot { padding: 0 .6em; }
   .composer-slot { padding: .5em .6em .7em; background: rgba(13, 13, 16, .95); }
@@ -406,4 +411,19 @@ button.path:hover { border-color: var(--uv-light); }
   .composer .bar > .ctl { flex: 0 0 auto; }
   .composer .bar .ctl .note, .composer .bar .ctl-text { display: none; }
   .composer .bar .split .btn { padding-inline: .5em; }
+}
+
+/* Posture button: full label, short on the phone (the accessible name stays full). */
+.ctl .short { display: none; }
+@media (max-width: 600px) {
+  .ctl .full { display: none; }
+  .ctl .short { display: inline; }
+  .stop kbd { display: none; }
+  .meters-compact { flex-wrap: nowrap; white-space: nowrap; overflow: hidden; gap: .7em; }
+  .meters-compact > span { flex-shrink: 0; }
+  .meters-compact > span:last-child { flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+}
+@media (max-width: 600px) {
+  .composer .bar .posture-menu { flex: 0 0 auto; }
+  .composer .bar .model-menu { flex: 0 1 auto; }
 }

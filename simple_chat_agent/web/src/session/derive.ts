@@ -65,6 +65,20 @@ export function modelAppliesNextTurn(messages: readonly Message[], agentStatus: 
   return false;
 }
 
+/** The model the open turn runs on: while a model change waits for the next turn, the one
+ *  before it; otherwise the current one. */
+export function modelInUse(messages: readonly Message[], seed: ModelChoice | null, agentStatus: "idle" | "busy"): ModelChoice | null {
+  if (!modelAppliesNextTurn(messages, agentStatus)) return currentModel(messages, seed);
+  let last = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.handler === "set_model") {
+      last = i;
+      break;
+    }
+  }
+  return currentModel(messages.slice(0, Math.max(0, last)), seed);
+}
+
 export function currentPosture(messages: readonly Message[], seed: Posture | null): Posture | null {
   let posture = seed;
   for (const m of messages) {

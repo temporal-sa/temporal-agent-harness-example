@@ -15,6 +15,7 @@ import {
   choiceLabel,
   composerMode,
   escapeStops,
+  postureShort,
   effortsFor,
   modelName,
   pickerState,
@@ -51,12 +52,17 @@ function ModelPicker({ session, config }: { session: CodingSession; config: Agen
   const efforts = effortsFor(config, shown);
   return (
     <Menu
+      rootClass="model-menu"
       label="Model"
       buttonLabel={`Model: ${choiceLabel(config, shown)}`}
       buttonClass={`ctl on${state.failed ? " bad" : ""}`}
       buttonContent={
         <>
-          {choiceLabel(config, shown)} <span aria-hidden="true">▾</span>
+          <span className="full">{choiceLabel(config, shown)}</span>
+          <span className="short" aria-hidden="true">
+            {modelName(config, shown).replace(/^Claude /, "")}
+          </span>{" "}
+          <span aria-hidden="true">▾</span>
           {state.note && <span className="note">{state.note}</span>}
         </>
       }
@@ -158,12 +164,17 @@ function PostureMenu({ session, config }: { session: CodingSession; config: Agen
 
   return (
     <Menu
+      rootClass="posture-menu"
       label="Approvals"
       buttonLabel={`Approvals: ${postureLabel(config, current)}`}
       buttonClass={`ctl${current === "auto" ? " auto" : ""}${failed ? " bad" : ""}`}
       buttonContent={
         <>
-          {postureLabel(config, current)} <span aria-hidden="true">▾</span>
+          <span className="full">{postureLabel(config, current)}</span>
+          <span className="short" aria-hidden="true">
+            {postureShort(current)}
+          </span>{" "}
+          <span aria-hidden="true">▾</span>
           {pending && !failed && <span className="note">{record ? "applies to new calls" : "Sending…"}</span>}
           {failed && <span className="note">Couldn't change it</span>}
         </>

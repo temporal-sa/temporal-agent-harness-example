@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { Transcript } from "./Transcript";
+import { Transcript, notSentText } from "./Transcript";
 import { TranscriptContext, type TranscriptContextValue } from "./context";
 import { call, message, text, tool } from "./fixtures";
 import type { CodingSession, Message } from "../session";
@@ -115,5 +115,15 @@ describe("Transcript", () => {
     const html = render([message([call(), waiting])], { pendingApprovals: [{ agentId: "root", messageId: "m1", part: waiting, riskClass: "workspace_edit", rememberAllowed: true }] } as never);
     expect(html).toContain('<span class="badge idle">waiting · see card</span>');
     expect(html).not.toContain(">Waiting for you<");
+  });
+});
+
+describe("not-sent copy (UX verification 3)", () => {
+  const rec = (status: number | null, code: string | null) => ({ errorStatus: status, errorCode: code, error: "raw" }) as never;
+  it("says why by status and code", () => {
+    expect(notSentText(rec(500, "internal"), { error: "raw" })).toBe("Not sent. The app hit an error. Your session is safe in Temporal; try again.");
+    expect(notSentText(rec(502, null), { error: "raw" })).toMatch(/^Not sent. The app's API isn't answering/);
+    expect(notSentText(rec(409, "session_closed"), { error: "raw" })).toBe("Not sent. This session is closed. Start a new one.");
+    expect(notSentText(rec(0, null), { error: "Failed to fetch" })).toMatch(/^Not sent. Couldn't reach the app/);
   });
 });

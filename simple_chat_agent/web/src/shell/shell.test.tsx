@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { railLabel, rowCaption } from "./Sidebar";
 import { Unreachable } from "./Unreachable";
-import { footerText } from "../app/App";
+import { footerText, meterModelLabel } from "../app/App";
 import { NO_SESSION_REASON, viewDefs } from "./ViewLinks";
 import { modelLine } from "../transcript/Transcript";
 import type { SessionSummary } from "../session";
@@ -58,5 +58,15 @@ describe("Temporal UI link", () => {
   it("keeps config's reason when it is off", () => {
     expect(temporal(off, null).reason).toBe("The Temporal UI isn't linked in this environment.");
     expect(temporal(off, "s1").href).toBeNull();
+  });
+});
+
+describe("meters model label (UX verification nit)", () => {
+  const name = (c: { model?: string } | null | undefined, withProvider = false) => (c?.model ? `${c.model}${withProvider ? " · Anthropic" : ""}` : "");
+  it("shows the model in use and marks the next one", () => {
+    const sonnet = { provider: "anthropic" as const, model: "Sonnet" };
+    const opus = { provider: "anthropic" as const, model: "Opus" };
+    expect(meterModelLabel({ model: opus, modelInUse: sonnet, modelAppliesNextTurn: true }, name)).toBe("Sonnet · Anthropic · next: Opus");
+    expect(meterModelLabel({ model: opus, modelInUse: opus, modelAppliesNextTurn: false }, name)).toBe("Opus · Anthropic");
   });
 });

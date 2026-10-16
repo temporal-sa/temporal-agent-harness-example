@@ -1,7 +1,7 @@
 // The app shell (PRD U1, U5, U7, U8): boot (reachability and sign-in), the session list, the
 // selected session, and the layout grid with its slots.
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 
 import { Composer } from "../composer/Composer";
 import { MetersStrip } from "../meters/MetersStrip";
@@ -21,7 +21,6 @@ import {
   type WorkbenchFocus,
 } from "../session";
 import { Dialog } from "../shell/Dialog";
-import { useAnchoredDock } from "./anchoredDock";
 import { Header } from "../shell/Header";
 import { useMaxWidth, usePresenterMode } from "../shell/presenter";
 import { Rail, Sidebar, type SidebarProps } from "../shell/Sidebar";
@@ -298,7 +297,7 @@ function Layout({ parts, session, page = { kind: "landing" } }: { parts: ShellPa
 
   const title = parts.summary?.title ?? null;
   const demo = parts.summary?.demo ?? null;
-  const modelLabel = session ? parts.modelName(session.model, true) || null : null;
+  const modelLabel = session ? meterModelLabel(session, parts.modelName) : null;
   const changesCount = session?.changes?.files.length ?? 0;
   const commandRunning = session ? runningCommand(session) : false;
   const [focus, setFocus] = useState<WorkbenchFocus | null>(null);
@@ -338,8 +337,6 @@ function Layout({ parts, session, page = { kind: "landing" } }: { parts: ShellPa
   );
 
   const modal = drawer || (sheet !== null && !!session && phone);
-  const dockRef = useRef<HTMLDivElement>(null);
-  const dockHeight = useAnchoredDock(dockRef, !!session && !phone && session.pendingApprovals.length > 0);
 
   // The agent applies (or refuses) a model or posture change when its handler ends; then the
   // session list carries the new value, so refetch it once per such reply.
@@ -394,12 +391,7 @@ function Layout({ parts, session, page = { kind: "landing" } }: { parts: ShellPa
             </div>
           )}
           {session && (
-            <div
-              className="decision-slot"
-              data-slot="decisions"
-              ref={dockRef}
-              style={dockHeight !== null ? { height: dockHeight } : undefined}
-            >
+            <div className="decision-slot" data-slot="decisions">
               <DecisionDock session={session} />
             </div>
           )}
@@ -474,6 +466,18 @@ export function footerText(username: string, mode: string, ttlDays: number | nul
   const who = mode === "catalog" ? `Signed in as ${username} through the catalog` : `Signed in as ${username}`;
   if (ttlDays === null || !(ttlDays > 0)) return who;
   return `${who} · sessions are kept ${ttlDays} ${ttlDays === 1 ? "day" : "days"}`;
+}
+
+/** The meters' model: the one the turn runs on, and "next: …" while a change waits. */
+export function meterModelLabel(
+  session: Pick<CodingSession, "model" | "modelInUse" | "modelAppliesNextTurn">,
+  name: (c: Partial<ModelChoice> | null | undefined, withProvider?: boolean) => string,
+): string | null {
+  const now = name(session.modelInUse ?? session.model, true);
+  if (!now) return null;
+  if (!session.modelAppliesNextTurn || !session.model) return now;
+  const next = name(session.model);
+  return next && next !== name(session.modelInUse) ? `${now} · next: ${next}` : now;
 }
 
 function runningCommand(session: CodingSession): boolean {
