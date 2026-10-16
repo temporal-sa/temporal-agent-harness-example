@@ -16,6 +16,7 @@ import unittest
 import uuid
 from pathlib import Path
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -125,6 +126,21 @@ class FakeTemporal:
         self.queries: list[tuple[str, str]] = []
         self.query_results: dict[str, Any] = {}
         self.start_error: Exception | None = None
+        # Visibility (ListWorkflows): entries to return, the queries asked, an error to raise.
+        self.visibility: list[Any] = []
+        self.list_queries: list[str] = []
+        self.list_error: Exception | None = None
+
+    def list_workflows(self, query: str | None = None, **kwargs: Any) -> Any:
+        self.list_queries.append(query or "")
+
+        async def entries() -> Any:
+            if self.list_error is not None:
+                raise self.list_error
+            for entry in self.visibility:
+                yield entry
+
+        return entries()
 
     def get_workflow_handle(self, workflow_id: str) -> FakeHandle:
         return FakeHandle(self, workflow_id)
@@ -145,6 +161,17 @@ class FakeTemporal:
         handle = FakeHandle(self, id)
         handle.result_run_id = "root-run-0"  # type: ignore[attr-defined]
         return handle
+
+
+def visible(workflow_id: str, memo: dict[str, Any] | None = None, start: float = 1_700_000_000.0) -> Any:
+    """One Visibility entry, as ``client.list_workflows`` yields it."""
+
+    async def read_memo() -> dict[str, Any]:
+        return dict(memo or {})
+
+    return SimpleNamespace(
+        id=workflow_id, start_time=datetime.fromtimestamp(start, timezone.utc), memo=read_memo
+    )
 
 
 class FakeBridge:
@@ -703,15 +730,14 @@ class DirectorySyncTests(AgentRoutesTestBase):
         self.assertIsNone(self.run_async(self.directory.update_settings("alice", sid, posture="auto")))
         self.assertNotIn("update_session_signal", [n for n, _ in self.manager_signals()])
 
-    def test_rebuild_keeps_the_current_posture(self) -> None:
-        from simple_chat_agent.agent.sessions import SessionRecord
-
-        manager = f"coding-sessions-{owner_digest('alice')}"
-        self.temporal.query_results[manager] = [
-            SessionRecord(session_id="coding-agent-a", model="openai:gpt-5.5", posture="auto", created_at="2026-10-01T00:00:00+00:00"),
+    def test_rebuild_reads_start_memo_without_a_query(self) -> None:
+        self.temporal.visibility = [
+            visible("coding-agent-a", {"model": "openai:gpt-5.5", "model_choice": {"provider": "openai", "model": "gpt-5.5"},
+                                       "posture": "auto", "title": "a", "created_at": 1.0}),
         ]
         entry = self.client.get("/api/agent/sessions", headers=A).json()[0]
         self.assertEqual((entry["model"], entry["posture"]), ({"provider": "openai", "model": "gpt-5.5"}, "auto"))
+        self.assertEqual(self.temporal.queries, [])
 
     def test_temporal_failure_keeps_the_redis_list(self) -> None:
         async def broken(*args: Any, **kwargs: Any) -> Any:
@@ -774,6 +800,54 @@ class DirectoryNoWorkerTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 with contextlib.suppress(Exception):
                     await client.get_workflow_handle(manager).terminate("test cleanup")
+                keys = [k async for k in r.scan_iter(f"{prefix}:*")]
+                if keys:
+                    await r.delete(*keys)
+                await r.aclose()
+
+
+@unittest.skipUnless(REDIS_UP and _temporal_up(), "needs Redis and the Temporal dev server")
+class VisibilityRebuildTests(unittest.IsolatedAsyncioTestCase):
+    """The rebuild's Visibility query runs on the real server, with no worker polling."""
+
+    async def test_rebuild_from_real_visibility_with_no_worker(self) -> None:
+        user = f"vis-{uuid.uuid4().hex[:8]}"
+        prefix = f"aah-test-vis-{uuid.uuid4().hex[:6]}"
+        queue = f"no-worker-{uuid.uuid4().hex[:6]}"
+        with mock.patch.dict(os.environ, {"TEMPORAL_ADDRESS": TEMPORAL_ADDRESS, "AGENT_REDIS_PREFIX": prefix}):
+            client = await agent_routes.connect_agent_client()
+            r = aredis.from_url(REDIS_URL, decode_responses=True)
+
+            async def temporal() -> Any:
+                return client
+
+            record = {"session_id": f"coding-agent-{uuid.uuid4().hex[:16]}", "title": "from memo", "created_at": 123.0,
+                      "model": "openai:gpt-5.5", "model_choice": {"provider": "openai", "model": "gpt-5.5"},
+                      "posture": "auto", "environment": "local", "demo": None}
+            handle = await client.start_workflow(
+                AGENT_WORKFLOW_TYPE, args=[], id=record["session_id"], task_queue=queue,
+                search_attributes=agent_routes.owner_search_attributes(user), memo=agent_routes.session_memo(record),
+            )
+            try:
+                query = f"WorkflowId = '{record['session_id']}'"
+                for _ in range(50):
+                    if [e async for e in client.list_workflows(query)]:
+                        break
+                    await asyncio.sleep(0.1)
+                directory = SessionDirectory(r, temporal=temporal, task_queue=queue)
+                with mock.patch("temporalio.client.WorkflowHandle.query", side_effect=AssertionError("Query")):
+                    listed = await directory.list(user)
+                self.assertEqual(len(listed), 1)
+                got = listed[0]
+                self.assertEqual(
+                    (got["session_id"], got["title"], got["created_at"], got["model"], got["posture"]),
+                    (record["session_id"], "from memo", 123.0, "openai:gpt-5.5", "auto"),
+                )
+                # Another owner sees nothing.
+                self.assertEqual(await SessionDirectory(r, temporal=temporal, task_queue=queue).list(f"{user}-other"), [])
+            finally:
+                with contextlib.suppress(Exception):
+                    await handle.terminate("test cleanup")
                 keys = [k async for k in r.scan_iter(f"{prefix}:*")]
                 if keys:
                     await r.delete(*keys)
@@ -1148,22 +1222,28 @@ class ReviewFixTests(_RouteHelpers, AgentRoutesTestBase):
         _index, records = self.directory._keys("alice")
         self.assertFalse(self.run_async(self.redis.hexists(records, sid)))
 
-    def test_m2_lost_list_is_rebuilt_from_coding_sessions(self) -> None:
-        from simple_chat_agent.agent.sessions import SessionRecord
-
-        manager = f"coding-sessions-{owner_digest('alice')}"
-        self.temporal.query_results[manager] = [
-            SessionRecord(session_id="coding-agent-a", title="older", model="openai:gpt-5.5", created_at="2026-10-01T00:00:00+00:00"),
-            SessionRecord(session_id="coding-agent-b", title="newer", model="", created_at="2026-10-02T00:00:00+00:00"),
+    def test_m2_lost_list_is_rebuilt_from_visibility(self) -> None:
+        self.temporal.visibility = [
+            visible("coding-agent-a", {"title": "older", "model": "openai:gpt-5.5",
+                                       "model_choice": {"provider": "openai", "model": "gpt-5.5"}, "created_at": 100.0}),
+            visible("coding-agent-b", {}, start=200.0),  # no memo (started before memos): start time, default title
         ]
         listed = self.client.get("/api/agent/sessions", headers=A).json()
         self.assertEqual([s["workflow_id"] for s in listed], ["coding-agent-b", "coding-agent-a"])
         self.assertEqual(listed[1]["model"], {"provider": "openai", "model": "gpt-5.5"})
-        self.assertEqual(self.temporal.queries, [(manager, "list_sessions")])
-        # A user with nothing to rebuild costs one Query per backoff window, not one per list.
+        self.assertEqual((listed[1]["label"], listed[0]["label"]), ("older", "New session"))
+        self.assertEqual(listed[0]["created_at"], 200.0)
+        # Visibility only: running CodingAgent workflows owned by alice. No Query, no Describe.
+        self.assertEqual(self.temporal.queries, [])
+        self.assertEqual(
+            self.temporal.list_queries,
+            [f"WorkflowType = 'CodingAgent' AND CodingAgentOwner = '{owner_digest('alice')}' AND ExecutionStatus = 'Running'"],
+        )
+        # A user with nothing to rebuild costs one list per backoff window, not one per request.
+        self.temporal.visibility = []
         self.client.get("/api/agent/sessions", headers=B)
         self.client.get("/api/agent/sessions", headers=B)
-        self.assertEqual(len([q for q in self.temporal.queries if q[0] != manager]), 1)
+        self.assertEqual(len(self.temporal.list_queries), 2)
 
     # M4 -----------------------------------------------------------------------------
 
@@ -1429,29 +1509,57 @@ class VerificationFollowUpTests(_RouteHelpers, AgentRoutesTestBase):
 
     # N4 -----------------------------------------------------------------------------
 
-    def test_n4_failed_rebuild_query_retries_soon(self) -> None:
-        self.temporal.query_error = RuntimeError("no poller seen for task queue recently")
+    def test_n4_failed_rebuild_retries_soon(self) -> None:
+        self.temporal.list_error = RuntimeError("visibility unavailable")
         self.assertEqual(self.client.get("/api/agent/sessions", headers=A).json(), [])
         key = self.directory._rebuilt_key("alice")
         self.assertLessEqual(self.ttl(key), agent_routes.REBUILD_RETRY_SECONDS)
-        # No manager at all: nothing to rebuild for the whole backoff.
-        self.temporal.query_error = None
+        # Nothing listed: nothing to rebuild for the whole backoff.
+        self.temporal.list_error = None
         self.client.get("/api/agent/sessions", headers=B)
         self.assertGreater(self.ttl(self.directory._rebuilt_key("bob")), agent_routes.REBUILD_RETRY_SECONDS)
 
     def test_n4_get_session_rebuilds_a_lost_list(self) -> None:
-        from simple_chat_agent.agent.sessions import SessionRecord
-
         sid = self.create(title="kept")["workflow_id"]
+        memo = next(st for st in self.temporal.starts if st["id"] == sid)["memo"]
         index, records = self.directory._keys("alice")
         self.run_async(self.redis.delete(index, records))
-        manager = f"coding-sessions-{owner_digest('alice')}"
-        self.temporal.query_results[manager] = [
-            SessionRecord(session_id=sid, title="kept", model="anthropic:claude-sonnet-5-5", created_at="2026-10-01T00:00:00+00:00")
-        ]
+        self.temporal.visibility = [visible(sid, memo)]
         r = self.client.get(f"/api/agent/sessions/{sid}", headers=A)
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["label"], "kept")
+        self.assertEqual(self.temporal.queries, [])
+
+    def test_rebuild_issues_no_query_even_with_workers_down(self) -> None:
+        # Any Query on this path fails the test, as it would with no worker to answer it.
+        self.temporal.query_error = AssertionError("a browser path issued a Query")
+        sid = self.create(title="first", posture="auto", model={"provider": "openai", "model": "gpt-5.5"})["workflow_id"]
+        start = next(st for st in self.temporal.starts if st["id"] == sid)
+        memo = start["memo"]
+        self.assertEqual(memo["title"], "first")
+        self.assertEqual((memo["model"], memo["posture"], memo["environment"]), ("openai:gpt-5.5", "auto", "catalog"))
+        self.assertIsInstance(memo["created_at"], float)
+        before = self.client.get(f"/api/agent/sessions/{sid}", headers=A).json()
+        index, records = self.directory._keys("alice")
+        self.run_async(self.redis.delete(index, records))
+        self.temporal.visibility = [visible(sid, memo)]
+        with mock.patch.object(FakeHandle, "query", side_effect=AssertionError("Query on a browser path")):
+            listed = self.client.get("/api/agent/sessions", headers=A).json()
+            detail = self.client.get(f"/api/agent/sessions/{sid}", headers=A).json()
+        self.assertEqual([s["workflow_id"] for s in listed], [sid])
+        for key in ("label", "model", "posture", "created_at", "environment"):
+            self.assertEqual(detail[key], before[key], key)
+        self.assertEqual(self.temporal.queries, [])
+
+    def test_rebuild_after_rename_falls_back_to_the_start_title(self) -> None:
+        # Documented limit: renames and later model/posture changes aren't in the memo.
+        sid = self.create(title="original")["workflow_id"]
+        self.client.post(f"/api/agent/sessions/{sid}/title", json={"title": "renamed"}, headers=A)
+        memo = next(st for st in self.temporal.starts if st["id"] == sid)["memo"]
+        index, records = self.directory._keys("alice")
+        self.run_async(self.redis.delete(index, records))
+        self.temporal.visibility = [visible(sid, memo)]
+        self.assertEqual(self.client.get("/api/agent/sessions", headers=A).json()[0]["label"], "original")
 
     # N5 -----------------------------------------------------------------------------
 
@@ -1739,6 +1847,18 @@ class ProductViewConfigTests(AgentRoutesTestBase):
         c = self.config(AGENT_SESSION_TTL_SECONDS=str(7 * 24 * 3600))
         self.assertEqual(c["session_ttl_days"], 7)
         self.assertEqual(self.config(AGENT_SESSION_TTL_SECONDS="129600")["session_ttl_days"], 1.5)
+
+    def test_test_tools_local_only(self) -> None:
+        r = self.client.post("/api/agent/sessions", json={"test_tools": True}, headers=A)
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertEqual(r.json()["error"], "test_tools_not_allowed")
+        self.assertEqual([st for st in self.temporal.starts if st["workflow"] == "CodingAgent"], [])
+        with mock.patch.dict(os.environ, {"AGENT_ENVIRONMENT": "local"}):
+            sid = self.create(test_tools=True)["workflow_id"]
+        init = next(st for st in self.temporal.starts if st["id"] == sid)["args"][1]
+        self.assertTrue(init.test_tools)
+        sid = self.create()["workflow_id"]
+        self.assertFalse(next(st for st in self.temporal.starts if st["id"] == sid)["args"][1].test_tools)
 
     def test_requires_auth(self) -> None:
         r = self.client.get("/api/agent/config")

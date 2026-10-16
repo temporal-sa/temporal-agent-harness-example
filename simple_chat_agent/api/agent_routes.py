@@ -476,6 +476,8 @@ class CreateSession(BaseModel):
     posture: Posture = agent_models.DEFAULT_POSTURE
     title: str | None = Field(default=None, max_length=TITLE_MAX)
     demo: Literal["refund_service"] | None = None
+    # Local only: adds the agent's gated test tools (live stacked-approval checks).
+    test_tools: bool = False
 
 
 class HarnessCreateSession(BaseModel):
@@ -626,7 +628,8 @@ class SessionDirectory:
     Redis: a sorted set of session ids by creation time and a hash of records, per owner
     digest. Every change is written to Redis first (browsers read it at once), then sent to the
     workflow as a Signal (signal-with-start), which needs no worker. ``sync_workflow=False``
-    keeps the list in Redis only.
+    keeps the list in Redis only. A lost Redis list is rebuilt from Temporal Visibility and
+    the sessions' memos (:meth:`_rebuild`), never by querying ``CodingSessions``.
     """
 
     def __init__(
@@ -745,60 +748,53 @@ class SessionDirectory:
         await self._send(user_id, "remove_session_signal", session_id)
 
     async def _retry_rebuild_soon(self, user_id: str, exc: Exception) -> None:
-        """The Query failed (workers down, Temporal unreachable): try again after a short
-        wait rather than leaving the list empty for the whole backoff."""
+        """Visibility failed (Temporal unreachable): try again after a short wait rather than
+        leaving the list empty for the whole backoff."""
         log.info("session directory rebuild for %s failed, retrying soon: %s", owner_digest(user_id), exc)
         await self.r.expire(self._rebuilt_key(user_id), REBUILD_RETRY_SECONDS)
 
     async def _rebuild(self, user_id: str) -> bool:
-        """The Redis list is gone (expired or Redis lost): rebuild it from the user's
-        ``CodingSessions`` (its ``list_sessions`` Query). A rare, server-side path; at most
-        once per REBUILD_BACKOFF_SECONDS per user, so a user with no sessions costs no Query."""
+        """The Redis list is gone (expired or Redis lost): rebuild it from Temporal Visibility,
+        never a Query, since this runs on browser paths and must work with workers down.
+
+        Lists the user's *running* CodingAgent workflows by the ``CodingAgentOwner`` search
+        attribute (one entry per session: only the latest run of a continued-as-new chain is
+        running). Title, model, posture, demo and creation time come from the memo set at
+        start (:func:`session_memo`; the server carries it across continue-as-new).
+
+        Limits, accepted because rebuilds are rare: a rename or a model/posture change made
+        after start shows the start-time value again; and closed sessions are left out,
+        because Visibility can't tell a closed session from a deleted one (both are closed by
+        the ``close`` Signal), and a deleted session must never come back.
+
+        At most once per REBUILD_BACKOFF_SECONDS per user."""
         if not self._sync:
             return False
         if not await self.r.set(self._rebuilt_key(user_id), "1", nx=True, ex=REBUILD_BACKOFF_SECONDS):
             return False
-        from simple_chat_agent.agent.sessions import SessionRecord, sessions_workflow_id
-
+        # The digest is hex, so it is safe inside the quoted literal.
+        query = (
+            f"WorkflowType = '{AGENT_WORKFLOW_TYPE}' AND {OWNER_SEARCH_ATTRIBUTE.name} = '{owner_digest(user_id)}' "
+            "AND ExecutionStatus = 'Running'"
+        )
+        found: list[dict[str, Any]] = []
         try:
             assert self._temporal is not None
             client = await self._temporal()
-            handle = client.get_workflow_handle(sessions_workflow_id(owner_digest(user_id)))
-            found = await handle.query(
-                "list_sessions", result_type=list[SessionRecord], rpc_timeout=REBUILD_QUERY_TIMEOUT
-            )
-        except RPCError as exc:
-            if exc.status == RPCStatusCode.NOT_FOUND:
-                # No manager: the user never had a session. Nothing to rebuild for a while.
-                return False
-            await self._retry_rebuild_soon(user_id, exc)
-            return False
-        except Exception as exc:  # noqa: BLE001 - e.g. no worker to answer the Query
+            async for execution in client.list_workflows(
+                query, limit=SESSIONS_LIST_MAX, rpc_timeout=REBUILD_QUERY_TIMEOUT
+            ):
+                found.append(await _rebuilt_record(execution))
+        except Exception as exc:  # noqa: BLE001 - Temporal unreachable or Visibility error
             await self._retry_rebuild_soon(user_id, exc)
             return False
         if not found:
             return False
         index, records = self._keys(user_id)
         pipe = self.r.pipeline(transaction=True)
-        for rec in found:
-            if getattr(rec, "archived", False):
-                continue
-            try:
-                created = datetime.fromisoformat(rec.created_at).timestamp() if rec.created_at else 0.0
-            except ValueError:
-                created = 0.0
-            provider, _, model = (rec.model or "").partition(":")
-            record = {
-                "session_id": rec.session_id,
-                "title": rec.title,
-                "created_at": created,
-                "model": rec.model,
-                "model_choice": {"provider": provider, "model": model} if model else {},
-                "posture": getattr(rec, "posture", "") or None,
-                "rebuilt": True,
-            }
-            pipe.zadd(index, {rec.session_id: created}, nx=True)
-            pipe.hsetnx(records, rec.session_id, json.dumps(record))
+        for record in found:
+            pipe.zadd(index, {record["session_id"]: record["created_at"]}, nx=True)
+            pipe.hsetnx(records, record["session_id"], json.dumps(record))
         self._touch(pipe, user_id)
         await pipe.execute()
         return True
@@ -852,6 +848,42 @@ class SessionDirectory:
             )
         except Exception as exc:  # noqa: BLE001 - Redis already holds the change
             log.warning("session directory %s for %s not recorded in CodingSessions: %s", signal, digest, exc)
+
+
+SESSION_MEMO_FIELDS = ("title", "created_at", "model", "model_choice", "posture", "environment", "demo")
+
+
+def session_memo(record: dict[str, Any]) -> dict[str, Any]:
+    """The memo a CodingAgent starts with: what a Query-free rebuild of the session list
+    needs (:meth:`SessionDirectory._rebuild`). Small, and nothing secret: it is visible to
+    anyone who can see the workflow, like its summary."""
+    return {k: record[k] for k in SESSION_MEMO_FIELDS if record.get(k) is not None}
+
+
+async def _rebuilt_record(execution: Any) -> dict[str, Any]:
+    """A session list record from one Visibility entry (memo first, then the run's own data)."""
+    try:
+        memo = await execution.memo()
+    except Exception:  # noqa: BLE001 - an unreadable memo still lists the session
+        memo = {}
+    if not isinstance(memo, dict):
+        memo = {}
+    start = getattr(execution, "start_time", None)
+    created = memo.get("created_at")
+    if isinstance(created, bool) or not isinstance(created, (int, float)):
+        created = start.timestamp() if start is not None else 0.0
+    model_choice = memo.get("model_choice") if isinstance(memo.get("model_choice"), dict) else {}
+    return {
+        "session_id": execution.id,
+        "title": str(memo.get("title") or "New session")[:TITLE_MAX],
+        "created_at": float(created),
+        "model": str(memo.get("model") or ""),
+        "model_choice": model_choice,
+        "posture": memo.get("posture") or None,
+        "environment": memo.get("environment"),
+        "demo": memo.get("demo"),
+        "rebuilt": True,
+    }
 
 
 _UPDATE_RECORD = """
@@ -1093,6 +1125,8 @@ def create_agent_router(
         refusal = posture_refusal(body.posture, environment, auto_mode_status(configured_judge_backend()))
         if refusal is not None:
             raise HarnessError(422, "posture_not_allowed", refusal)
+        if body.test_tools and environment != "local":
+            raise HarnessError(422, "test_tools_not_allowed", "Test tools are local development only.")
 
         if requested_id is not None:
             # Caller-chosen ids are idempotent per user and can't collide across users: the
@@ -1125,6 +1159,7 @@ def create_agent_router(
             environment=environment,  # type: ignore[arg-type]
             judge=configured_judge_backend(),
             research_tools=offered_research_tools(),
+            test_tools=body.test_tools,
         )
         title = (body.title or "").strip() or (
             agent_models.DEMOS[body.demo] if body.demo else "New session"
@@ -1135,23 +1170,6 @@ def create_agent_router(
             # failed seed leaves no session behind. Once per workspace: a retry after the seed
             # succeeded but the start failed skips it.
             seeded = await seed_once(session_id, body.demo)
-        client = await temporal()
-        try:
-            started = await client.start_workflow(
-                AGENT_WORKFLOW_TYPE,
-                args=[AgentConfig(), data],
-                id=session_id,
-                task_queue=task_queue,
-                search_attributes=owner_search_attributes(uid),
-                id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
-                static_summary=title[:200],
-            )
-        except WorkflowAlreadyStartedError:
-            # A concurrent create of the same caller-chosen id won the start.
-            existing = await existing_summary(session_id, uid)
-            if existing is not None:
-                return JSONResponse(existing, headers=NO_STORE)
-            raise HarnessError(409, "session_exists", "That session id is taken.") from None
         record = {
             "session_id": session_id,
             "title": title,
@@ -1162,6 +1180,25 @@ def create_agent_router(
             "environment": environment,
             "demo": body.demo,
         }
+        client = await temporal()
+        try:
+            started = await client.start_workflow(
+                AGENT_WORKFLOW_TYPE,
+                args=[AgentConfig(), data],
+                id=session_id,
+                task_queue=task_queue,
+                search_attributes=owner_search_attributes(uid),
+                id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+                static_summary=title[:200],
+                # What a Query-free rebuild of the session list reads (SessionDirectory._rebuild).
+                memo=session_memo(record),
+            )
+        except WorkflowAlreadyStartedError:
+            # A concurrent create of the same caller-chosen id won the start.
+            existing = await existing_summary(session_id, uid)
+            if existing is not None:
+                return JSONResponse(existing, headers=NO_STORE)
+            raise HarnessError(409, "session_exists", "That session id is taken.") from None
         await sessions.put(uid, record)
         run_id = getattr(started, "result_run_id", None)
         if isinstance(run_id, str) and run_id:

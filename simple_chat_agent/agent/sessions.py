@@ -149,5 +149,6 @@ class CodingSessions:
 
     @workflow.query
     def list_sessions(self) -> list[SessionRecord]:
-        """For the API's Redis mirror rebuild and operators; browsers never call it."""
+        """For operators and tests. The API never calls it: a lost Redis list is rebuilt from
+        Visibility and the sessions' memos, so no browser path depends on a worker."""
         return self._state.sessions
