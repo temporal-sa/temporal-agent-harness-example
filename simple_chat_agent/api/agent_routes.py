@@ -119,6 +119,11 @@ MAX_PARENT_HOPS = 4
 # Workflow ids we will even look up: what we mint, and what Temporal can hold.
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Client-supplied ids and attachment fields (P3 security review #5, #6).
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_ATTACHMENT_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_MIME_TYPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}$")
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 TITLE_MAX = 200
 # How long a subagent tool approval waits for a worker to take the harness Update.
 CHILD_APPROVAL_TIMEOUT = timedelta(seconds=10)
@@ -318,6 +323,17 @@ def _error(status: int, code: str, message: str, headers: dict[str, str] | None 
         content={"error": code, "message": message, **extra},
         headers={**NO_STORE, **(headers or {})},
     )
+
+
+def check_request_id(request_id: str | None) -> None:
+    """A client ``request_id`` (dedup key, Update id) is short, plain, and never claims to be
+    one of the bridge's ``x_rejected:`` ids."""
+    from simple_chat_agent.api.agent_telemetry import REJECTION_MESSAGE_PREFIX
+
+    if request_id is None:
+        return
+    if not _REQUEST_ID.fullmatch(request_id) or request_id.startswith(REJECTION_MESSAGE_PREFIX):
+        raise HarnessError(422, "invalid_request_id", "request_id must be 1-128 of [A-Za-z0-9_.:-].")
 
 
 def not_found(message: str = "No such session.") -> HarnessError:
@@ -777,7 +793,11 @@ class SessionDirectory:
         because Visibility can't tell a closed session from a deleted one (both are closed by
         the ``close`` Signal), and a deleted session must never come back.
 
-        At most once per REBUILD_BACKOFF_SECONDS per user."""
+        At most once per REBUILD_BACKOFF_SECONDS per user.
+
+        Known gap, deferred to P5 (security review #8): with workers down and Redis lost, a
+        just-deleted session whose ``close`` Signal hasn't run yet is still Running here and
+        comes back."""
         if not self._sync:
             return False
         if not await self.r.set(self._rebuilt_key(user_id), "1", nx=True, ex=REBUILD_BACKOFF_SECONDS):
@@ -1421,12 +1441,49 @@ def create_agent_router(
             headers=SSE_HEADERS,
         )
 
+    async def checked_attachments(attachments: Any, uid: str, session_id: str) -> list[dict[str, Any]]:
+        """A chat message's attachments, each one this user's upload to this session, with a
+        plain id, a MIME-shaped content type and a name without control characters. 422
+        otherwise. Returns the cleaned list that goes to the workflow."""
+        if not isinstance(attachments, list):
+            raise HarnessError(422, "invalid_attachment", "attachments must be a list.")
+        from simple_chat_agent.common.attachments import artifact_is_user_attachment
+
+        cleaned = []
+        for item in attachments:
+            if not isinstance(item, dict):
+                raise HarnessError(422, "invalid_attachment", "Each attachment must be an object.")
+            attachment_id = item.get("attachment_id")
+            if not isinstance(attachment_id, str) or not _ATTACHMENT_ID.fullmatch(attachment_id):
+                raise HarnessError(422, "invalid_attachment", "attachment_id must be 1-128 of [A-Za-z0-9_-].")
+            content_type = item.get("content_type")
+            if content_type is not None and (not isinstance(content_type, str) or not _MIME_TYPE.fullmatch(content_type)):
+                raise HarnessError(422, "invalid_attachment", "content_type must be a MIME type.")
+            name = item.get("name", "")
+            if not isinstance(name, str):
+                raise HarnessError(422, "invalid_attachment", "name must be a string.")
+            artifact = None
+            if app_store is not None:
+                artifact = await asyncio.to_thread(app_store().get_artifact, user_id=uid, artifact_id=attachment_id)
+            if artifact is None or artifact.workflow_id != session_id or not artifact_is_user_attachment(artifact):
+                # Same answer for someone else's id, another session's and an unknown one.
+                raise HarnessError(422, "invalid_attachment", "That attachment isn't part of this session.")
+            cleaned.append({**item, "name": _CONTROL_CHARS.sub("", name).strip()})
+        return cleaned
+
     @router.post("/messages")
     async def submit_message(body: SubmitMessage, uid: str = Depends(user_id)):
+        check_request_id(body.request_id)
         root = await require(body.session_id, uid)
         if root != body.session_id:
             # Subagents have no front door; their parent drives them.
             raise HarnessError(409, "not_supported", "Messages go to the session, not to a subagent.")
+        message_payload = body.message.get("payload") or {}
+        if body.message.get("type") == "chat" and isinstance(message_payload, dict) and "attachments" in message_payload:
+            message_payload = {
+                **message_payload,
+                "attachments": await checked_attachments(message_payload["attachments"], uid, body.session_id),
+            }
         # set_posture / set_model get the same checks as POST sessions, and once accepted
         # they update the session list. A malformed payload is left to the workflow's own
         # validation and doesn't touch the list.
@@ -1454,7 +1511,7 @@ def create_agent_router(
                 FrontDoorMessage(
                     request_id=message_id,
                     type=str(body.message.get("type", "")),
-                    payload=body.message.get("payload") or {},
+                    payload=message_payload,
                 ),
             )
         except RPCError as exc:
@@ -1485,6 +1542,7 @@ def create_agent_router(
 
     @router.post("/approve")
     async def approve(body: Approve, uid: str = Depends(user_id)):
+        check_request_id(body.request_id)
         root = await require(body.session_id, uid)
         if root != body.session_id:
             await approve_child(body, root)

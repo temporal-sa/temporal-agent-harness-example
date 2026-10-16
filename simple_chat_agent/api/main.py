@@ -593,6 +593,13 @@ _APP_HEADERS = {
     "Content-Security-Policy": "frame-ancestors 'none'",
     "Referrer-Policy": "same-origin",
 }
+# The app itself (not the 401 sign-in page, which has an inline script). Checked against the
+# built app in headless Chromium: no violations.
+_APP_CSP = (
+    "default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-src 'self'; "
+    "img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
+)
+_APP_FILE_HEADERS = {**_APP_HEADERS, "Content-Security-Policy": _APP_CSP}
 
 
 def _web_dist() -> Path:
@@ -661,14 +668,21 @@ async def app_page(request: Request, path: str) -> Response:
             "<p>Run <code>make web</code> in the repo root, then reload. "
             "For live reload while you work, run <code>make web-dev</code> instead.</p>",
         )
-    target = (dist / path).resolve() if path else index_html
-    if target.is_relative_to(dist) and target.is_file():
+    not_found = Response("Not found", status_code=404, media_type="text/plain", headers=_APP_HEADERS)
+    if "\x00" in path:
+        return not_found
+    try:
+        target = (dist / path).resolve() if path else index_html
+        is_file = target.is_relative_to(dist) and target.is_file()
+    except (ValueError, OSError):
+        return not_found
+    if is_file:
         # Vite fingerprints everything under assets/, so those can be cached for good.
         cache = "public, max-age=31536000, immutable" if path.startswith("assets/") else "no-cache"
-        return FileResponse(target, headers={**_APP_HEADERS, "Cache-Control": cache})
+        return FileResponse(target, headers={**_APP_FILE_HEADERS, "Cache-Control": cache})
     if path.startswith("assets/") or not target.is_relative_to(dist):
-        return Response("Not found", status_code=404, media_type="text/plain", headers=_APP_HEADERS)
-    return FileResponse(index_html, headers={**_APP_HEADERS, "Cache-Control": "no-cache"})
+        return not_found
+    return FileResponse(index_html, headers={**_APP_FILE_HEADERS, "Cache-Control": "no-cache"})
 
 
 # The harness console (P2 step 2.4): its unchanged static UI at /console/, talking to our own
