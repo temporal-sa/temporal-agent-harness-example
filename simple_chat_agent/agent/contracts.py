@@ -231,7 +231,8 @@ class Findings(BaseModel):
 
 
 class ReviewRequest(BaseModel):
-    """Ask the reviewer to review the workspace's current uncommitted diff."""
+    """Ask the reviewer to review the workspace's changes: the uncommitted diff, or the last
+    commit when nothing is uncommitted."""
 
     focus: str = Field("", description="What to pay most attention to, if anything.")
 

@@ -51,8 +51,9 @@ workspace with your read-only tools. Cite the files and lines that support your 
 brief and factual; don't propose changes."""
 
 REVIEWER_INSTRUCTIONS = """\
-You are a careful code reviewer. Inspect the uncommitted diff (git_diff) and the surrounding
-code, then judge whether the change is correct and complete. Report concrete issues with
+You are a careful code reviewer. Inspect the uncommitted diff (git_diff); if there is none,
+review the last commit instead (git_diff with commit="HEAD"). Read the surrounding code,
+then judge whether the change is correct and complete. Report concrete issues with
 file and line; approve only if you would merge it."""
 
 
@@ -115,7 +116,7 @@ class ExplorerAgent(_ReadOnlyAgent):
 
     @agent.accepts
     async def investigate(self, msg: Question) -> Findings:
-        """Investigate a question about the code and report findings with evidence."""
+        """Investigate one question about the workspace's code (read-only) and report findings with file and line evidence."""
         where = f"\nStart with: {', '.join(msg.paths)}" if msg.paths else ""
         return await self._ask(msg.question + where, Findings)  # type: ignore[return-value]
 
@@ -132,9 +133,12 @@ class ReviewerAgent(_ReadOnlyAgent):
 
     @agent.accepts
     async def review(self, msg: ReviewRequest) -> Review:
-        """Review the current diff and return a verdict with concrete issues."""
+        """Review the workspace's changes (the uncommitted diff, else the last commit) and return a verdict with concrete issues."""
         focus = f" Focus on: {msg.focus}" if msg.focus else ""
-        return await self._ask(f"Review the current uncommitted diff.{focus}", Review)  # type: ignore[return-value]
+        return await self._ask(
+            f"Review the current uncommitted diff, or the last commit if nothing is uncommitted.{focus}",
+            Review,
+        )  # type: ignore[return-value]
 
 
 SUBAGENT_WORKFLOWS = (ExplorerAgent, ReviewerAgent)

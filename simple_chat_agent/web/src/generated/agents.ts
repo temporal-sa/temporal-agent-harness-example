@@ -46,7 +46,7 @@ export type CodingAgentInitData = CodingAgentInit;
 
 /** ExplorerAgent: the workflow type `ExplorerAgent` (simple_chat_agent.agent.subagents:ExplorerAgent). */
 export interface ExplorerAgentHandlers {
-  /** Investigate a question about the code and report findings with evidence. (mid-turn: reject) */
+  /** Investigate one question about the workspace's code (read-only) and report findings with file and line evidence. (mid-turn: reject) */
   investigate: { input: Question; output: Findings; midTurn: "reject" };
 }
 
@@ -55,7 +55,7 @@ export type ExplorerAgentInput<H extends ExplorerAgentHandlerName> = ExplorerAge
 export type ExplorerAgentOutput<H extends ExplorerAgentHandlerName> = ExplorerAgentHandlers[H]["output"];
 
 export const ExplorerAgentHandlerInfo = {
-  investigate: { description: "Investigate a question about the code and report findings with evidence.", midTurn: "reject" },
+  investigate: { description: "Investigate one question about the workspace's code (read-only) and report findings with file and line evidence.", midTurn: "reject" },
 } as const satisfies Record<ExplorerAgentHandlerName, { description: string; midTurn: string }>;
 
 /** States the agent publishes with agent.state(...), by state id. */
@@ -67,7 +67,7 @@ export type ExplorerAgentInitData = SubagentInit;
 
 /** ReviewerAgent: the workflow type `ReviewerAgent` (simple_chat_agent.agent.subagents:ReviewerAgent). */
 export interface ReviewerAgentHandlers {
-  /** Review the current diff and return a verdict with concrete issues. (mid-turn: reject) */
+  /** Review the workspace's changes (the uncommitted diff, else the last commit) and return a verdict with concrete issues. (mid-turn: reject) */
   review: { input: ReviewRequest; output: Review; midTurn: "reject" };
 }
 
@@ -76,7 +76,7 @@ export type ReviewerAgentInput<H extends ReviewerAgentHandlerName> = ReviewerAge
 export type ReviewerAgentOutput<H extends ReviewerAgentHandlerName> = ReviewerAgentHandlers[H]["output"];
 
 export const ReviewerAgentHandlerInfo = {
-  review: { description: "Review the current diff and return a verdict with concrete issues.", midTurn: "reject" },
+  review: { description: "Review the workspace's changes (the uncommitted diff, else the last commit) and return a verdict with concrete issues.", midTurn: "reject" },
 } as const satisfies Record<ReviewerAgentHandlerName, { description: string; midTurn: string }>;
 
 /** States the agent publishes with agent.state(...), by state id. */

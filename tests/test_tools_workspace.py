@@ -989,6 +989,26 @@ class RunCommandActivityTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(heartbeats)
         self.assertEqual(heartbeats[-1][0]["execution_id"], result.log_ref)
 
+    async def test_changed_files_leave_out_what_git_ignores(self) -> None:
+        """P3 demo: pytest's caches showed as 16 changes. Only files git doesn't ignore count."""
+        import subprocess
+
+        (self.ws_dir / ".gitignore").write_text("__pycache__/\n*.pyc\n.pytest_cache/\n")
+        (self.ws_dir / "app.py").write_text("x = 1\n")
+        subprocess.run("git init -q && git add -A && git -c user.name=t -c user.email=t@e commit -qm init",
+                       shell=True, cwd=self.ws_dir, check=True)
+        result = await self.env().run(ws.run_command_activity, self.input(
+            "mkdir -p pkg/__pycache__ .pytest_cache/v && touch pkg/__pycache__/m.cpython-312.pyc "
+            ".pytest_cache/v/lastfailed stray.pyc && echo 'y = 2' > new.py && echo 'x = 2' > app.py"
+        ))
+        self.assertEqual(sorted((c.path, c.status) for c in result.changed_files),
+                         [("app.py", "modified"), ("new.py", "created")])
+        self.assertEqual(result.changed_files_total, 2)
+
+    async def test_changed_files_outside_a_repo_are_all_kept(self) -> None:
+        result = await self.env().run(ws.run_command_activity, self.input("mkdir -p __pycache__ && touch __pycache__/a.pyc"))
+        self.assertEqual([c.path for c in result.changed_files], ["__pycache__/a.pyc"])
+
     async def test_nonzero_exit_is_a_result_not_an_error(self) -> None:
         result = await self.env().run(ws.run_command_activity, self.input("echo bad >&2; exit 3"))
         self.assertEqual(result.exit_code, 3)
@@ -1279,6 +1299,13 @@ class ExecToolsTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
         nothing = await self.call(ws.git_commit, "noop", "ws-1", False)
         self.assertFalse(nothing.committed)
         self.assertEqual(nothing.branch, "main")
+        # A commit's own changes (the reviewer after a commit): git_diff(commit="HEAD").
+        last = await self.call(ws.git_diff, "ws-1", None, False, "HEAD")
+        self.assertEqual(last.commit, "HEAD")
+        self.assertEqual(last.files, [ws.GitDiffFile(path="app.py", added=1, removed=0)])
+        self.assertIn("+x = 1", last.diff)
+        with self.assertRaises(ApplicationError):
+            await self.call(ws.git_diff, "ws-1", None, False, "--output=/tmp/x")
 
 
 

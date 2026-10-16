@@ -107,8 +107,9 @@ class PlanReply(BaseModel):
 async def update_plan(update: PlanUpdate, plan: agent.Injected[StateRef[PlanState]]) -> PlanReply:
     """Write your plan for the current task as a checklist the user can watch.
 
-    Call it at the start of a multi-step task, and again whenever a step starts, finishes or
-    changes. Send the whole list each time; mark at most one step `in_progress`.
+    Call it at the start of a multi-step task, and again every time a step finishes (mark it
+    `done` and the next one `in_progress`); a plan left unticked tells the user nothing was
+    done. Send the whole list each time; mark at most one step `in_progress`.
     """
     # Bounded: every plan change becomes a state patch in workflow history.
     items = [
@@ -116,7 +117,11 @@ async def update_plan(update: PlanUpdate, plan: agent.Injected[StateRef[PlanStat
     ]
     plan.set(PlanState(goal=update.goal.strip()[:MAX_PLAN_TEXT], items=items))
     done = sum(1 for i in items if i.status == "done")
-    return PlanReply(summary=f"Plan updated: {done}/{len(items)} steps done.")
+    summary = f"Plan updated: {done}/{len(items)} steps done."
+    if done < len(items):
+        # Models tend to write a plan and never tick it; the reply is where they look next.
+        summary += " Call update_plan again as each step finishes, marking it done."
+    return PlanReply(summary=summary)
 
 
 STATE_TOOLS = (update_plan,)

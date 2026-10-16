@@ -498,7 +498,8 @@ export interface Review {
   issues: Issue[];
 }
 /**
- * Ask the reviewer to review the workspace's current uncommitted diff.
+ * Ask the reviewer to review the workspace's changes: the uncommitted diff, or the last
+ * commit when nothing is uncommitted.
  */
 export interface ReviewRequest {
   /**

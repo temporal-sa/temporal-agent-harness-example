@@ -75,6 +75,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import shlex
 import time
 from collections.abc import Callable
@@ -502,11 +503,15 @@ class GitDiffResult(ToolResult):
     diff: str = ""
     truncated: bool = False
     error: str | None = None
+    # Set when the diff is a commit's changes (``git_diff(commit=...)``).
+    commit: str | None = None
 
     def model_text(self) -> str:
         if self.error:
             return f"git diff failed: {self.error}"
         if not self.files and not self.diff:
+            if self.commit:
+                return f"No changes in {self.commit}."
             return "No staged changes." if self.staged else "No unstaged changes."
         return self.diff or "\n".join(
             f"{f.path} +{f.added if f.added is not None else '?'} "
@@ -1296,6 +1301,57 @@ def _retry_schedule(info: activity.Info) -> dict[str, Any]:
     }
 
 
+def reported_changed_paths(payload: dict[str, Any]) -> list[str]:
+    """The paths the executor saw change during a command, outside .git."""
+    files = payload.get("files_changed") if isinstance(payload.get("files_changed"), dict) else {}
+    return [
+        str(name)
+        for status in ("modified", "created", "deleted")
+        for name in files.get(status, []) or []
+        if not (name == ".git" or str(name).startswith(".git/"))
+    ]
+
+
+# At most this many changed paths are checked against .gitignore after a command; beyond it
+# they are listed unchecked.
+MAX_IGNORE_CHECK_PATHS = 2_000
+
+
+def check_ignore_command() -> str:
+    """Prints which of the paths on stdin (one per line) git ignores. ``check-ignore`` exits
+    1 when none is ignored; that is not a failure."""
+    return "\n".join([GIT_PRELUDE, f"{GIT} check-ignore --stdin || [ $? -eq 1 ]"])
+
+
+async def _git_ignored(workspace_id: str, paths: list[str], heartbeat: dict[str, Any] | None = None) -> set[str]:
+    """The subset of ``paths`` the workspace's git ignores (.gitignore and friends), so
+    caches a command wrote (``__pycache__``, ``.pytest_cache``) don't show as changes. Best
+    effort: on any failure nothing is treated as ignored."""
+    checked = [p for p in paths[:MAX_IGNORE_CHECK_PATHS] if "\n" not in p]
+    if not checked:
+        return set()
+    body = {
+        "workspace_id": workspace_id,
+        "execution_id": _activity_execution_id("check_ignore"),
+        "command": check_ignore_command(),
+        "cwd": "/workspace",
+        "timeout_seconds": 30,
+        "network": False,
+        "stdin": "\n".join(checked) + "\n",
+    }
+    # Heartbeat the caller's details (run_command's delivered seq), so a retry from here
+    # still knows what output was already published.
+    details = heartbeat if heartbeat is not None else {"phase": "check_ignore"}
+    try:
+        result, _ = await _stream_execute(body, on_tick=_heartbeat_ticker(lambda: dict(details)))
+    except Exception as exc:  # noqa: BLE001 - the change list is a convenience
+        activity.logger.info("git check-ignore failed: %s", exc)
+        return set()
+    if result.get("exit_code") != 0:
+        return set()
+    return {line for line in str(result.get("stdout") or "").splitlines() if line}
+
+
 def command_result(
     command: str,
     payload: dict[str, Any],
@@ -1303,14 +1359,16 @@ def command_result(
     log_ref: str,
     attempt: int = 1,
     reattached: bool = False,
+    ignored: set[str] | frozenset[str] = frozenset(),
 ) -> CommandResult:
-    """Build the bounded CommandResult from an executor result payload."""
+    """Build the bounded CommandResult from an executor result payload. ``ignored`` paths
+    (git ignores them) are left out of ``changed_files``."""
     stdout, stderr, cut = bounded_output(str(payload.get("stdout") or ""), str(payload.get("stderr") or ""))
     changed: list[ChangedFile] = []
     files = payload.get("files_changed") if isinstance(payload.get("files_changed"), dict) else {}
     for status in ("modified", "created", "deleted"):
         for name in files.get(status, []) or []:
-            if name == ".git" or name.startswith(".git/"):
+            if name == ".git" or name.startswith(".git/") or name in ignored:
                 continue
             changed.append(ChangedFile(path=str(name), status=status))  # type: ignore[arg-type]
     exit_code = payload.get("exit_code")
@@ -1447,6 +1505,7 @@ async def run_command_activity(request: RunCommandInput) -> CommandResult:
         log_ref=execution_id,
         attempt=info.attempt,
         reattached=attached or info.attempt > 1,
+        ignored=await _git_ignored(request.workspace_id, reported_changed_paths(result), state),
     )
 
 
@@ -1552,11 +1611,23 @@ def git_status_command() -> str:
     return f"{GIT_PRELUDE}\n{GIT} status --porcelain=v1 -b --ignore-submodules=all"
 
 
-def git_diff_command(path: str | None, staged: bool) -> str:
-    base = (
-        f"{GIT} diff --no-ext-diff --no-textconv --no-color --ignore-submodules=all"
-        + (" --cached" if staged else "")
-    )
+# A commit-ish for git_diff(commit=...): a ref, a hash, or one with ~N / ^ suffixes. Never an
+# option (no leading "-") and never a path or range.
+_COMMIT_REF = re.compile(r"^(?!-)(?!.*\.\.)[A-Za-z0-9_][A-Za-z0-9_./-]{0,99}(?:[~^][0-9]{0,3})*$")
+
+
+def git_diff_command(path: str | None, staged: bool, commit: str | None = None) -> str:
+    if commit is not None:
+        # One commit's changes, against its first parent.
+        base = (
+            f"{GIT} show --format= --no-ext-diff --no-textconv --no-color --ignore-submodules=all "
+            f"{shlex.quote(commit)}"
+        )
+    else:
+        base = (
+            f"{GIT} diff --no-ext-diff --no-textconv --no-color --ignore-submodules=all"
+            + (" --cached" if staged else "")
+        )
     scope = f" -- {shlex.quote(path)}" if path else ""
     return (
         f"{GIT_PRELUDE}\n"
@@ -1588,16 +1659,25 @@ async def git_diff(
     workspace_id: agent.Injected[str],
     path: str | None = None,
     staged: bool = False,
+    commit: str | None = None,
 ) -> GitDiffResult:
     """Show the git diff of the workspace: unstaged changes, or staged ones with
-    `staged=true`. `path` limits it to one file or directory. Untracked files are not
+    `staged=true`, or the changes made by one commit with `commit` (e.g. "HEAD" for the
+    last commit). `path` limits it to one file or directory. Untracked files are not
     included (see git_status)."""
     scope = _check_relative_path(path) if path else None
-    result = await _exec_collect(workspace_id, "git_diff", git_diff_command(scope, staged))
+    if commit is not None and not _COMMIT_REF.fullmatch(commit):
+        raise ApplicationError(
+            "`commit` must be a commit hash or ref such as HEAD or HEAD~1.",
+            type="InvalidArgument",
+            non_retryable=True,
+        )
+    result = await _exec_collect(workspace_id, "git_diff", git_diff_command(scope, staged, commit))
     error = _git_error(result)
     if error:
-        return GitDiffResult(staged=staged, error=error)
+        return GitDiffResult(staged=staged, error=error, commit=commit)
     parsed = parse_git_diff(str(result.get("stdout") or ""), staged)
+    parsed.commit = commit
     if result.get("stdout_truncated"):
         parsed.truncated = True
     return parsed

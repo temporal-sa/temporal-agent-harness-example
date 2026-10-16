@@ -9,7 +9,7 @@
   },
   "handlers": {
     "review": {
-      "description": "Review the current diff and return a verdict with concrete issues.",
+      "description": "Review the workspace's changes (the uncommitted diff, else the last commit) and return a verdict with concrete issues.",
       "mid_turn": "reject",
       "input": {
         "$ref": "#/$defs/ReviewRequest"
@@ -127,7 +127,7 @@
       "type": "object"
     },
     "ReviewRequest": {
-      "description": "Ask the reviewer to review the workspace's current uncommitted diff.",
+      "description": "Ask the reviewer to review the workspace's changes: the uncommitted diff, or the last\ncommit when nothing is uncommitted.",
       "properties": {
         "focus": {
           "default": "",

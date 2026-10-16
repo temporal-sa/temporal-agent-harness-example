@@ -9,7 +9,7 @@
   },
   "handlers": {
     "investigate": {
-      "description": "Investigate a question about the code and report findings with evidence.",
+      "description": "Investigate one question about the workspace's code (read-only) and report findings with file and line evidence.",
       "mid_turn": "reject",
       "input": {
         "$ref": "#/$defs/Question"
