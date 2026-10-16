@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ProgressFolder, RECORD_SEPARATOR, parseDelta } from "./progress";
 import { emptyAcc, foldFrames, summarize } from "./telemetry";
 import { withRiskClass } from "./derive";
-import type { PendingApproval, ToolPart } from "./types";
+import type { ToolPart } from "./types";
 
 const RS = RECORD_SEPARATOR;
 const frame = (tool_id: string, progress_delta: string, timestamp = 10) => ({
@@ -97,6 +97,20 @@ describe("progress parser", () => {
   });
 });
 
+describe("notes", () => {
+  it("sit on their own line with no blank lines around them", () => {
+    const folder = new ProgressFolder();
+    const v = folder.update([
+      frame("t1", output(1, ["stdout", "batch 6 of 10"])),
+      frame("t1", output(null, ["note", "\n\n── reattached on worker-b ──\n\n"])),
+      frame("t1", output(2, ["stdout", "\n\nbatch 7 of 10\n"])),
+      frame("t1", output(null, ["note", "\n"])),
+    ]);
+    expect(v.text.t1).toBe("batch 6 of 10\n── reattached on worker-b ──\nbatch 7 of 10\n");
+    expect(v.chunks.t1?.map((c) => c.stream)).toEqual(["stdout", "note", "stdout"]);
+  });
+});
+
 describe("run ids", () => {
   it("reads each agent's latest run id and the x_worker runs map", () => {
     const acc = emptyAcc();
@@ -111,7 +125,7 @@ describe("run ids", () => {
 });
 
 describe("risk classes", () => {
-  const pending = (toolName: string) => ({ agentId: "root", messageId: "m", part: { toolName } as ToolPart }) as PendingApproval;
+  const pending = (toolName: string) => ({ agentId: "root", messageId: "m", part: { toolName } as ToolPart });
   it("come from config, with its default for unmapped tools", () => {
     const out = withRiskClass([pending("edit_file"), pending("run_command"), pending("mcp_thing")], { edit_file: "workspace_edit", run_command: "shell" }, "external_side_effect", ["workspace_edit"]);
     expect(out.map((o) => [o.riskClass, o.rememberAllowed])).toEqual([

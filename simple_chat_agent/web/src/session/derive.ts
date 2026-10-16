@@ -120,7 +120,7 @@ export function sessionStatus(input: {
 
 /** Tag each waiting call with its approval class from config, and whether "Always approve"
  *  can apply to it. Neither is hard-coded: both come from /api/agent/config. */
-export function withRiskClass<T extends PendingApproval>(
+export function withRiskClass<T extends { part: { toolName: string } }>(
   approvals: readonly T[],
   classes: Readonly<Record<string, string>> | null | undefined,
   fallback: string | null | undefined,

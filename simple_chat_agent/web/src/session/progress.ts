@@ -75,6 +75,25 @@ export function sandboxFrom(notice: Obj, toolId: string | null): SandboxHealth {
   };
 }
 
+/**
+ * Our own notes (reattach, dropped output, limit reached) sit on a line of their own with no
+ * blank lines around them: a note starts on a fresh line, ends with one newline, and the
+ * output right after a note drops its leading newlines.
+ */
+export function tidy(
+  chunk: { stream: string; text: string },
+  previous: { stream: string } | undefined,
+  textSoFar: string,
+): string {
+  if (chunk.stream === "note") {
+    const line = chunk.text.replace(/^\n+/, "").replace(/\n+$/, "");
+    if (!line) return "";
+    const lead = textSoFar === "" || textSoFar.endsWith("\n") ? "" : "\n";
+    return `${lead}${line}\n`;
+  }
+  return previous?.stream === "note" ? chunk.text.replace(/^\n+/, "") : chunk.text;
+}
+
 export interface ProgressView {
   /** Output per tool id: stdout, stderr and notes, in arrival order. */
   text: Readonly<Record<string, string>>;
@@ -129,8 +148,12 @@ export class ProgressFolder {
       }
       const at = typeof f.data.timestamp === "number" ? Math.round(f.data.timestamp * 1000) : null;
       for (const c of parsed.chunks) {
-        this.#text[toolId] = (this.#text[toolId] ?? "") + c.text;
-        (this.#chunks[toolId] ??= []).push({ text: c.text, stream: c.stream, at });
+        const list = (this.#chunks[toolId] ??= []);
+        const before = this.#text[toolId] ?? "";
+        const text = tidy(c, list[list.length - 1], before);
+        if (!text) continue;
+        this.#text[toolId] = before + text;
+        list.push({ text, stream: c.stream, at });
         changed = true;
       }
     }

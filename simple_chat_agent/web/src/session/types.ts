@@ -66,9 +66,9 @@ export type RiskClass = "read_only" | "workspace_edit" | "shell" | "network" | "
  *  only while config hasn't loaded. `rememberAllowed`: its class is in config
  *  `remember_allowed_classes` (offer "Always approve"). */
 export type PendingApproval = WaitingToolCall & {
-  /** Always set by the facade; optional so hand-built test values stay valid. */
-  riskClass?: RiskClass | (string & {}) | null;
-  rememberAllowed?: boolean;
+  /** Null only while config hasn't loaded. */
+  riskClass: RiskClass | (string & {}) | null;
+  rememberAllowed: boolean;
 };
 
 // -- config and catalog (GET /api/agent/config) ---------------------------------------------
@@ -324,8 +324,7 @@ export interface SandboxHealth {
  *  is a line from us, not the command (reattach, dropped output, limit reached). */
 export interface ToolProgressChunk {
   text: string;
-  /** Never null from the facade; null stays in the type for older hand-built values. */
-  stream: "stdout" | "stderr" | "note" | null;
+  stream: "stdout" | "stderr" | "note";
   /** ms since epoch, from the frame. */
   at: number | null;
 }
