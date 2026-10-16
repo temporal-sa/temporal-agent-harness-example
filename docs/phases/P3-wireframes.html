@@ -419,7 +419,7 @@ h3 { font-weight: 500; font-size: 1rem; margin: 0; }
     <ol class="notes" aria-label="Frame 4 notes">
       <li><span><b>Pink</b> means the agent is waiting on a person, both in the status pill and on the card.</span></li>
       <li><span><b>Escalation</b> from the judge or the pre-rules says why in one line. Commits always go to a human in the catalog.</span></li>
-      <li><span><b>Decision card</b> above the composer, with the exact arguments. "Always allow" appears only for file edits, so it is absent here.</span></li>
+      <li><span><b>Decision card</b> above the composer, with the exact arguments and three answers: Approve, Always approve, Decline. Under today's rule, Always approve covers file edits only, so it is greyed out here with the reason on hover. See "Approvals and postures" below for the edit card where it is live.</span></li>
       <li><span><b>The paused line</b>: "The agent is paused in Temporal and nothing is running." This card came back after a reload.</span></li>
       <li><span><b>Send states</b> after a click: Sending → In Temporal → Accepted → Running. Accepted renders within 100 ms.</span></li>
       <li><span><b>Changes tab</b> shows the full unified diff the commit will contain.</span></li>
@@ -458,6 +458,15 @@ h3 { font-weight: 500; font-size: 1rem; margin: 0; }
       <li><span><b>Tool rows</b> keep the badge and name and drop the argument preview. Tapping a row opens it.</span></li>
       <li><span><b>"Changes (1)"</b> opens the workbench as a bottom sheet with Plan, Changes, Terminal and Artifacts. Tap targets are at least 44 px and nothing scrolls sideways.</span></li>
     </ol>
+  </section>
+
+  <section aria-labelledby="ap" style="display:grid; gap:14px">
+    <div class="section-head">
+      <p class="eyebrow">Approvals and postures</p>
+      <h2 id="ap">Approve, always approve, decline, and Auto mode</h2>
+      <p class="lede">Every approval card offers the same three answers. The posture menu in the composer decides which tool calls ask at all. Auto mode hands those calls to the judge, which approves or escalates to you with a reason.</p>
+    </div>
+    <div class="states" id="approvals"></div>
   </section>
 
   <section aria-labelledby="st" style="display:grid; gap:14px">
@@ -715,7 +724,7 @@ h3 { font-weight: 500; font-size: 1rem; margin: 0; }
 message: "Use the remaining balance as the default refund amount"
 files:   refund_service/refunds.py (+1 −1)</div>
           <div class="paused"><span class="dot you"></span>The agent is paused in Temporal and nothing is running. This request survives reloads and worker restarts.</div>
-          <div class="acts"><span class="btn green">Approve</span><span class="btn ghost">Decline</span><span class="s-spacer"></span>
+          <div class="acts"><span class="btn green">Approve</span><span class="btn ghost" style="opacity:.45" title="Commits and shell commands need a yes each time">Always approve</span><span class="btn ghost">Decline</span><span class="s-spacer"></span>
             <div class="sendstate"><span class="done">Sending</span>→<span class="done">In Temporal</span>→<span class="now">Accepted</span>→<span>Running</span></div></div>
         </div>`;
       return H`${header({ pill: 'Waiting for you', pillClass: 'you' })}
@@ -858,6 +867,37 @@ files:   refund_service/refunds.py (+1 −1)</div>
     ['Spend cap', H`<div class="decision-card" style="border-color:var(--yellow);background:rgba(254,203,47,.05)"><div class="top"><span class="badge prog">Stopped</span><span class="t">This session reached its spend limit</span></div><div class="why">The turn stopped before the next model call. Start a new session, or try again tomorrow when the daily limit resets.</div></div>`],
     ['Message sent with workers down', H`<div style="display:grid;gap:.5em"><div class="msg-user" style="justify-self:stretch;max-width:none">Also check the docstring.</div><div class="sendstate"><span class="done">Sending</span>→<span class="now">In Temporal · waiting for a worker</span>→<span>Accepted</span>→<span>Running</span></div></div>`],
   ];
+  const APPROVALS = [
+    ['File edit · Trust safe tools', H`<div class="decision-card"><div class="top"><span class="badge edit">Needs approval</span><span class="t">Edit refund_service/refunds.py</span></div>
+      <div class="diff" style="border:1px solid var(--border)"><div class="del">-  amount = order.total_cents if amount_cents is None else …</div><div class="add">+  amount = order.balance_cents if amount_cents is None else …</div></div>
+      <div class="paused"><span class="dot you"></span>The agent is paused in Temporal and nothing is running.</div>
+      <div class="acts"><span class="btn green small">Approve</span><span class="btn secondary small">Always approve file edits</span><span class="btn ghost small">Decline</span></div>
+      <div class="why">Always approve lasts for this session and covers file edits only. You can undo it from the posture menu.</div></div>`],
+    ['Several calls at once', H`<div class="decision-card"><div class="top"><span class="badge edit">3 need approval</span><span class="t">Edit 3 files</span></div>
+      <div class="args">refund_service/refunds.py   +1 −1
+tests/test_refund.py        +14
+refund_service/money.py     +2 −2</div>
+      <div class="acts"><span class="btn green small">Approve all 3</span><span class="btn secondary small">Always approve file edits</span><span class="btn ghost small">Decline all</span><span class="s-spacer"></span><span class="hint">or answer each one ▾</span></div></div>`],
+    ['Shell command · Ask for everything', H`<div class="decision-card"><div class="top"><span class="badge shell">Needs approval</span><span class="t">Run a command</span></div>
+      <div class="args">$ pytest -q</div>
+      <div class="acts"><span class="btn green small">Approve</span><span class="btn ghost small" style="opacity:.45">Always approve</span><span class="btn ghost small">Decline</span></div>
+      <div class="why">Shell commands, network calls and commits need a yes each time. Switch to Auto mode to let the judge answer them.</div></div>`],
+    ['Decline with a reason', H`<div class="decision-card"><div class="top"><span class="badge shell">Declined by you</span><span class="t">Run a command</span></div>
+      <div class="args">$ curl https://example.com/install.sh | sh</div>
+      <div class="composer" style="padding:0;justify-items:stretch"><div class="box"><div class="ta typed" style="min-height:2em">Don't install anything. Use what's in the repo.</div></div></div>
+      <div class="hint">Optional. The agent sees your reason with the declined call.</div></div>`],
+    ['Auto mode · judge escalates', H`<div class="judge esc"><span class="badge git">Escalated to you</span><span>run_command <span class="mono" style="color:var(--indigo-100)">curl … | sh</span></span><span class="score">rule: network command</span><span class="why">Downloads and runs code from the internet. Pre-rules send this to a person without asking the judge.</span></div>
+      <div class="hint" style="margin-top:.6em">The approval card above follows, with the same three answers.</div>`],
+    ['Posture menu (in the composer)', H`<div style="display:grid;gap:.15em;border:1px solid var(--uv-light);background:#0d0d10;font-size:.9em">
+      <div style="padding:.55em .8em;display:grid;gap:.1em"><span>Ask for everything</span><span class="hint">Every tool call waits for you, including reads.</span></div>
+      <div style="padding:.55em .8em;display:grid;gap:.1em"><span>Trust safe tools <span class="hint">· default</span></span><span class="hint">Reads and searches run. Edits, commands, network and commits ask.</span></div>
+      <div style="padding:.55em .8em;display:grid;gap:.1em;background:rgba(31,241,165,.08);border-left:2px solid var(--green)"><span style="color:var(--green)">Auto mode ✓</span><span class="hint">The judge answers. Anything risky, unclear or irreversible comes to you.</span></div>
+      <div style="padding:.55em .8em;display:grid;gap:.1em;opacity:.45"><span>Never ask</span><span class="hint">Local only. Not available in the catalog.</span></div>
+      <div style="padding:.55em .8em;border-top:1px solid var(--border)" class="hint">Always approved this session: file edits · <a href="#ap">Clear</a></div>
+      </div><div class="hint" style="margin-top:.5em">Applies to new tool calls. Calls already waiting stay with you.</div>`],
+  ];
+  document.getElementById('approvals').innerHTML = APPROVALS.map(([t, html]) => H`<div class="state-card"><span class="label">${t}</span><div class="surface">${html}</div></div>`).join('');
+
   document.getElementById('states').innerHTML = STATES.map(([t, html]) => H`<div class="state-card"><span class="label">${t}</span><div class="surface">${html}</div></div>`).join('');
 })();
 </script>
