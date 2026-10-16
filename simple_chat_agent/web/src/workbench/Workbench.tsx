@@ -4,10 +4,12 @@
 
 import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
 
-import type { CodingSession, PlanItem, WorkbenchProps as SlotProps } from "../session";
+import type { CodingSession, PlanItem, WorkbenchFocus, WorkbenchProps as SlotProps } from "../session";
 import { count, hms } from "../recovery/format";
 import { artifactsOf, PREVIEW_SANDBOX, type ArtifactItem } from "./artifacts";
-import { fileChanges, fileStat, workspaceFacts, type WorkspaceFacts } from "./changes";
+import { fileChanges, fileStat, focusedFile, workspaceFacts, type WorkspaceFacts } from "./changes";
+
+const FLASH_MS = 1600;
 import { DiffView } from "./DiffView";
 import {
   COMMAND_TOOLS,
@@ -38,11 +40,17 @@ export interface WorkbenchProps extends SlotProps {
   initialTab?: WorkbenchTab;
 }
 
-export function Workbench({ session, variant, initialTab }: WorkbenchProps) {
-  const [tab, setTab] = useState<WorkbenchTab>(initialTab ?? "plan");
+export function Workbench({ session, variant, initialTab, focus }: WorkbenchProps) {
+  const [tab, setTab] = useState<WorkbenchTab>(focus ? "changes" : (initialTab ?? "plan"));
   useEffect(() => {
     if (initialTab) setTab(initialTab);
   }, [initialTab]);
+  // A path chip in the transcript asks to see a file: open Changes. `focus.at` changes on every
+  // click, so focusing the same file again scrolls to it again.
+  const focusAt = focus?.at ?? null;
+  useEffect(() => {
+    if (focusAt !== null) setTab("changes");
+  }, [focusAt]);
   const base = useId();
   const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
 
@@ -121,7 +129,7 @@ export function Workbench({ session, variant, initialTab }: WorkbenchProps) {
         tabIndex={0}
       >
         {tab === "plan" && <PlanPanel session={session} facts={facts} />}
-        {tab === "changes" && <ChangesPanel session={session} tools={tools} />}
+        {tab === "changes" && <ChangesPanel session={session} tools={tools} focus={focus ?? null} />}
         {tab === "terminal" && <TerminalPanel session={session} runs={runs} facts={facts} />}
         {tab === "artifacts" && <ArtifactsPanel artifacts={artifacts} />}
       </div>
@@ -186,8 +194,27 @@ function Facts({ facts }: { facts: WorkspaceFacts }) {
 
 // -- Changes --------------------------------------------------------------------------------
 
-function ChangesPanel({ session, tools }: { session: CodingSession; tools: LocatedTool[] }) {
+function ChangesPanel({ session, tools, focus }: { session: CodingSession; tools: LocatedTool[]; focus: WorkbenchFocus | null }) {
   const files = useMemo(() => fileChanges(session.changes, tools), [session.changes, tools]);
+  const refs = useRef(new Map<string, HTMLElement>());
+  const [flash, setFlash] = useState<{ path: string; at: number } | null>(null);
+  const target = focus ? focusedFile(files, focus.path) : null;
+  const focusAt = focus?.at ?? null;
+  useEffect(() => {
+    if (focusAt === null || target === null) return;
+    const el = refs.current.get(target);
+    if (!el) return;
+    const reduce = typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    el.scrollIntoView({ block: "start", behavior: reduce ? "auto" : "smooth" });
+    el.focus({ preventScroll: true });
+    // Restart the highlight even when the same file is focused again while it still shows.
+    if (!reduce && typeof el.animate === "function") {
+      el.animate([{ backgroundColor: "rgba(97, 105, 237, .25)" }, { backgroundColor: "transparent" }], { duration: FLASH_MS, easing: "ease-out" });
+    }
+    setFlash({ path: target, at: focusAt });
+    const t = window.setTimeout(() => setFlash((f) => (f?.at === focusAt ? null : f)), FLASH_MS);
+    return () => window.clearTimeout(t);
+  }, [focusAt, target]);
   const commits = session.changes?.commits ?? [];
   if (files.length === 0 && commits.length === 0) return <p className="wb-empty">No files changed yet.</p>;
   return (
@@ -195,7 +222,16 @@ function ChangesPanel({ session, tools }: { session: CodingSession; tools: Locat
       {files.map((f) => {
         const s = fileStat(f);
         return (
-          <article key={f.path} className="wb-file" aria-label={`${f.path}, ${f.status}`}>
+          <article
+            key={f.path}
+            ref={(el) => {
+              if (el) refs.current.set(f.path, el);
+              else refs.current.delete(f.path);
+            }}
+            tabIndex={-1}
+            className={`wb-file${flash?.path === f.path ? " flash" : ""}`}
+            aria-label={`${f.path}, ${f.status}`}
+          >
             <header className="fh">
               <span className="path">{f.path}</span>
               <span className="status">{f.status}</span>

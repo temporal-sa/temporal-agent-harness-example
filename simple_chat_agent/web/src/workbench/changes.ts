@@ -90,3 +90,14 @@ export function workspaceFacts(
     exit: !workspace?.last_command ? "none yet" : exitCode === null || exitCode === undefined ? "not reported" : String(exitCode),
   };
 }
+
+/** The Changes entry a transcript path chip points at: an exact match after normalising,
+ *  else the one file whose path ends with the chip's path (a chip may show a shorter path). */
+export function focusedFile(files: readonly Pick<FileChanges, "path">[], path: string): string | null {
+  const want = normPath(path);
+  if (!want) return null;
+  const exact = files.find((f) => normPath(f.path) === want);
+  if (exact) return exact.path;
+  const tail = files.filter((f) => normPath(f.path).endsWith(`/${want}`));
+  return tail.length === 1 ? tail[0]!.path : null;
+}

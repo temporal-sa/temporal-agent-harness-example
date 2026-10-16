@@ -41,6 +41,10 @@
 
 /* Changes */
 .wb-file { border: 1px solid var(--border); }
+.wb-file:focus-visible { outline: none; box-shadow: var(--focus); }
+/* A file opened from a transcript path chip: a border that holds for a moment (the fading
+   background is a Web Animation, skipped under reduced motion). */
+.wb-file.flash { border-color: var(--uv-light); }
 .wb-file .fh { display: flex; gap: .6em; align-items: center; padding: .5em .8em; font-family: var(--mono); font-size: .76em; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
 .wb-file .path { overflow-wrap: anywhere; }
 .wb-file .status { color: var(--slate-300); font-size: .9em; }
