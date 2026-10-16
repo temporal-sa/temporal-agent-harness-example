@@ -1415,5 +1415,203 @@ class VerificationFollowUpTests(_RouteHelpers, AgentRoutesTestBase):
         self.assertEqual(r.status_code, 403)
 
 
+class ProductViewConfigTests(AgentRoutesTestBase):
+    """P3 step 3.0: what the model picker, posture menu and header links read from config."""
+
+    def config(self, **env: str) -> dict[str, Any]:
+        with mock.patch.dict(os.environ, env):
+            r = self.client.get("/api/agent/config", headers=A)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.headers["cache-control"], "no-store")
+        return r.json()
+
+    def test_picker_fields(self) -> None:
+        c = self.config()
+        self.assertEqual(c["default_model"], {"provider": "anthropic", "model": "claude-sonnet-5-5"})
+        for provider in c["providers"]:
+            self.assertTrue(provider["label"])
+            self.assertIn(provider["default_model"], [m["id"] for m in provider["models"]])
+            for model in provider["models"]:
+                self.assertEqual(model["provider"], provider["provider"])
+                self.assertEqual(model["effort_options"], ["low", "medium", "high"])
+                self.assertIn(model["default_effort"], model["effort_options"])
+
+    def test_posture_menu_catalog(self) -> None:
+        c = self.config()
+        options = {o["id"]: o for o in c["posture_options"]}
+        self.assertEqual(list(options), ["ask_everything", "trust_safe", "auto", "never_ask"])
+        self.assertFalse(options["never_ask"]["available"])
+        self.assertEqual(options["never_ask"]["reason"], "Local development only.")
+        self.assertTrue(options["auto"]["available"])
+        self.assertTrue(options["trust_safe"]["default"])
+        self.assertEqual(sum(o["default"] for o in options.values()), 1)
+        # ``postures`` stays the selectable subset.
+        self.assertEqual([p["id"] for p in c["postures"]], [o["id"] for o in c["posture_options"] if o["available"]])
+
+    def test_posture_menu_local(self) -> None:
+        options = {o["id"]: o for o in self.config(AGENT_ENVIRONMENT="local")["posture_options"]}
+        self.assertTrue(options["never_ask"]["available"])
+        self.assertIsNone(options["never_ask"]["reason"])
+
+    def test_auto_mode_judge(self) -> None:
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("AGENT_JUDGE_MODEL", None)
+            os.environ.pop("TYPESAFE_API_KEY", None)
+            os.environ.pop("TYPESAFE_AI_API_KEY", None)
+            c = self.config()
+            self.assertEqual(
+                c["auto_mode"],
+                {"available": True, "judge": "llm", "judge_model": "anthropic:claude-haiku-5-5", "reason": None},
+            )
+            c = self.config(AGENT_JUDGE_MODEL="not-a-spec")
+            self.assertFalse(c["auto_mode"]["available"])
+            self.assertTrue(c["auto_mode"]["reason"])
+            auto = next(o for o in c["posture_options"] if o["id"] == "auto")
+            self.assertEqual((auto["available"], auto["reason"]), (False, c["auto_mode"]["reason"]))
+            self.assertFalse(self.config(AGENT_JUDGE_MODEL="mystery:model")["auto_mode"]["available"])
+            self.assertTrue(self.config(AGENT_JUDGE_MODEL="openai:gpt-5.4-mini")["auto_mode"]["available"])
+
+    def test_temporal_ui_link(self) -> None:
+        def link(**env: str) -> dict[str, Any]:
+            with mock.patch.dict(os.environ, env):
+                for name in ("TEMPORAL_UI_URL", "TEMPORAL_ADDRESS", "TEMPORAL_ENDPOINT", "TEMPORAL_NAMESPACE"):
+                    if name not in env:
+                        os.environ.pop(name, None)
+                return self.config()["links"]["temporal_ui"]
+
+        self.assertEqual(
+            link(TEMPORAL_ADDRESS="127.0.0.1:7244")["url_template"],
+            "http://127.0.0.1:8244/namespaces/default/workflows/{workflow_id}",
+        )
+        self.assertEqual(
+            link(TEMPORAL_ADDRESS="ns.acct.tmprl.cloud:7233", TEMPORAL_NAMESPACE="ns.acct")["url_template"],
+            "https://cloud.temporal.io/namespaces/ns.acct/workflows/{workflow_id}",
+        )
+        self.assertEqual(
+            link(TEMPORAL_UI_URL="https://ui.example/", TEMPORAL_NAMESPACE="a b")["url_template"],
+            "https://ui.example/namespaces/a%20b/workflows/{workflow_id}",
+        )
+        off = link(TEMPORAL_UI_URL="off")
+        self.assertEqual((off["enabled"], off["url_template"]), (False, None))
+        self.assertTrue(off["reason"])
+
+    def test_console_link(self) -> None:
+        with mock.patch("simple_chat_agent.api.console.console_dist", return_value=Path(self.tmp.name)):
+            on = self.config(CONSOLE_ENABLED="1")["links"]["console"]
+            self.assertEqual(on, {"enabled": True, "url_template": "/console/?s={session_id}", "reason": None})
+            off = self.config(CONSOLE_ENABLED="0")["links"]["console"]
+            self.assertEqual((off["enabled"], off["url_template"]), (False, None))
+            self.assertIn("off", off["reason"])
+        with mock.patch("simple_chat_agent.api.console.console_dist", return_value=None):
+            missing = self.config(CONSOLE_ENABLED="1")["links"]["console"]
+            self.assertFalse(missing["enabled"])
+            self.assertIn("installed", missing["reason"])
+
+    def test_no_keys_and_no_provider_calls(self) -> None:
+        secret = f"sk-test-{uuid.uuid4().hex}"
+        env = {"ANTHROPIC_API_KEY": secret, "OPENAI_API_KEY": secret, "GEMINI_API_KEY": secret, "TYPESAFE_API_KEY": secret}
+        with mock.patch("httpx.AsyncClient.send", side_effect=AssertionError("no network")):
+            with mock.patch.dict(os.environ, env):
+                r = self.client.get("/api/agent/config", headers=A)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertNotIn(secret, r.text)
+        self.assertEqual(self.temporal.events, [])
+
+    def test_requires_auth(self) -> None:
+        r = self.client.get("/api/agent/config")
+        self.assertEqual(r.status_code, 401)
+        self.assertNotIn("providers", r.text)
+
+
+class ProductViewMountTests(unittest.TestCase):
+    """P3 step 3.0: the built app at /app/, behind the app's auth, with SPA fallback."""
+
+    CATALOG = {"x-temporal-auth-subject": "sub-1", "x-temporal-auth-email": "a@example.com"}
+
+    def setUp(self) -> None:
+        from simple_chat_agent.api import main
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dist = Path(self.tmp.name) / "dist"
+        self.env = mock.patch.dict(
+            os.environ, {"SIMPLE_CHAT_AUTH_MODE": "catalog", "SIMPLE_CHAT_WEB_DIST": str(self.dist)}
+        )
+        self.env.start()
+        self.client = TestClient(main.app)
+
+    def tearDown(self) -> None:
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def build(self) -> None:
+        (self.dist / "assets").mkdir(parents=True)
+        (self.dist / "index.html").write_text("<!doctype html><title>Product view</title>")
+        (self.dist / "assets" / "app-abc123.js").write_text("console.log(1)")
+        (self.dist / "favicon.svg").write_text("<svg/>")
+        (Path(self.tmp.name) / "secret.txt").write_text("outside dist")
+
+    def test_unauthenticated_catalog_is_401(self) -> None:
+        self.build()
+        for path in ("/app/", "/app/sessions/x", "/app/assets/app-abc123.js"):
+            r = self.client.get(path)
+            self.assertEqual(r.status_code, 401, path)
+            self.assertNotIn("Product view", r.text)
+            self.assertNotIn("console.log", r.text)
+
+    def test_local_login_page(self) -> None:
+        self.build()
+        with mock.patch.dict(os.environ, {"SIMPLE_CHAT_AUTH_MODE": "local", "SIMPLE_CHAT_LOCAL_AUTH_ENABLED": "1"}):
+            r = self.client.get("/app/")
+            self.assertEqual(r.status_code, 401)
+            self.assertIn("/api/auth/local/login", r.text)
+            self.assertIn("X-Requested-With", r.text)
+            self.assertEqual(r.headers["x-frame-options"], "DENY")
+            from simple_chat_agent.api.auth import SESSION_COOKIE, create_session_token, user_from_local_username
+
+            self.client.cookies.set(SESSION_COOKIE, create_session_token(user_from_local_username("demo")))
+            r = self.client.get("/app/")
+            self.assertEqual(r.status_code, 200)
+            self.assertIn("Product view", r.text)
+            self.client.cookies.clear()
+
+    def test_local_without_local_login_points_to_main_page(self) -> None:
+        with mock.patch.dict(os.environ, {"SIMPLE_CHAT_AUTH_MODE": "local", "SIMPLE_CHAT_LOCAL_AUTH_ENABLED": ""}):
+            r = self.client.get("/app/")
+        self.assertEqual(r.status_code, 401)
+        self.assertNotIn("/api/auth/local/login", r.text)
+
+    def test_not_built_is_a_503_page(self) -> None:
+        r = self.client.get("/app/", headers=self.CATALOG)
+        self.assertEqual(r.status_code, 503)
+        self.assertIn("text/html", r.headers["content-type"])
+        self.assertIn("make web", r.text)
+        self.assertEqual(self.client.get("/app/sessions/x", headers=self.CATALOG).status_code, 503)
+
+    def test_serving_and_spa_fallback(self) -> None:
+        self.build()
+        r = self.client.get("/app?s=1", headers=self.CATALOG, follow_redirects=False)
+        self.assertIn(r.status_code, (307, 302))
+        self.assertEqual(r.headers["location"], "/app/?s=1")
+        for path in ("/app/", "/app/index.html", "/app/sessions/abc", "/app/deep/link/here?x=1"):
+            r = self.client.get(path, headers=self.CATALOG)
+            self.assertEqual(r.status_code, 200, path)
+            self.assertIn("Product view", r.text)
+            self.assertEqual(r.headers["cache-control"], "no-cache")
+            self.assertEqual(r.headers["x-frame-options"], "DENY")
+        r = self.client.get("/app/assets/app-abc123.js", headers=self.CATALOG)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("javascript", r.headers["content-type"])
+        self.assertIn("immutable", r.headers["cache-control"])
+        self.assertEqual(self.client.get("/app/favicon.svg", headers=self.CATALOG).text, "<svg/>")
+        # A missing hashed asset is a 404, not index.html served as JavaScript.
+        self.assertEqual(self.client.get("/app/assets/gone-999.js", headers=self.CATALOG).status_code, 404)
+
+    def test_no_escape_from_dist(self) -> None:
+        self.build()
+        for path in ("/app/..%2fsecret.txt", "/app/%2e%2e/secret.txt", "/app/assets/..%2f..%2fsecret.txt"):
+            r = self.client.get(path, headers=self.CATALOG)
+            self.assertNotIn("outside dist", r.text, path)
+
+
 if __name__ == "__main__":
     unittest.main()

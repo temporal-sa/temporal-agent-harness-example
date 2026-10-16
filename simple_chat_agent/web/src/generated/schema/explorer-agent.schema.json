@@ -1,0 +1,168 @@
+{
+  "agent": "ExplorerAgent",
+  "source": "simple_chat_agent.agent.subagents:ExplorerAgent",
+  "init_data": {
+    "data": {
+      "$ref": "#/$defs/SubagentInit"
+    },
+    "required": true
+  },
+  "handlers": {
+    "investigate": {
+      "description": "Investigate a question about the code and report findings with evidence.",
+      "mid_turn": "reject",
+      "input": {
+        "$ref": "#/$defs/Question"
+      },
+      "output": {
+        "$ref": "#/$defs/Findings"
+      }
+    }
+  },
+  "states": {},
+  "$defs": {
+    "Evidence": {
+      "description": "One place in the code that supports the answer.",
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "line": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Line"
+        },
+        "note": {
+          "title": "Note",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "line",
+        "note"
+      ],
+      "title": "Evidence",
+      "type": "object"
+    },
+    "Findings": {
+      "description": "The explorer's answer, with the code that supports it.",
+      "properties": {
+        "answer": {
+          "title": "Answer",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          },
+          "title": "Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "answer",
+        "evidence"
+      ],
+      "title": "Findings",
+      "type": "object"
+    },
+    "ModelChoice": {
+      "description": "A provider plus a model id from that provider's allowlist.",
+      "properties": {
+        "provider": {
+          "default": "anthropic",
+          "enum": [
+            "anthropic",
+            "openai",
+            "google"
+          ],
+          "title": "Provider",
+          "type": "string"
+        },
+        "model": {
+          "default": "claude-sonnet-5-5",
+          "title": "Model",
+          "type": "string"
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effort"
+        }
+      },
+      "title": "ModelChoice",
+      "type": "object"
+    },
+    "Question": {
+      "description": "A question about the codebase for the explorer to answer from the files.",
+      "properties": {
+        "question": {
+          "description": "What to find out. Be specific.",
+          "title": "Question",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Where to start looking, if known.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Paths",
+          "type": "array"
+        }
+      },
+      "required": [
+        "question"
+      ],
+      "title": "Question",
+      "type": "object"
+    },
+    "SubagentInit": {
+      "description": "What a subagent starts with: the parent's workspace and identity, and its model.",
+      "properties": {
+        "workspace_id": {
+          "title": "Workspace Id",
+          "type": "string"
+        },
+        "owner_id": {
+          "default": "",
+          "title": "Owner Id",
+          "type": "string"
+        },
+        "session_id": {
+          "default": "",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelChoice"
+        }
+      },
+      "required": [
+        "workspace_id"
+      ],
+      "title": "SubagentInit",
+      "type": "object"
+    }
+  }
+}

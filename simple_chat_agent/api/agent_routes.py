@@ -30,7 +30,7 @@ import os
 import re
 import time
 import uuid
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -65,7 +65,7 @@ from temporal_agent_harness.harness.agent_protocol import (
 )
 from temporal_agent_harness.harness.agent_protocol.agent_interface import AcceptedFunction
 
-from simple_chat_agent.agent.approvals import configured_judge_backend
+from simple_chat_agent.agent.approvals import DEFAULT_JUDGE_MODEL, JUDGE_MODEL_ENV, configured_judge_backend
 from simple_chat_agent.agent.contracts import (
     AGENT_WORKFLOW_TYPE,
     ENQUEUE_APPROVAL_SIGNAL,
@@ -149,6 +149,106 @@ def agent_environment() -> str:
 
 def agent_task_queue() -> str:
     return os.environ.get("CODING_AGENT_TASK_QUEUE", "coding-agent")
+
+
+# -- what the product view's header and composer need (P3 step 3.0) ----------------------
+# Static: no provider calls, no keys, no Temporal calls.
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+_OFF = {"0", "false", "no", "off", "none", "disabled"}
+
+
+def auto_mode_status(judge: str) -> dict[str, Any]:
+    """Whether Auto mode's judge can run here. The API holds no keys, so this checks only what
+    it can see: the judge model setting the workers share (``AGENT_JUDGE_MODEL``) is well formed
+    and names a provider we offer. Jev needs no model setting."""
+    spec = os.environ.get(JUDGE_MODEL_ENV, "").strip() or DEFAULT_JUDGE_MODEL
+    provider, sep, model = spec.partition(":")
+    available = judge == "jev" or bool(sep and model and provider in agent_models.DEFAULT_ALLOWLIST)
+    return {
+        "available": available,
+        "judge": judge,
+        "judge_model": None if judge == "jev" else spec,
+        "reason": None if available else "Auto mode's judge isn't set up here.",
+    }
+
+
+def posture_options(environment: str, auto_mode: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every posture, in menu order, with whether it can be chosen here and why not."""
+    allowed = set(agent_models.postures_for(environment))
+    options = []
+    for posture, (label, description) in agent_models.POSTURES.items():
+        reason = None
+        if posture not in allowed:
+            reason = "Local development only."
+        elif posture == "auto" and not auto_mode["available"]:
+            reason = auto_mode["reason"]
+        options.append(
+            {
+                "id": posture,
+                "label": label,
+                "description": description,
+                "available": reason is None,
+                "reason": reason,
+                "default": posture == agent_models.DEFAULT_POSTURE,
+            }
+        )
+    return options
+
+
+def temporal_ui_base() -> str | None:
+    """The Temporal UI's base URL, or ``None`` when it is switched off (``TEMPORAL_UI_URL=off``).
+
+    ``TEMPORAL_UI_URL`` wins. Otherwise a Temporal Cloud address maps to the Cloud UI, and a
+    local dev server at ``host:port`` to its UI at ``port + 1000`` (the ``temporal server
+    start-dev`` default: 7233 -> 8233, 7244 -> 8244)."""
+    explicit = os.environ.get("TEMPORAL_UI_URL", "").strip()
+    if explicit:
+        return None if explicit.lower() in _OFF else explicit.rstrip("/")
+    address = os.environ.get("TEMPORAL_ADDRESS", os.environ.get("TEMPORAL_ENDPOINT", "")).strip()
+    if "tmprl.cloud" in address:
+        return "https://cloud.temporal.io"
+    host, _, port = address.rpartition(":")
+    if host in _LOCAL_HOSTS and port.isdigit():
+        return f"http://{host}:{int(port) + 1000}"
+    return "http://localhost:8233"
+
+
+def console_link_status() -> tuple[bool, str | None]:
+    """Mirrors :func:`simple_chat_agent.api.console.mount_console`'s decision (imported lazily:
+    the console module imports this one)."""
+    from simple_chat_agent.api import console
+
+    if not console.console_enabled():
+        return False, "The harness console is off in this environment."
+    try:
+        installed = console.console_dist() is not None
+    except Exception:  # noqa: BLE001 - a missing optional UI must not break config
+        installed = False
+    if not installed:
+        return False, "The harness console isn't installed on this server."
+    return True, None
+
+
+def view_links() -> dict[str, Any]:
+    """The header's view links. ``url_template`` placeholders: ``{session_id}`` (the session's
+    root workflow id) for the console, ``{workflow_id}`` for the Temporal UI; substitute them
+    URL-encoded. A disabled link has ``url_template: null`` and a ``reason``."""
+    console_on, console_reason = console_link_status()
+    base = temporal_ui_base()
+    namespace = quote(os.environ.get("TEMPORAL_NAMESPACE", "default"), safe="")
+    return {
+        "console": {
+            "enabled": console_on,
+            "url_template": "/console/?s={session_id}" if console_on else None,
+            "reason": console_reason,
+        },
+        "temporal_ui": {
+            "enabled": base is not None,
+            "url_template": f"{base}/namespaces/{namespace}/workflows/{{workflow_id}}" if base else None,
+            "reason": None if base else "The Temporal UI isn't linked in this environment.",
+        },
+    }
 
 
 def owner_digest(user_id: str) -> str:
@@ -892,14 +992,16 @@ def create_agent_router(
 
     @router.get("/config")
     async def config(uid: str = Depends(user_id)):
-        return JSONResponse(
-            agent_models.catalog(
-                environment=agent_environment(),
-                research_tools=offered_research_tools(),
-                judge=configured_judge_backend(),
-            ),
-            headers=NO_STORE,
-        )
+        environment = agent_environment()
+        judge = configured_judge_backend()
+        body = agent_models.catalog(environment=environment, research_tools=offered_research_tools(), judge=judge)
+        auto_mode = auto_mode_status(judge)
+        # ``postures`` (above) lists only what can be chosen; ``posture_options`` is the whole
+        # menu, with the reason an option is greyed out.
+        body["posture_options"] = posture_options(environment, auto_mode)
+        body["auto_mode"] = auto_mode
+        body["links"] = view_links()
+        return JSONResponse(body, headers=NO_STORE)
 
     # -- sessions ------------------------------------------------------------------------
 

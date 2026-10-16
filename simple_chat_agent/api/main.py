@@ -11,6 +11,8 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import (
     FileResponse,
+    HTMLResponse,
+    RedirectResponse,
     Response,
 )
 from fastapi.staticfiles import StaticFiles
@@ -580,6 +582,94 @@ app.include_router(
 _agent_api = AgentApi(current_user=lambda request: _current_user(request))
 app.state.agent_api = _agent_api
 app.include_router(_agent_api.router(app_store=_store), prefix="/api/agent")
+
+# The product view (P3): the Vite build in simple_chat_agent/web/dist at /app/, behind the same
+# catalog / local auth as /api/agent. Unknown paths fall back to index.html (client routing);
+# a missing asset under assets/ is a 404. Without a build, /app/ explains how to make one.
+_APP_PATH = "/app"
+_APP_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "frame-ancestors 'none'",
+    "Referrer-Policy": "same-origin",
+}
+
+
+def _web_dist() -> Path:
+    override = os.environ.get("SIMPLE_CHAT_WEB_DIST", "").strip()
+    return Path(override) if override else Path(__file__).resolve().parent.parent / "web" / "dist"
+
+
+def _app_page(status: int, title: str, body_html: str) -> HTMLResponse:
+    page = (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"<title>{title}</title><style>body{{font:16px/1.5 system-ui,sans-serif;max-width:36rem;"
+        "margin:4rem auto;padding:0 1rem;color:#141414;background:#fff}code{background:#f2f2f2;"
+        "padding:0 .25rem}input,button{font:inherit;padding:.5rem;margin:.25rem 0;width:100%;"
+        "box-sizing:border-box}@media (prefers-color-scheme:dark){body{color:#f2f2f2;"
+        "background:#141414}code{background:#2a2a2a}}</style></head>"
+        f"<body><h1>{title}</h1>{body_html}</body></html>"
+    )
+    return HTMLResponse(page, status_code=status, headers={**_APP_HEADERS, "Cache-Control": "no-store"})
+
+
+def _app_sign_in(request: Request) -> HTMLResponse:
+    if not _local_auth_route_enabled():
+        hint = (
+            "<p>Your sign-in didn't reach the app. Reload the page; if it keeps happening, "
+            "sign in again through the catalog.</p>"
+            if catalog_auth_enabled()
+            else '<p>Sign in on the <a href="/">main page</a>, then come back.</p>'
+        )
+        return _app_page(401, "Sign in to continue", hint)
+    login = json.dumps(f"{request.scope.get('root_path', '')}/api/auth/local/login")
+    form = (
+        '<form id="f"><label>Username<input name="username" autocomplete="username" required></label>'
+        '<label>Password<input name="password" type="password" autocomplete="current-password" required>'
+        '</label><button type="submit">Sign in</button><p id="e" role="alert"></p></form>'
+        "<script>document.getElementById('f').addEventListener('submit',async(ev)=>{ev.preventDefault();"
+        "const d=new FormData(ev.target);const r=await fetch(" + login + ",{method:'POST',"
+        "headers:{'Content-Type':'application/json','X-Requested-With':'fetch'},credentials:'same-origin',"
+        "body:JSON.stringify({username:d.get('username'),password:d.get('password')})});"
+        "if(r.ok){location.reload()}else{document.getElementById('e').textContent="
+        "'That username and password didn\\u2019t match.'}});</script>"
+    )
+    return _app_page(401, "Sign in to continue", form)
+
+
+@app.api_route(_APP_PATH, methods=["GET", "HEAD"], include_in_schema=False)
+async def app_redirect(request: Request) -> Response:
+    query = f"?{request.url.query}" if request.url.query else ""
+    return RedirectResponse(f"{request.scope.get('root_path', '')}{_APP_PATH}/{query}")
+
+
+@app.api_route(_APP_PATH + "/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
+async def app_page(request: Request, path: str) -> Response:
+    try:
+        _current_user(request)
+    except HTTPException as err:
+        if err.status_code != 401:
+            raise
+        return _app_sign_in(request)
+    dist = _web_dist().resolve()
+    index_html = dist / "index.html"
+    if not index_html.is_file():
+        return _app_page(
+            503,
+            "The product view isn't built yet",
+            "<p>Run <code>make web</code> in the repo root, then reload. "
+            "For live reload while you work, run <code>make web-dev</code> instead.</p>",
+        )
+    target = (dist / path).resolve() if path else index_html
+    if target.is_relative_to(dist) and target.is_file():
+        # Vite fingerprints everything under assets/, so those can be cached for good.
+        cache = "public, max-age=31536000, immutable" if path.startswith("assets/") else "no-cache"
+        return FileResponse(target, headers={**_APP_HEADERS, "Cache-Control": cache})
+    if path.startswith("assets/") or not target.is_relative_to(dist):
+        return Response("Not found", status_code=404, media_type="text/plain", headers=_APP_HEADERS)
+    return FileResponse(index_html, headers={**_APP_HEADERS, "Cache-Control": "no-cache"})
+
 
 # The harness console (P2 step 2.4): its unchanged static UI at /console/, talking to our own
 # owner-scoped routes at /console/api/. CONSOLE_ENABLED; on by default only for

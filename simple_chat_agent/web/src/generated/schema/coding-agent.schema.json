@@ -1,0 +1,727 @@
+{
+  "agent": "CodingAgent",
+  "source": "simple_chat_agent.agent.workflow:CodingAgent",
+  "init_data": {
+    "data": {
+      "$ref": "#/$defs/CodingAgentInit"
+    },
+    "required": true
+  },
+  "handlers": {
+    "chat": {
+      "description": "Ask the coding agent to do something in its workspace, or ask it a question.",
+      "mid_turn": "enqueue",
+      "input": {
+        "$ref": "#/$defs/ChatMessage"
+      },
+      "output": {
+        "$ref": "#/$defs/ChatReply"
+      }
+    },
+    "interrupt": {
+      "description": "Stop the turn in progress. Pending approvals in it are declined.",
+      "mid_turn": "accept",
+      "input": {
+        "$ref": "#/$defs/InterruptRequest"
+      },
+      "output": {
+        "$ref": "#/$defs/Ack"
+      }
+    },
+    "set_model": {
+      "description": "Switch the provider and/or model. Takes effect from the next turn.",
+      "mid_turn": "accept",
+      "input": {
+        "$ref": "#/$defs/SetModel"
+      },
+      "output": {
+        "$ref": "#/$defs/Ack"
+      }
+    },
+    "set_posture": {
+      "description": "Change how tool calls are approved. Applies to new calls; pending ones stay with you.",
+      "mid_turn": "accept",
+      "input": {
+        "$ref": "#/$defs/SetPosture"
+      },
+      "output": {
+        "$ref": "#/$defs/Ack"
+      }
+    },
+    "steer": {
+      "description": "Guide the turn in progress. The text reaches the agent before its next model call.",
+      "mid_turn": "accept",
+      "input": {
+        "$ref": "#/$defs/SteerMessage"
+      },
+      "output": {
+        "$ref": "#/$defs/Ack"
+      }
+    }
+  },
+  "states": {
+    "plan": {
+      "$ref": "#/$defs/PlanState"
+    },
+    "changes": {
+      "$ref": "#/$defs/ChangesState"
+    },
+    "workspace": {
+      "$ref": "#/$defs/WorkspaceState"
+    }
+  },
+  "$defs": {
+    "Ack": {
+      "description": "Acknowledgement for control operations.",
+      "properties": {
+        "ok": {
+          "default": true,
+          "title": "Ok",
+          "type": "boolean"
+        },
+        "detail": {
+          "default": "",
+          "title": "Detail",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ok",
+        "detail"
+      ],
+      "title": "Ack",
+      "type": "object"
+    },
+    "CarriedState": {
+      "description": "Everything a run hands to the next one when it continues as new.\n\nThe conversation is opaque JSON here so this module stays free of Pydantic AI; the\nworkflow validates it on the way in.",
+      "properties": {
+        "state_version": {
+          "default": 1,
+          "title": "State Version",
+          "type": "integer"
+        },
+        "conversation": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Conversation",
+          "type": "array"
+        },
+        "stream_state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowStreamState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "turn_counter": {
+          "default": 0,
+          "title": "Turn Counter",
+          "type": "integer"
+        },
+        "stream_acked": {
+          "default": 0,
+          "title": "Stream Acked",
+          "type": "integer"
+        },
+        "recent_request_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Recent Request Ids",
+          "type": "array"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelChoice"
+        },
+        "pending_model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelChoice"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "observable": {
+          "additionalProperties": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Observable",
+          "type": "object"
+        },
+        "steer_queue": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Steer Queue",
+          "type": "array"
+        },
+        "pending_messages": {
+          "items": {
+            "$ref": "#/$defs/FrontDoorMessage"
+          },
+          "title": "Pending Messages",
+          "type": "array"
+        }
+      },
+      "title": "CarriedState",
+      "type": "object"
+    },
+    "ChangedFile": {
+      "additionalProperties": false,
+      "description": "A file the agent changed in its workspace this session.",
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "status": {
+          "default": "modified",
+          "enum": [
+            "added",
+            "modified",
+            "deleted",
+            "renamed"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "added": {
+          "default": 0,
+          "title": "Added",
+          "type": "integer"
+        },
+        "removed": {
+          "default": 0,
+          "title": "Removed",
+          "type": "integer"
+        },
+        "tool_id": {
+          "default": "",
+          "title": "Tool Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "status",
+        "added",
+        "removed",
+        "tool_id"
+      ],
+      "title": "ChangedFile",
+      "type": "object"
+    },
+    "ChangesState": {
+      "additionalProperties": false,
+      "description": "Files changed and commits made, newest last.",
+      "properties": {
+        "files": {
+          "items": {
+            "$ref": "#/$defs/ChangedFile"
+          },
+          "title": "Files",
+          "type": "array"
+        },
+        "commits": {
+          "items": {
+            "$ref": "#/$defs/Commit"
+          },
+          "title": "Commits",
+          "type": "array"
+        }
+      },
+      "required": [
+        "files",
+        "commits"
+      ],
+      "title": "ChangesState",
+      "type": "object"
+    },
+    "ChatMessage": {
+      "description": "A user message to the coding agent.",
+      "properties": {
+        "text": {
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "title": "ChatMessage",
+      "type": "object"
+    },
+    "ChatReply": {
+      "description": "The agent's final answer for a turn.",
+      "properties": {
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "interrupted": {
+          "default": false,
+          "title": "Interrupted",
+          "type": "boolean"
+        },
+        "checkpoint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Checkpoint"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error"
+        }
+      },
+      "required": [
+        "text",
+        "interrupted",
+        "checkpoint",
+        "error"
+      ],
+      "title": "ChatReply",
+      "type": "object"
+    },
+    "CodingAgentInit": {
+      "description": "The agent's init data: what a session starts with, plus anything carried across runs.",
+      "properties": {
+        "owner_id": {
+          "default": "",
+          "title": "Owner Id",
+          "type": "string"
+        },
+        "session_id": {
+          "default": "",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelChoice"
+        },
+        "posture": {
+          "default": "trust_safe",
+          "enum": [
+            "ask_everything",
+            "trust_safe",
+            "auto",
+            "never_ask"
+          ],
+          "title": "Posture",
+          "type": "string"
+        },
+        "environment": {
+          "default": "catalog",
+          "enum": [
+            "catalog",
+            "local"
+          ],
+          "title": "Environment",
+          "type": "string"
+        },
+        "judge": {
+          "default": "llm",
+          "enum": [
+            "llm",
+            "jev"
+          ],
+          "title": "Judge",
+          "type": "string"
+        },
+        "research_tools": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Research Tools",
+          "type": "array"
+        },
+        "workspace_id": {
+          "default": "",
+          "title": "Workspace Id",
+          "type": "string"
+        },
+        "depth": {
+          "default": 0,
+          "title": "Depth",
+          "type": "integer"
+        },
+        "system_prompt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "System Prompt"
+        },
+        "carried": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CarriedState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "force_continue_as_new_after_turns": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Force Continue As New After Turns"
+        },
+        "test_tools": {
+          "default": false,
+          "title": "Test Tools",
+          "type": "boolean"
+        },
+        "test_history_event_cap": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Test History Event Cap"
+        }
+      },
+      "title": "CodingAgentInit",
+      "type": "object"
+    },
+    "Commit": {
+      "additionalProperties": false,
+      "description": "A local commit the agent made.",
+      "properties": {
+        "hash": {
+          "title": "Hash",
+          "type": "string"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        }
+      },
+      "required": [
+        "hash",
+        "message"
+      ],
+      "title": "Commit",
+      "type": "object"
+    },
+    "FrontDoorMessage": {
+      "description": "Payload of the enqueue_message signal.",
+      "properties": {
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        }
+      },
+      "required": [
+        "request_id",
+        "type"
+      ],
+      "title": "FrontDoorMessage",
+      "type": "object"
+    },
+    "InterruptRequest": {
+      "description": "Stop the current turn. Pending approvals in the turn are declined.",
+      "properties": {
+        "reason": {
+          "default": "Stopped by the user.",
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "title": "InterruptRequest",
+      "type": "object"
+    },
+    "ModelChoice": {
+      "description": "A provider plus a model id from that provider's allowlist.",
+      "properties": {
+        "provider": {
+          "default": "anthropic",
+          "enum": [
+            "anthropic",
+            "openai",
+            "google"
+          ],
+          "title": "Provider",
+          "type": "string"
+        },
+        "model": {
+          "default": "claude-sonnet-5-5",
+          "title": "Model",
+          "type": "string"
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effort"
+        }
+      },
+      "title": "ModelChoice",
+      "type": "object"
+    },
+    "PlanItem": {
+      "additionalProperties": false,
+      "description": "One step of the agent's plan.",
+      "properties": {
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "status": {
+          "default": "pending",
+          "enum": [
+            "pending",
+            "in_progress",
+            "done",
+            "skipped"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "status"
+      ],
+      "title": "PlanItem",
+      "type": "object"
+    },
+    "PlanState": {
+      "additionalProperties": false,
+      "description": "The agent's checklist for the current task.",
+      "properties": {
+        "goal": {
+          "default": "",
+          "title": "Goal",
+          "type": "string"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/PlanItem"
+          },
+          "title": "Items",
+          "type": "array"
+        }
+      },
+      "required": [
+        "goal",
+        "items"
+      ],
+      "title": "PlanState",
+      "type": "object"
+    },
+    "PublisherState": {
+      "description": "Per-publisher dedup state.\n\n.. warning::\n    This class is experimental and may change in future versions.\n\nTracks the last accepted ``sequence`` and the ``workflow.now()`` at\nwhich it was accepted, used together for at-least-once dedup and\nTTL-based pruning at continue-as-new time.",
+      "properties": {
+        "sequence": {
+          "title": "Sequence",
+          "type": "integer"
+        },
+        "last_seen": {
+          "format": "date-time",
+          "title": "Last Seen",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sequence",
+        "last_seen"
+      ],
+      "title": "PublisherState",
+      "type": "object"
+    },
+    "SetModel": {
+      "description": "Switch provider and/or model. Applies from the next turn.",
+      "properties": {
+        "model": {
+          "$ref": "#/$defs/ModelChoice"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "title": "SetModel",
+      "type": "object"
+    },
+    "SetPosture": {
+      "description": "Change how tool calls are approved. Applies to new calls; pending ones stay with you.",
+      "properties": {
+        "posture": {
+          "enum": [
+            "ask_everything",
+            "trust_safe",
+            "auto",
+            "never_ask"
+          ],
+          "title": "Posture",
+          "type": "string"
+        }
+      },
+      "required": [
+        "posture"
+      ],
+      "title": "SetPosture",
+      "type": "object"
+    },
+    "SteerMessage": {
+      "description": "Guidance for the turn in progress, injected before the agent's next model call.",
+      "properties": {
+        "text": {
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "title": "SteerMessage",
+      "type": "object"
+    },
+    "WorkflowStreamState": {
+      "description": "Serializable snapshot of stream state for continue-as-new.\n\n.. warning::\n    This class is experimental and may change in future versions.\n\nThe containing workflow input must type the field as\n``WorkflowStreamState | None``, not ``Any``, so the default data converter\ncan reconstruct the dataclass from JSON.\n\nLog items use the wire representation for serialization stability.",
+      "properties": {
+        "log": {
+          "items": {
+            "$ref": "#/$defs/_WorkflowStreamWireItem"
+          },
+          "title": "Log",
+          "type": "array"
+        },
+        "base_offset": {
+          "default": 0,
+          "title": "Base Offset",
+          "type": "integer"
+        },
+        "publishers": {
+          "additionalProperties": {
+            "$ref": "#/$defs/PublisherState"
+          },
+          "title": "Publishers",
+          "type": "object"
+        }
+      },
+      "title": "WorkflowStreamState",
+      "type": "object"
+    },
+    "WorkspaceState": {
+      "additionalProperties": false,
+      "description": "What the workspace's terminal did last.",
+      "properties": {
+        "last_command": {
+          "default": "",
+          "title": "Last Command",
+          "type": "string"
+        },
+        "last_exit_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Exit Code"
+        },
+        "commands_run": {
+          "default": 0,
+          "title": "Commands Run",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "last_command",
+        "last_exit_code",
+        "commands_run"
+      ],
+      "title": "WorkspaceState",
+      "type": "object"
+    },
+    "_WorkflowStreamWireItem": {
+      "description": "Wire representation of a WorkflowStreamItem (base64 of serialized Payload).",
+      "properties": {
+        "topic": {
+          "title": "Topic",
+          "type": "string"
+        },
+        "data": {
+          "title": "Data",
+          "type": "string"
+        },
+        "offset": {
+          "default": 0,
+          "title": "Offset",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "topic",
+        "data"
+      ],
+      "title": "_WorkflowStreamWireItem",
+      "type": "object"
+    }
+  }
+}

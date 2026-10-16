@@ -1,0 +1,170 @@
+{
+  "agent": "ReviewerAgent",
+  "source": "simple_chat_agent.agent.subagents:ReviewerAgent",
+  "init_data": {
+    "data": {
+      "$ref": "#/$defs/SubagentInit"
+    },
+    "required": true
+  },
+  "handlers": {
+    "review": {
+      "description": "Review the current diff and return a verdict with concrete issues.",
+      "mid_turn": "reject",
+      "input": {
+        "$ref": "#/$defs/ReviewRequest"
+      },
+      "output": {
+        "$ref": "#/$defs/Review"
+      }
+    }
+  },
+  "states": {},
+  "$defs": {
+    "Issue": {
+      "description": "One problem the reviewer found.",
+      "properties": {
+        "severity": {
+          "description": "blocker, major or minor",
+          "title": "Severity",
+          "type": "string"
+        },
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "line": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Line"
+        },
+        "comment": {
+          "title": "Comment",
+          "type": "string"
+        }
+      },
+      "required": [
+        "severity",
+        "path",
+        "line",
+        "comment"
+      ],
+      "title": "Issue",
+      "type": "object"
+    },
+    "ModelChoice": {
+      "description": "A provider plus a model id from that provider's allowlist.",
+      "properties": {
+        "provider": {
+          "default": "anthropic",
+          "enum": [
+            "anthropic",
+            "openai",
+            "google"
+          ],
+          "title": "Provider",
+          "type": "string"
+        },
+        "model": {
+          "default": "claude-sonnet-5-5",
+          "title": "Model",
+          "type": "string"
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effort"
+        }
+      },
+      "title": "ModelChoice",
+      "type": "object"
+    },
+    "Review": {
+      "description": "The reviewer's verdict on the diff.",
+      "properties": {
+        "verdict": {
+          "description": "approve or request_changes",
+          "title": "Verdict",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "issues": {
+          "items": {
+            "$ref": "#/$defs/Issue"
+          },
+          "title": "Issues",
+          "type": "array"
+        }
+      },
+      "required": [
+        "verdict",
+        "summary",
+        "issues"
+      ],
+      "title": "Review",
+      "type": "object"
+    },
+    "ReviewRequest": {
+      "description": "Ask the reviewer to review the workspace's current uncommitted diff.",
+      "properties": {
+        "focus": {
+          "default": "",
+          "description": "What to pay most attention to, if anything.",
+          "title": "Focus",
+          "type": "string"
+        }
+      },
+      "title": "ReviewRequest",
+      "type": "object"
+    },
+    "SubagentInit": {
+      "description": "What a subagent starts with: the parent's workspace and identity, and its model.",
+      "properties": {
+        "workspace_id": {
+          "title": "Workspace Id",
+          "type": "string"
+        },
+        "owner_id": {
+          "default": "",
+          "title": "Owner Id",
+          "type": "string"
+        },
+        "session_id": {
+          "default": "",
+          "title": "Session Id",
+          "type": "string"
+        },
+        "model": {
+          "$ref": "#/$defs/ModelChoice"
+        }
+      },
+      "required": [
+        "workspace_id"
+      ],
+      "title": "SubagentInit",
+      "type": "object"
+    }
+  }
+}
