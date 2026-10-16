@@ -67,6 +67,7 @@ class FakeWorkflow:
     parent_id: str | None = None
     owner: str | None = None  # owner digest search attribute
     status: WorkflowExecutionStatus = WorkflowExecutionStatus.RUNNING
+    run_id: str = "run-1"
 
 
 class FakeHandle:
@@ -86,6 +87,7 @@ class FakeHandle:
             typed_search_attributes=sa,
             status=wf.status,
             start_time=None,
+            run_id=wf.run_id,
         )
 
     async def signal(self, name: str, arg: Any = None) -> None:
@@ -140,7 +142,9 @@ class FakeTemporal:
             sa = kwargs.get("search_attributes")
             owner = sa.get(OWNER_SEARCH_ATTRIBUTE) if sa is not None else None
             self.workflows[id] = FakeWorkflow(workflow, owner=owner)
-        return FakeHandle(self, id)
+        handle = FakeHandle(self, id)
+        handle.result_run_id = "root-run-0"  # type: ignore[attr-defined]
+        return handle
 
 
 class FakeBridge:
@@ -340,6 +344,21 @@ class OwnershipTests(AgentRoutesTestBase):
         self.assertEqual(self.client.get(f"/api/agent/workflow-status/{sub}", headers=A).status_code, 200)
         # Bob: 404 on every route for the subagent, too.
         self.assert_all_404(sub, B)
+
+    def test_status_carries_the_current_run_id_without_a_query(self) -> None:
+        root = self.create()["workflow_id"]
+        sub = f"{root}-explorer-1"
+        self.temporal.workflows[sub] = FakeWorkflow("ExplorerAgent", parent_id=root, run_id="sub-run-1")
+        # Recorded at create from the start call's run id.
+        self.assertEqual(self.client.get(f"/api/agent/status/{root}", headers=A).json()["run_id"], "root-run-0")
+        # A subagent's is null until the bridge records it (Describe on subagent_started).
+        self.assertIsNone(self.client.get(f"/api/agent/status/{sub}", headers=A).json()["run_id"])
+        self.run_async(self.store.set_tracking(sub, run_id="sub-run-1"))
+        self.assertEqual(self.client.get(f"/api/agent/status/{sub}", headers=A).json()["run_id"], "sub-run-1")
+        # Continue-as-new: the bridge records the new run (from its own Describe); status follows.
+        self.run_async(self.store.set_tracking(root, run_id="root-run-2"))
+        self.assertEqual(self.client.get(f"/api/agent/status/{root}", headers=A).json()["run_id"], "root-run-2")
+        self.assertEqual(self.temporal.queries, [])
 
     def test_subagent_id_whole_session_routes_take_root_only(self) -> None:
         root = self.create()["workflow_id"]
@@ -559,7 +578,7 @@ class SessionTests(AgentRoutesTestBase):
         r = self.client.get(f"/api/agent/workflow-status/{sid}", headers=A).json()
         self.assertEqual(r, {"workflow_id": sid, "execution_status": "RUNNING", "closed": False})
         r = self.client.get(f"/api/agent/status/{sid}", headers=A).json()
-        self.assertEqual(r, {"current_turn": 0, "turn_active": False, "pending_turns": []})
+        self.assertEqual(r, {"current_turn": 0, "turn_active": False, "pending_turns": [], "run_id": "root-run-0"})
         del self.temporal.workflows[sid]
         r = self.client.get(f"/api/agent/workflow-status/{sid}", headers=A).json()
         self.assertEqual(r["execution_status"], "NOT_FOUND")

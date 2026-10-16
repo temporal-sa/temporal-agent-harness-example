@@ -11,7 +11,8 @@ Frame format v1 (CTO memo 001, CTO-2). One Redis stream per agent session:
 hence the per-offset ``seq``. Redis stream ids must be greater than 0-0, so the stored
 millisecond part is ``resume_offset + 1``. Root frames also carry ``event_offset`` (=
 ``resume_offset - 1``) so the client dedups them by ``agent_id|event_offset``. Telemetry frames
-(``x_usage``, ``x_recovery``, ``x_worker``) sit at the position of the frame before them.
+(``x_usage``, ``x_recovery``, ``x_worker``) sit at the position of the frame before them;
+``x_rejected`` sits at the position of the stream event it replaces (see agent_telemetry).
 
 Status meta lives in a key next to it and is served to clients instead of a Temporal Query,
 so ``status`` costs no Actions and still answers while every worker is down. Pending message
@@ -99,10 +100,16 @@ class SessionMeta:
     # Root stream offset of the open turn's turn_started (a takeover replays from here so
     # subagents mounted in this turn are re-mounted). None between turns.
     turn_start: int | None = None
+    # The root agent's id (minted by the harness per session), from the first root frame; the
+    # bridge stamps it on telemetry frames that belong to no turn.
+    root_agent_id: str | None = None
     # Bridge bookkeeping (the ``…:t`` hash; read-only here, written by its own setters).
     acked: int = 0
     archived: str = "0-0"
     worker: dict[str, Any] | None = None
+    # This workflow's current run id (changes at continue-as-new), from Describe by the bridge
+    # or the status route. Also kept for subagent workflow ids (their own ``…:t`` hash).
+    run_id: str | None = None
     # True from a root turn_end until that turn's telemetry is confirmed (or given up on, or
     # the deadline passed), so an attach doesn't end before the confirmed frames are stored.
     confirming: bool = False
@@ -115,6 +122,7 @@ class SessionMeta:
         }
         if self.worker is not None:
             status["worker"] = self.worker
+        status["run_id"] = self.run_id
         return status
 
 
@@ -539,6 +547,7 @@ class AgentStore:
                     "current_turn": meta.current_turn,
                     "closed": meta.closed,
                     "turn_start": meta.turn_start,
+                    "root_agent_id": meta.root_agent_id,
                 }
             ),
             ex=ttl,
@@ -558,7 +567,7 @@ class AgentStore:
         await pipe.execute()
 
     async def set_tracking(self, session: str, **fields: Any) -> None:
-        """Set bridge bookkeeping fields (``acked``, ``archived``, ``worker``)."""
+        """Set bridge bookkeeping fields (``acked``, ``archived``, ``worker``, ``run_id``)."""
         mapping = {k: (json.dumps(v) if k == "worker" else str(v)) for k, v in fields.items()}
         pipe = self.r.pipeline(transaction=True)
         pipe.hset(self._k(session, "t"), mapping=mapping)
@@ -751,8 +760,10 @@ def _meta(raw: Any, pending: Any, track: Any, closed_key: Any) -> SessionMeta:
         pending=set(pending or ()),
         closed=bool(d.get("closed", False) or closed_key),
         turn_start=d.get("turn_start"),
+        root_agent_id=d.get("root_agent_id"),
         acked=int(track.get("acked") or 0),
         archived=track.get("archived") or "0-0",
         worker=json.loads(track["worker"]) if track.get("worker") else None,
+        run_id=track.get("run_id") or None,
         confirming=float(track.get("confirming_until") or 0) > _now_ms() / 1000,
     )

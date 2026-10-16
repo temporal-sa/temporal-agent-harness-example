@@ -40,6 +40,7 @@ from temporal_agent_harness.harness.agent_protocol.events import (
 from simple_chat_agent.api import agent_bridge, agent_store
 from simple_chat_agent.api.agent_bridge import Bridge, _Forwarder
 from simple_chat_agent.api.agent_store import AgentStore, FrameArchive, LeaseLost, SessionMeta, _DiskArchive
+from tests.test_agent_telemetry import already_resolved, rejection_events
 
 REDIS_URL = os.environ.get("TEST_AGENT_REDIS_URL", "redis://127.0.0.1:6390/0")
 
@@ -67,7 +68,8 @@ class FakeHandle:
 
     async def describe(self) -> Any:
         self.t.describes += 1
-        return SimpleNamespace(status=WorkflowExecutionStatus.RUNNING, run_id="r1", task_queue="tq",
+        return SimpleNamespace(status=WorkflowExecutionStatus.RUNNING, run_id=self.t.run_ids.get(self.id, "r1"),
+                               task_queue="tq",
                                history_length=self.t.history_length,
                                raw_description=SimpleNamespace(pending_activities=[], HasField=lambda _f: False))
 
@@ -79,6 +81,7 @@ class FakeTemporal:
         self.signals: list[tuple[str, str, Any]] = []
         self.describes = 0
         self.history_length = 10
+        self.run_ids: dict[str, str] = {}
 
     def get_workflow_handle(self, wid: str) -> FakeHandle:
         return FakeHandle(self, wid)
@@ -634,6 +637,172 @@ class FixPassTests(_RedisCase):
             await agent_bridge._stop(task)
         self.assertLessEqual(check.await_count, 3)  # ~t+1, +2 (x2), not every second
         self.assertGreaterEqual(check.await_count, 1)
+
+
+class RejectionAndRootIdTests(_RedisCase):
+    """P3 gaps: front-door rejections reach the stream as ``x_rejected`` (PRD S8), and every
+    telemetry frame carries an agent id (the root's outside a turn)."""
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        p = mock.patch.object(agent_bridge, "OUT_OF_TURN_QUIET_SECONDS", 0.2)
+        p.start()
+        self.addCleanup(p.stop)
+
+    async def forward(self, script: Script) -> _Forwarder:
+        b = self.bridge()
+        self.assertTrue(await self.store.acquire_lease("s", b.holder))
+        fwd = _Forwarder(b, "s")
+        with mock.patch.object(agent_bridge, "AgentClient", script.client):
+            await asyncio.wait_for(fwd._forward_once(), 5)
+            await fwd._settle()
+        return fwd
+
+    @staticmethod
+    def carriers(kind: str, request_id: str, **kw: Any) -> list[AgentEvent]:
+        return rejection_events(kind, request_id, agent_id=ROOT, **kw)
+
+    async def test_idle_approval_rejection_is_stored_once_and_the_attach_ends(self) -> None:
+        entries = turn_script(False)  # root offsets 1..7, turn_end at 7
+        carrier = self.carriers("approval", "req-1", exc=already_resolved("tool-9"), tool_id="tool-9")
+        entries += [(ev, 8 + i) for i, ev in enumerate(carrier)]
+        script = Script(entries)
+        script.block = asyncio.Event()  # like the real attach: no turn_end follows, it would poll on
+        await self.forward(script)
+        frames = await self.store.read_from("s", 0)
+        rejected = [f for f in frames if f.event == "x_rejected"]
+        self.assertEqual(len(rejected), 1)
+        x = rejected[0].data
+        self.assertEqual(
+            {k: x[k] for k in ("id", "agent_id", "kind", "request_id", "tool_id", "message_id", "code")},
+            {"id": "rejected:req-1", "agent_id": ROOT, "kind": "approval", "request_id": "req-1",
+             "tool_id": "tool-9", "message_id": None, "code": "already_resolved"},
+        )
+        # Stored in place of the carrier (its position), which is never stored itself.
+        self.assertEqual(rejected[0].resume_offset, 8)
+        self.assertFalse(any(str(f.data.get("message_id") or "").startswith("x_rejected:") for f in frames))
+        meta = await self.store.meta("s")
+        self.assertEqual(meta.head, 8)
+        self.assertEqual(meta.root_agent_id, ROOT)
+        self.assertEqual(meta.pending, set())
+        # Acked through the rejection, so the agent may truncate it at continue-as-new.
+        self.assertEqual(max(s[2].offset for s in self.temporal.signals if s[1] == "stream_acked"), 8)
+        # The next attach starts after it (no re-read, no extra Queries for it).
+        self.assertEqual(await self.store.last_position("s"), (8, 0))
+
+    async def test_idle_message_rejection_marks_the_message_failed_and_adds_x_rejected(self) -> None:
+        from temporalio.exceptions import ApplicationError
+
+        await self.store.note_sent("s", "m-7")
+        entries = turn_script(False)
+        carrier = self.carriers("message", "m-7", exc=ApplicationError("x", type="UnknownFunction"),
+                                message_text="Not accepted: x")
+        entries += [(ev, 8 + i) for i, ev in enumerate(carrier)]
+        script = Script(entries)
+        script.block = asyncio.Event()
+        await self.forward(script)
+        frames = await self.store.read_from("s", 0)
+        self.assertEqual([f.event for f in frames if f.resume_offset >= 8],
+                         ["message_accepted", "message_handler_error", "x_rejected"])
+        x = frames[-1].data
+        self.assertEqual((x["kind"], x["message_id"], x["code"]), ("message", "m-7", "unknown_function"))
+        self.assertEqual((await self.store.meta("s")).pending, set())
+
+    async def test_takeover_never_duplicates_a_rejection(self) -> None:
+        """An approval rejected mid-turn (already resolved by another tab). Replica A stores it
+        and dies with the turn open; B replays the turn from its start and finds the same
+        rejection event again. The telemetry id dedup keeps exactly one x_rejected."""
+        base = turn_script(False)
+        carrier = self.carriers("approval", "req-dup", exc=already_resolved(), tool_id="tool-9")
+        # Mid-turn: after the model call (offset 6), before turn_end.
+        entries = base[:6] + [(carrier[0], 7)] + [(base[6][0], 8)]
+        await self.forward(Script(entries[:7]))  # A stores through the rejection, no turn_end
+        meta = await self.store.meta("s")
+        self.assertTrue(meta.turn_active)
+        await self.r.delete(self.store._k("s", "lease"))
+        full = Script(entries)
+        await self.forward(full)  # B
+        self.assertEqual(full.calls[0], 1)  # replayed from the open turn's start, through the rejection
+        frames = await self.store.read_from("s", 0)
+        self.assertEqual(len([f for f in frames if f.event == "x_rejected"]), 1)
+        harness = [f for f in frames if not f.event.startswith("x_")]
+        self.assertEqual(len(harness), len(entries) - 1)  # every harness frame once; carrier never
+        self.assertFalse((await self.store.meta("s")).turn_active)
+
+    async def test_worker_frame_outside_a_turn_carries_the_root_agent_id(self) -> None:
+        await self.forward(Script(turn_script(False)))
+        # A later forwarder (another replica, or after a restart) that has seen no frame yet.
+        await self.r.delete(self.store._k("s", "lease"))
+        b = self.bridge()
+        self.assertTrue(await self.store.acquire_lease("s", b.holder))
+        fwd = _Forwarder(b, "s")
+        with mock.patch.object(agent_bridge, "AgentClient", Script([]).client):
+            await fwd._forward_once()
+        await fwd._set_worker("suspect", "no worker is polling the task queue", 0)
+        worker = [f for f in await self.store.read_from("s", 0) if f.event == "x_worker"]
+        self.assertEqual(len(worker), 1)
+        self.assertEqual(worker[0].data["agent_id"], ROOT)
+        self.assertIsNone(worker[0].data["turn_id"])
+
+    async def test_every_stored_x_frame_has_an_agent_id(self) -> None:
+        entries = turn_script()
+        entries.append((self.carriers("approval", "r", exc=already_resolved(), tool_id="t")[0], 9))
+        script = Script(entries)
+        script.block = asyncio.Event()
+        fwd = await self.forward(script)
+        await fwd._set_worker("ok", "workers are answering", 1)
+        x = [f for f in await self.store.read_from("s", 0) if f.event.startswith("x_")]
+        self.assertEqual({f.event for f in x}, {"x_usage", "x_rejected", "x_worker"})
+        self.assertTrue(all(f.data.get("agent_id") for f in x), [(f.event, f.data.get("agent_id")) for f in x])
+
+
+class RunIdTests(_RedisCase):
+    """Current run ids (root and subagents) for Temporal UI deep links: from Describe, never a
+    Query, following continue-as-new."""
+
+    async def forward(self, script: Script) -> _Forwarder:
+        await self.r.delete(self.store._k("s", "lease"))
+        b = self.bridge()
+        self.assertTrue(await self.store.acquire_lease("s", b.holder))
+        fwd = _Forwarder(b, "s")
+        with mock.patch.object(agent_bridge, "AgentClient", script.client):
+            await fwd._forward_once()
+            await fwd._settle()
+        return fwd
+
+    async def test_root_and_subagent_run_ids_are_recorded_and_follow_continue_as_new(self) -> None:
+        self.temporal.run_ids = {"s": "root-run-1", "child-wf-1": "child-run-1"}
+        script = Script(turn_script())
+        fwd = await self.forward(script)
+        self.assertEqual((await self.store.meta("s")).run_id, "root-run-1")
+        self.assertEqual((await self.store.meta("child-wf-1")).run_id, "child-run-1")
+        self.assertEqual((await self.store.meta("s")).to_status()["run_id"], "root-run-1")
+        await fwd._set_worker("suspect", "no worker", 0)
+        worker = [f for f in await self.store.read_from("s", 0) if f.event == "x_worker"][-1].data
+        self.assertEqual((worker["workflow_id"], worker["run_id"]), ("s", "root-run-1"))
+        self.assertEqual(worker["runs"], {"s": "root-run-1", "child-wf-1": "child-run-1"})
+        self.assertEqual(script.queries, 2)  # the attach's own two; run ids cost none
+        # The agent continued as new between turns: the next attach records the new run.
+        self.temporal.run_ids["s"] = "root-run-2"
+        await self.forward(Script([]))
+        self.assertEqual((await self.store.meta("s")).run_id, "root-run-2")
+
+    async def test_worker_check_records_run_ids(self) -> None:
+        b = self.bridge()
+        fwd = _Forwarder(b, "s")
+        health = SimpleNamespace(state="suspect", reason="x", pollers=0, tool_retries=[],
+                                 runs={"s": "root-run-3", "child-wf-1": "child-run-3"})
+        fwd.turn_active = True
+        fwd.last_frame_at = time.monotonic() - 100
+        await self.store.acquire_lease("s", b.holder)
+        with mock.patch.object(agent_bridge.telemetry, "check_health", mock.AsyncMock(return_value=health)), \
+                mock.patch.object(agent_bridge, "WORKER_SILENCE_SECONDS", 0.0):
+            task = asyncio.create_task(fwd._watch_workers())
+            await asyncio.sleep(1.5)
+            await agent_bridge._stop(task)
+        self.assertEqual((await self.store.meta("child-wf-1")).run_id, "child-run-3")
+        worker = [f for f in await self.store.read_from("s", 0) if f.event == "x_worker"][-1].data
+        self.assertEqual(worker["run_id"], "root-run-3")
 
 
 class StoreAdditionsTests(_RedisCase):

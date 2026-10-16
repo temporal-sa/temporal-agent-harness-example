@@ -458,7 +458,7 @@ class FakeClient:
 
         class H:
             async def describe(self) -> Any:
-                return SimpleNamespace(task_queue="tq", raw_description=raw)
+                return SimpleNamespace(task_queue="tq", raw_description=raw, run_id="run-x")
 
         return H()
 
@@ -475,6 +475,7 @@ class HealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("no heartbeat from w-a", health.reason)
         self.assertEqual(health.pollers, 1)
         self.assertEqual(tel.identities[("s", "7", 1)], "w-a")
+        self.assertEqual(health.runs, {"s": "run-x"})  # current run, for deep links
 
     async def test_unclaimed_workflow_task_and_no_pollers(self) -> None:
         now = time.time()
@@ -506,6 +507,147 @@ class HealthTests(unittest.IsolatedAsyncioTestCase):
             FakeClient(DescribeWorkflowExecutionResponse(), [PollerInfo(last_access_time=ts_pb(now))]),  # type: ignore[arg-type]
             t.Telemetry("s"), now=now)
         self.assertEqual(health.state, "ok")
+
+
+
+# -- front-door rejections (PRD S8) and root agent ids -------------------------------------
+
+
+class _CapturingRunner:
+    """Stands in for AgentWorkflowRunner: records what ``_pub`` publishes as AgentEvents."""
+
+    def __init__(self, agent_id: str = "root") -> None:
+        self.agent_id = agent_id
+        self.events: list[Any] = []
+
+    def _pub(self, turn_id: str, turn_number: int, event: Any, *, message_id: Any = None) -> None:
+        from temporal_agent_harness.harness.agent_protocol import AgentEvent
+
+        self.events.append(AgentEvent(agent_id=self.agent_id, turn_id=turn_id, turn_number=turn_number,
+                                      message_id=message_id, timestamp=time.time(), event=event))
+
+
+def rejection_events(kind: str, request_id: str, *, exc: Any, tool_id: str | None = None,
+                     agent_id: str = "root", message_text: str | None = None) -> list[Any]:
+    """The AgentEvents the workflow publishes for one rejected front-door Signal."""
+    from simple_chat_agent.agent import harness_ext
+
+    runner = _CapturingRunner(agent_id)
+    harness_ext.publish_rejection(runner, kind=kind, request_id=request_id, exc=exc,  # type: ignore[arg-type]
+                                  tool_id=tool_id, message_text=message_text)
+    return runner.events
+
+
+def already_resolved(tool_id: str = "tool-9") -> Any:
+    from temporalio.exceptions import ApplicationError
+
+    return ApplicationError(f"tool approval for tool_id={tool_id!r} is already approved",
+                            type="ToolApprovalAlreadyResolved", non_retryable=True)
+
+
+class RejectionTests(unittest.TestCase):
+    def frames(self, events: list[Any]) -> list[tuple[str, dict[str, Any]]]:
+        from simple_chat_agent.api.agent_bridge import sse_data
+
+        return [sse_data(e) for e in events]
+
+    def test_prefix_matches_the_workflow_side(self) -> None:
+        from simple_chat_agent.agent import harness_ext
+
+        self.assertEqual(t.REJECTION_MESSAGE_PREFIX, harness_ext.REJECTION_MESSAGE_PREFIX)
+
+    def test_approval_rejection_becomes_one_x_rejected_frame(self) -> None:
+        frames = self.frames(rejection_events("approval", "req-1", exc=already_resolved(), tool_id="tool-9"))
+        # Approvals publish only the carrier: no message for a harness client to render.
+        self.assertEqual([e for e, _ in frames], ["message_handler_error"])
+        event, data = frames[0]
+        self.assertTrue(t.is_rejection(event, data))
+        x_event, x = t.rejected_frame(data)
+        self.assertEqual(x_event, "x_rejected")
+        self.assertEqual(x["id"], "rejected:req-1")
+        self.assertEqual(x["agent_id"], "root")
+        self.assertEqual(
+            {k: x[k] for k in ("kind", "request_id", "tool_id", "message_id", "code", "error_type")},
+            {"kind": "approval", "request_id": "req-1", "tool_id": "tool-9", "message_id": None,
+             "code": "already_resolved", "error_type": "ToolApprovalAlreadyResolved"},
+        )
+        self.assertEqual(x["reason"], "This tool call was already approved, so this decision was not applied.")
+        self.assertIsInstance(x["timestamp"], float)
+        json.dumps(x)  # JSON-safe for the store
+
+    def test_unknown_approval_code(self) -> None:
+        from temporalio.exceptions import ApplicationError
+
+        exc = ApplicationError("no pending tool approval for tool_id='x'", type="UnknownToolApproval")
+        _, data = self.frames(rejection_events("approval", "req-2", exc=exc, tool_id="x"))[0]
+        _, x = t.rejected_frame(data)
+        self.assertEqual((x["code"], x["tool_id"]), ("unknown_approval", "x"))
+        self.assertIn("No approval is waiting", x["reason"])
+
+    def test_message_rejection_keeps_the_harness_pair_and_adds_the_carrier(self) -> None:
+        from temporalio.exceptions import ApplicationError
+
+        exc = ApplicationError("Unknown function 'nope'.", type="UnknownFunction")
+        frames = self.frames(rejection_events("message", "m-7", exc=exc, message_text="Not accepted: x"))
+        self.assertEqual([e for e, _ in frames], ["message_accepted", "message_handler_error", "message_handler_error"])
+        self.assertEqual([d["message_id"] for _, d in frames], ["m-7", "m-7", "x_rejected:m-7"])
+        self.assertEqual(frames[1][1]["message"], "Not accepted: x")  # what a harness client shows
+        self.assertEqual([t.is_rejection(e, d) for e, d in frames], [False, False, True])
+        _, x = t.rejected_frame(frames[2][1])
+        self.assertEqual((x["kind"], x["message_id"], x["tool_id"], x["code"]), ("message", "m-7", None, "unknown_function"))
+
+    def test_session_closed(self) -> None:
+        frames = self.frames(rejection_events("message", "m-8", exc=None, message_text="The session closed."))
+        _, x = t.rejected_frame(frames[-1][1])
+        self.assertEqual((x["code"], x["reason"], x["error_type"]), ("session_closed", "The session closed.", None))
+
+    def test_unreadable_carrier_still_yields_a_frame(self) -> None:
+        _, x = t.rejected_frame({"message_id": "x_rejected:r", "message": "not json", "agent_id": None,
+                                 "timestamp": "2026-10-16T00:00:00+00:00"}, root_agent_id="root")
+        self.assertEqual((x["request_id"], x["agent_id"], x["code"], x["reason"]), ("r", "root", "rejected", "not json"))
+        self.assertEqual(x["timestamp"], 1792108800.0)
+
+    def test_ordinary_handler_errors_are_not_rejections(self) -> None:
+        self.assertFalse(t.is_rejection("message_handler_error", {"message_id": "m1", "message": "boom"}))
+        self.assertFalse(t.is_rejection("message_handler_error", {"message_id": None}))
+        self.assertFalse(t.is_rejection("tool_error", {"message_id": "x_rejected:m1"}))
+
+
+class RootAgentIdTests(unittest.TestCase):
+    def test_root_agent_id_learned_from_root_frames_only(self) -> None:
+        tel = t.Telemetry("s")
+        tel.observe("reply_delta", {"agent_id": "child-1", "turn_id": "ct"}, 3, is_root=False)
+        self.assertIsNone(tel.root_agent_id)
+        tel.observe("state_snapshot", {"agent_id": "abc123", "turn_id": "", "turn_number": 0}, 1, is_root=True)
+        self.assertEqual(tel.root_agent_id, "abc123")
+
+    def test_worker_frame_outside_a_turn_belongs_to_the_root(self) -> None:
+        _, data = t.worker_frame("suspect", "no worker", 1.0, turn=None, pollers=0, root_agent_id="abc123")
+        self.assertEqual(data["agent_id"], "abc123")
+        turn = t.Turn(agent_id="abc123", workflow_id="s", turn_id="t1", turn_number=2)
+        _, data = t.worker_frame("ok", "fine", 1.0, turn=turn, pollers=1, root_agent_id="other")
+        self.assertEqual((data["agent_id"], data["turn_id"]), ("abc123", "t1"))
+
+    def test_every_frame_builder_sets_agent_id(self) -> None:
+        turn = t.Turn(agent_id="abc123", workflow_id="s", turn_id="t1", turn_number=1)
+        built = [
+            t.usage_frame(turn, call_index=0, message_id=None, model=None, usage={}, confirmed=False),
+            t.recovery_frame(turn, key="k", kind="model_call", confirmed=False, detected_at=None, lost_at=None,
+                             lost_worker=None, resumed_on=None, kept={}, repeated={}),
+            t.worker_frame("ok", "", 0.0, turn=None, pollers=None, root_agent_id="abc123"),
+            t.rejected_frame({"message_id": "x_rejected:r", "message": "{}"}, root_agent_id="abc123"),
+        ]
+        self.assertEqual({e for e, _ in built}, {"x_usage", "x_recovery", "x_worker", "x_rejected"})
+        self.assertTrue(all(d["agent_id"] == "abc123" for _, d in built))
+
+
+class RunIdFrameTests(unittest.TestCase):
+    def test_worker_frame_carries_run_ids(self) -> None:
+        _, data = t.worker_frame("ok", "", 0.0, turn=None, pollers=1, root_agent_id="a", workflow_id="s",
+                                 runs={"s": "r2", "child": "c1"})
+        self.assertEqual((data["workflow_id"], data["run_id"], data["runs"]), ("s", "r2", {"s": "r2", "child": "c1"}))
+        _, data = t.worker_frame("ok", "", 0.0, turn=None, pollers=1)
+        self.assertEqual((data["run_id"], data["runs"]), (None, {}))
 
 
 if __name__ == "__main__":

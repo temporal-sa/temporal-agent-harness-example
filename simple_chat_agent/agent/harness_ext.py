@@ -459,28 +459,96 @@ def explained_failure(exc: BaseException) -> str | None:
     return None
 
 
-def publish_rejection(runner: AgentWorkflowRunner, *, message_id: str, reason: str) -> None:
-    """Report a front-door message the agent refused, on the stream, as a harness event.
+# A front-door Signal the agent refused is reported on the turn_events stream with this
+# message-id prefix (the API's agent_telemetry keeps a copy of it, pinned by a test). The
+# bridge turns each such event into an ``x_rejected`` telemetry frame instead of storing it.
+REJECTION_MESSAGE_PREFIX = "x_rejected:"
 
-    The harness has no "rejected" event, and its event union is closed. A
-    ``message_handler_error`` carrying the message's id does the job: the client marks that
-    pending message as failed with the reason, and the bridge stops counting it as pending.
+# Reason codes the UI switches on, by the ApplicationError type the runner's validators raise.
+_REJECTION_CODES = {
+    "UnknownToolApproval": "unknown_approval",
+    "ToolApprovalAlreadyResolved": "already_resolved",
+    "UnknownFunction": "unknown_function",
+    "MalformedMessage": "malformed_message",
+    "MidTurnRejected": "busy",
+}
+_REJECTION_REASONS = {
+    "unknown_approval": "No approval is waiting for this tool call. Its turn may have been stopped.",
+    "already_resolved": "This tool call was already {detail}, so this decision was not applied.",
+    "unknown_function": "The agent doesn't accept this kind of message.",
+    "malformed_message": "The agent couldn't read this message.",
+    "busy": "The agent is busy and doesn't accept this message mid-turn.",
+    "session_closed": "The session closed.",
+}
+
+
+def describe_rejection(exc: ApplicationError | None) -> tuple[str, str, str | None]:
+    """``(code, human reason, error type)`` for a validator's ApplicationError (None: the
+    session closed)."""
+    if exc is None:
+        return "session_closed", _REJECTION_REASONS["session_closed"], None
+    code = _REJECTION_CODES.get(exc.type or "", "rejected")
+    if code == "already_resolved":
+        # "tool approval for tool_id='x' is already approved"
+        detail = str(exc.message).rsplit(" ", 1)[-1] or "resolved"
+        return code, _REJECTION_REASONS[code].format(detail=detail), exc.type
+    return code, _REJECTION_REASONS.get(code, str(exc.message)), exc.type
+
+
+def publish_rejection(
+    runner: AgentWorkflowRunner,
+    *,
+    kind: typing.Literal["message", "approval"],
+    request_id: str,
+    exc: ApplicationError | None,
+    tool_id: str | None = None,
+    message_text: str | None = None,
+) -> None:
+    """Report a front-door Signal the agent refused, on the stream (PRD S8).
+
+    The harness has no "rejected" event, and its event union is closed, so two harness events
+    carry it:
+
+    * for a message, ``message_accepted`` then ``message_handler_error`` under the message's
+      own id (``message_text``), so a harness client marks that pending message as failed;
+    * for both kinds, one ``message_handler_error`` under ``REJECTION_MESSAGE_PREFIX +
+      request_id`` whose text is the rejection as JSON. A harness client ignores it (an error
+      for an unknown message id); the bridge replaces it with an ``x_rejected`` frame.
     """
+    import json
+
     from temporal_agent_harness.harness.agent_protocol import (
         MessageAccepted,
         MessageDisposition,
         MessageHandlerError,
     )
 
-    # Accepted first, so a client that hasn't yet matched its pending send still creates
-    # the message before marking it failed (the projection ignores errors for unknown ids).
+    code, reason, error_type = describe_rejection(exc)
+    if kind == "message":
+        # Accepted first, so a client that hasn't yet matched its pending send still creates
+        # the message before marking it failed (the projection ignores errors for unknown ids).
+        runner._pub(
+            "",
+            0,
+            MessageAccepted(handler="", payload={}, disposition=MessageDisposition.QUEUED),
+            message_id=request_id,
+        )
+        runner._pub("", 0, MessageHandlerError(message=message_text or reason), message_id=request_id)
+    detail = {
+        "kind": kind,
+        "request_id": request_id,
+        "tool_id": tool_id,
+        "message_id": request_id if kind == "message" else None,
+        "code": code,
+        "reason": reason,
+        "error_type": error_type,
+    }
     runner._pub(
         "",
         0,
-        MessageAccepted(handler="", payload={}, disposition=MessageDisposition.QUEUED),
-        message_id=message_id,
+        MessageHandlerError(message=json.dumps(detail, sort_keys=True)),
+        message_id=REJECTION_MESSAGE_PREFIX + request_id,
     )
-    runner._pub("", 0, MessageHandlerError(message=reason), message_id=message_id)
 
 
 def payload_storage() -> Any:

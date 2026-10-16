@@ -1,7 +1,7 @@
 """Recovery, usage and worker-health telemetry for the bridge (PRD S3, U5, U6; CTO-2).
 
-The bridge appends three frame types to the session's Redis stream, each at the position of the
-frame before it:
+The bridge appends four frame types to the session's Redis stream, each at the position of the
+frame before it (``x_rejected``: at the position of the stream event it replaces):
 
 ``x_usage``     one per model call. Live from ``model_interaction_ended`` (``confirmed: false``),
                 then confirmed from the model activity's result in workflow history at the
@@ -12,9 +12,17 @@ frame before it:
                 identity and the previous attempt's failure). Also for ``run_command`` reattach.
 ``x_worker``    "is a worker answering" hints while a turn is open and the stream is silent,
                 from Describe and DescribeTaskQueue (no worker needed, not Queries).
+``x_rejected``  a front-door Signal (``enqueue_message`` / ``enqueue_approval``) the agent
+                refused: unknown or already-resolved approval, unknown or malformed message,
+                session closed. The workflow publishes it on its own event stream (a
+                ``message_handler_error`` whose ``message_id`` starts with
+                ``REJECTION_MESSAGE_PREFIX`` and whose text is the rejection as JSON); the
+                bridge stores this frame in its place. No Query, and it survives a reload.
 
 Every frame has an ``id``; the latest frame with a given ``id`` wins (a confirmed frame
-replaces the live one). Fields a provider doesn't report are ``null``, never 0.
+replaces the live one). Fields a provider doesn't report are ``null``, never 0. Every frame
+has an ``agent_id``: the agent whose turn it describes, else the root agent's, so a client
+never attributes one to an unknown agent.
 
 Honesty rules (the UI shows recoveries as durability savings):
 
@@ -35,8 +43,10 @@ Nothing here needs a worker: history, Describe and DescribeTaskQueue are served 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
+from datetime import datetime
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -57,6 +67,9 @@ log = logging.getLogger(__name__)
 X_USAGE = "x_usage"
 X_RECOVERY = "x_recovery"
 X_WORKER = "x_worker"
+X_REJECTED = "x_rejected"
+# Same value as harness_ext.REJECTION_MESSAGE_PREFIX (the workflow side); a test pins them.
+REJECTION_MESSAGE_PREFIX = "x_rejected:"
 
 MODEL_ACTIVITY_SUFFIXES = ("__model_request_stream", "__model_request")
 INTERNAL_ACTIVITY_SUFFIXES = ("__event_stream_handler", "__cancel_suspended_response")
@@ -480,6 +493,8 @@ class Telemetry:
         self.identities: OrderedDict[tuple[str, str, int], str] = OrderedDict()
         # Tool ids waiting on a human (approval) or a client (callback), per agent.
         self.awaiting: dict[str, set[str]] = {}
+        # The root agent's id (the harness mints it per session), for frames outside any turn.
+        self.root_agent_id: str | None = None
 
     @property
     def awaiting_human(self) -> bool:
@@ -516,6 +531,8 @@ class Telemetry:
         obs = Observation()
         if event.startswith("x_"):
             return obs
+        if is_root and data.get("agent_id"):
+            self.root_agent_id = data["agent_id"]
         if event == "subagent_started" and data.get("subagent_id") and data.get("workflow_id"):
             self.workflows[data["subagent_id"]] = data["workflow_id"]
         turn = self._turn(data, is_root)
@@ -838,6 +855,9 @@ class Health:
     pollers: int | None = None
     # Live tool recoveries seen while pending: (workflow_id, activity record-ish dict).
     tool_retries: list[dict[str, Any]] = field(default_factory=list)
+    # Current run id of each workflow Described (root and open subagents): follows
+    # continue-as-new, for Temporal UI deep links.
+    runs: dict[str, str] = field(default_factory=dict)
 
 
 async def check_health(client: Client, tel: Telemetry, *, now: float | None = None) -> Health:
@@ -847,6 +867,7 @@ async def check_health(client: Client, tel: Telemetry, *, now: float | None = No
     now = time.time() if now is None else now
     reasons: list[str] = []
     tool_retries: list[dict[str, Any]] = []
+    runs: dict[str, str] = {}
     task_queue = None
     for wf in tel.open_workflows():
         try:
@@ -854,6 +875,8 @@ async def check_health(client: Client, tel: Telemetry, *, now: float | None = No
         except Exception as exc:  # noqa: BLE001
             log.info("telemetry: describe %s failed: %s", wf, exc)
             continue
+        if getattr(desc, "run_id", None):
+            runs[wf] = desc.run_id
         task_queue = task_queue or desc.task_queue
         raw = desc.raw_description
         for pa in raw.pending_activities:
@@ -902,14 +925,31 @@ async def check_health(client: Client, tel: Telemetry, *, now: float | None = No
         except Exception as exc:  # noqa: BLE001 - optional signal
             log.debug("telemetry: describe task queue failed: %s", exc)
     if reasons:
-        return Health("suspect", "; ".join(reasons), pollers, tool_retries)
-    return Health("ok", "workers are answering", pollers, tool_retries)
+        return Health("suspect", "; ".join(reasons), pollers, tool_retries, runs)
+    return Health("ok", "workers are answering", pollers, tool_retries, runs)
 
 
-def worker_frame(state: str, reason: str, since: float, *, turn: Turn | None, pollers: int | None) -> tuple[str, dict[str, Any]]:
+def worker_frame(
+    state: str,
+    reason: str,
+    since: float,
+    *,
+    turn: Turn | None,
+    pollers: int | None,
+    root_agent_id: str | None = None,
+    workflow_id: str | None = None,
+    runs: dict[str, str] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Worker health is the root workflow's: outside a turn it belongs to the root agent.
+    ``run_id`` is the root workflow's current run; ``runs`` maps every workflow id seen
+    (root and subagents) to its current run, for Temporal UI deep links."""
+    runs = dict(runs or {})
     return X_WORKER, {
         "id": "worker",
-        "agent_id": turn.agent_id if turn else None,
+        "workflow_id": workflow_id,
+        "run_id": runs.get(workflow_id) if workflow_id else None,
+        "runs": runs,
+        "agent_id": turn.agent_id if turn else root_agent_id,
         "turn_id": turn.turn_id if turn else None,
         "turn_number": turn.turn_number if turn else None,
         "state": state,
@@ -943,3 +983,46 @@ def live_tool_recovery_frame(tel: Telemetry, turn: Turn, retry: dict[str, Any]) 
         activity_id=retry["activity_id"],
         tool_name=retry["name"],
     )
+
+
+def is_rejection(event: str, data: dict[str, Any]) -> bool:
+    """True for the stream event the workflow publishes for a refused front-door Signal."""
+    return event == "message_handler_error" and str(data.get("message_id") or "").startswith(
+        REJECTION_MESSAGE_PREFIX
+    )
+
+
+def _epoch(ts: Any) -> float:
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    try:
+        return datetime.fromisoformat(str(ts)).timestamp()
+    except (TypeError, ValueError):
+        return time.time()
+
+
+def rejected_frame(data: dict[str, Any], *, root_agent_id: str | None = None) -> tuple[str, dict[str, Any]]:
+    """The ``x_rejected`` frame for a rejection event (``is_rejection``). Its ``id`` is fixed
+    by the request id, so a takeover that replays the event never stores it twice."""
+    request_id = str(data["message_id"])[len(REJECTION_MESSAGE_PREFIX):]
+    try:
+        detail = json.loads(data.get("message") or "{}")
+        if not isinstance(detail, dict):
+            raise ValueError("not an object")
+    except ValueError:
+        detail = {"reason": data.get("message")}
+    kind = detail.get("kind") if detail.get("kind") in ("message", "approval") else None
+    return X_REJECTED, {
+        "id": f"rejected:{request_id}",
+        "agent_id": data.get("agent_id") or root_agent_id,
+        "turn_id": None,
+        "turn_number": None,
+        "kind": kind,
+        "request_id": request_id,
+        "tool_id": detail.get("tool_id"),
+        "message_id": detail.get("message_id"),
+        "code": detail.get("code") or "rejected",
+        "reason": detail.get("reason") or "The agent did not accept this request.",
+        "error_type": detail.get("error_type"),
+        "timestamp": _epoch(data.get("timestamp")),
+    }

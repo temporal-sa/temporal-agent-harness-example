@@ -393,6 +393,60 @@ class Takeover(_Base):
         return b.is_forwarding(session)
 
 
+@unittest.skipIf(support.skip_reason(), support.skip_reason() or "")
+class Rejections(_Base):
+    async def test_p3_front_door_rejections_reach_the_stream_as_x_rejected(self) -> None:
+        """PRD S8: an approval for no pending call and a message of an unknown type, sent through
+        the Signal front door while the agent is idle, reach Redis as x_rejected frames; the
+        forwarder's attach ends instead of polling until the next turn."""
+        from simple_chat_agent.agent.contracts import ENQUEUE_APPROVAL_SIGNAL, FrontDoorApproval
+
+        async with support.running_worker(self.client, self.task_queue):
+            handle = await self.start(model=HAIKU)
+            b = self.bridge()
+            approval_id = uuid.uuid4().hex
+            await handle.signal(ENQUEUE_APPROVAL_SIGNAL, FrontDoorApproval(
+                request_id=approval_id, tool_id="no-such-tool", approved=True))
+            await b.wake(handle.id)
+            message_id = await support.send(handle, "no_such_operation", {})
+            await self.store.note_sent(handle.id, message_id)
+            await b.wake(handle.id)
+
+            async def rejected():
+                got = of(await stored(self.store, handle.id), "x_rejected")
+                return got if len(got) == 2 else None
+
+            frames = await wait_until(rejected, 60, "two x_rejected frames")
+            started = time.monotonic()
+            await wait_until(lambda: self._idle(b, handle.id), 30, "the forwarder to go idle")
+            idle_after = time.monotonic() - started
+            stats = await handle.query("history_stats")
+            everything = await stored(self.store, handle.id)
+            await handle.signal("close")
+        by_id = {f.data["request_id"]: f.data for f in frames}
+        root = {f.data["agent_id"] for f in everything if "event_offset" in f.data}
+        print(f"\n[P3 x_rejected] {[(d['kind'], d['code']) for d in by_id.values()]}; "
+              f"forwarder idle {idle_after:.1f}s after the frames were stored")
+        self.assertEqual(len(root), 1)
+        a, m = by_id[approval_id], by_id[message_id]
+        self.assertEqual((a["kind"], a["tool_id"], a["code"], a["agent_id"]),
+                         ("approval", "no-such-tool", "unknown_approval", *root))
+        self.assertEqual((m["kind"], m["message_id"], m["code"], m["agent_id"]),
+                         ("message", message_id, "unknown_function", *root))
+        self.assertTrue(a["reason"] and m["reason"])
+        # The message's own failure reaches harness clients too; the carrier events never do.
+        failed = [f for f in of(everything, "message_handler_error") if f.data.get("message_id") == message_id]
+        self.assertEqual(len(failed), 1)
+        self.assertFalse(any(str(f.data.get("message_id") or "").startswith("x_rejected:") for f in everything))
+        self.assertEqual((await self.store.meta(handle.id)).pending, set())
+        self.assertEqual({r["request_id"] for r in stats["rejected"]}, {approval_id, message_id})
+        # The bridge recorded the root's current run id from Describe (for Temporal UI links).
+        self.assertEqual((await self.store.meta(handle.id)).run_id, handle.result_run_id)
+
+    async def _idle(self, b: Any, session: str) -> bool:
+        return not b.is_forwarding(session)
+
+
 async def _replica(session: str, archive_dir: str) -> None:
     """A stand-in API replica: holds a reader on ``session`` and forwards it."""
     from pathlib import Path

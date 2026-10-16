@@ -11,7 +11,13 @@ Around the copy, the forwarder:
 
 * registers each subagent it sees start (``subagent_started``) under the root session, so the
   routes can check ownership of subagent ids;
-* derives telemetry frames (``x_usage``, ``x_recovery``, ``x_worker``; see agent_telemetry);
+* derives telemetry frames (``x_usage``, ``x_recovery``, ``x_worker``; see agent_telemetry),
+  each with an ``agent_id`` (the root agent's for frames outside a turn);
+* records each workflow's current run id (root and subagents) from Describe, never a Query:
+  at each attach, root ``turn_started``, ``subagent_started`` and worker check, so it follows
+  continue-as-new; served by ``status`` and carried on ``x_worker`` frames;
+* stores an ``x_rejected`` frame in place of each front-door rejection event the agent
+  publishes (deduplicated by its id, so a takeover that replays the event never repeats it);
 * at each root ``turn_end``: confirms the turn's telemetry from history (meta ``confirming`` is
   true meanwhile, at most ``CONFIRM_TIMEOUT_SECONDS``), archives the frames since the last
   archive (S3 or disk), then Signals the agent ``stream_acked`` once, with the highest root
@@ -37,7 +43,12 @@ graceful release wakes standbys at once. Writes are fenced on the lease, and a n
 replays the open turn from its ``turn_started`` and drops frames already stored (by content),
 so subagents mounted in that turn are re-mounted and nothing is stored twice. Root frames are
 matched by ``event_offset``; other frames by content, counting repeats, so two identical frames
-both survive.
+both survive; telemetry frames (``x_*``) by their ``id``.
+
+Out-of-turn tail: the harness attach ends only at a root ``turn_end``. Events published while
+the agent is idle (a rejected Signal) are followed by none, so once the agent is idle with no
+pending message and the last root frame was outside a turn, the attach ends after
+``OUT_OF_TURN_QUIET_SECONDS`` without a frame instead of polling until the next turn.
 """
 
 from __future__ import annotations
@@ -86,6 +97,8 @@ STANDBY_POLL_SECONDS = float(os.environ.get("AGENT_BRIDGE_STANDBY_POLL_SECONDS",
 WORKER_SILENCE_SECONDS = float(os.environ.get("AGENT_BRIDGE_WORKER_SILENCE_SECONDS", "8"))
 WORKER_CHECK_EVERY_SECONDS = float(os.environ.get("AGENT_BRIDGE_WORKER_CHECK_SECONDS", "4"))
 WORKER_CHECK_MAX_SECONDS = float(os.environ.get("AGENT_BRIDGE_WORKER_CHECK_MAX_SECONDS", "60"))
+# Idle, nothing pending, last root frame outside a turn: end the attach after this much silence.
+OUT_OF_TURN_QUIET_SECONDS = float(os.environ.get("AGENT_BRIDGE_OUT_OF_TURN_QUIET_SECONDS", "3"))
 
 
 def sse_data(item: AgentEvent) -> tuple[str, dict[str, Any]]:
@@ -373,6 +386,7 @@ class _Forwarder:
         self.turn_active = False
         self.worker_state: str | None = None
         self.highest_root = 0  # highest root resume_offset stored
+        self.runs: dict[str, str] = {}  # workflow id -> current run id (from Describe)
         self._ack_lock = asyncio.Lock()
         self._archive_failures = 0
 
@@ -384,6 +398,7 @@ class _Forwarder:
         only on a wake, on new history seen by Describe, or while retrying a failure."""
         meta = await self.store.meta(self.session)
         self.worker_state = (meta.worker or {}).get("state")
+        self.tel.root_agent_id = self.tel.root_agent_id or meta.root_agent_id
         failing_for = 0.0
         backoff = 1.0
         while True:
@@ -485,31 +500,63 @@ class _Forwarder:
         # repeat, e.g. two equal deltas published in one workflow task).
         seen_roots: set[int] = set()
         seen = Counter()
+        self.tel.root_agent_id = self.tel.root_agent_id or meta.root_agent_id
         for f in await self.store.read_from(self.session, from_offset):
             if f.event.startswith("x_"):
                 continue
             if "event_offset" in f.data:
                 seen_roots.add(int(f.data["event_offset"]))
+                self.tel.root_agent_id = self.tel.root_agent_id or f.data.get("agent_id")
             else:
                 seen[_digest(f.event, f.data)] += 1
         self.highest_root = max(self.highest_root, meta.head)
         self.turn_active = meta.turn_active
+        if meta.run_id:
+            self.runs.setdefault(self.session, meta.run_id)
+        await self._refresh_run(self.session)
         max_ro = from_offset
         client = AgentClient(self.temporal, self.session)
         count = 0
         frames = await client.attach(on_item=lambda item, ro: (item, ro), from_offset=from_offset)
         watcher = asyncio.create_task(self._watch_workers())
+        out_of_turn_tail = False
         try:
-            async for item, resume_offset in frames:
+            while True:
+                try:
+                    if out_of_turn_tail:
+                        item, resume_offset = await asyncio.wait_for(
+                            anext(frames), timeout=OUT_OF_TURN_QUIET_SECONDS
+                        )
+                    else:
+                        item, resume_offset = await anext(frames)
+                except StopAsyncIteration:
+                    break
+                except TimeoutError:
+                    # Idle after an out-of-turn event: no turn_end will end this attach.
+                    break
                 if not isinstance(item, AgentEvent):
                     continue
                 event, data = sse_data(item)
                 # Only root events advance the resume offset (harness attach contract).
                 is_root = resume_offset > max_ro
                 max_ro = max(max_ro, resume_offset)
+                self.last_frame_at = time.monotonic()
+                if telemetry.is_rejection(event, data):
+                    # Stored as x_rejected at the event's position, never as itself.
+                    if is_root:
+                        meta.head = max(meta.head, resume_offset)
+                        self.highest_root = max(self.highest_root, resume_offset)
+                        out_of_turn_tail = not meta.turn_active and not meta.pending
+                    if await self._emit(
+                        *telemetry.rejected_frame(data, root_agent_id=self.tel.root_agent_id),
+                        at=resume_offset,
+                    ):
+                        count += 1
+                    if is_root:
+                        await self.store.save_meta(self.session, meta)
+                    continue
                 if is_root:
                     data["event_offset"] = resume_offset - 1
-                self.last_frame_at = time.monotonic()
                 obs = self.tel.observe(event, data, resume_offset, is_root=is_root)
                 if is_root:
                     dup = data["event_offset"] in seen_roots
@@ -531,14 +578,23 @@ class _Forwarder:
                     await self._write(event, data, resume_offset)
                     count += 1
                 if is_root:
-                    before = (meta.turn_active, meta.current_turn, meta.turn_start, meta.head)
+                    before = (meta.turn_active, meta.current_turn, meta.turn_start, meta.head,
+                              meta.root_agent_id)
                     change = fold(meta, event, data)
                     meta.head = max(meta.head, resume_offset)
+                    meta.root_agent_id = data.get("agent_id") or meta.root_agent_id
                     self.highest_root = max(self.highest_root, resume_offset)
                     if event == "turn_started":
                         meta.turn_start = resume_offset - 1
+                        if not dup:
+                            # A continue-as-new between attaches started a new run.
+                            self._spawn_run_refresh(self.session)
                     self.turn_active = meta.turn_active
-                    after = (meta.turn_active, meta.current_turn, meta.turn_start, meta.head)
+                    after = (meta.turn_active, meta.current_turn, meta.turn_start, meta.head,
+                             meta.root_agent_id)
+                    out_of_turn_tail = (
+                        not meta.turn_active and not meta.pending and not data.get("turn_id")
+                    )
                     if not dup or before != after or change.added or change.removed:
                         await self.store.save_meta(
                             self.session, meta, pending_added=change.added, pending_removed=change.removed
@@ -548,6 +604,8 @@ class _Forwarder:
                         data["workflow_id"], self.session, agent_id=data.get("subagent_id")
                     )
                     self.b._roots[data["workflow_id"]] = self.session
+                    if not dup:
+                        self._spawn_run_refresh(data["workflow_id"])
                 if dup:
                     if is_root and event == "turn_end" and resume_offset > meta.acked:
                         # The previous holder died before confirming and acking this turn.
@@ -562,6 +620,8 @@ class _Forwarder:
                     self._spawn(job, root_turn_end=root_turn_end, confirm_token=confirm_token)
         finally:
             await _stop(watcher)
+            with contextlib.suppress(Exception):
+                await frames.aclose()
         return count
 
     # -- writing -----------------------------------------------------------------------
@@ -581,15 +641,17 @@ class _Forwarder:
                 self.pos = await self.store.last_position(self.session) or self.pos
             raise RuntimeError(f"bridge {self.session}: could not place a {event} frame")
 
-    async def _emit(self, event: str, data: dict[str, Any]) -> None:
-        """Store a telemetry frame once (its ``id`` + confirmation state)."""
+    async def _emit(self, event: str, data: dict[str, Any], *, at: int | None = None) -> bool:
+        """Store a telemetry frame once (its ``id`` + confirmation state), after the newest
+        frame or at ``at``. False if it was already stored."""
         key = f"{data.get('id')}|{'c' if data.get('confirmed') else 'l'}"
         if event == telemetry.X_WORKER:
             key = f"worker|{data.get('state')}|{data.get('since')}"
         if await self.store.was_emitted(self.session, key):
-            return
-        await self._write(event, data, None)
+            return False
+        await self._write(event, data, at)
         await self.store.mark_emitted(self.session, key)
+        return True
 
     # -- background jobs ---------------------------------------------------------------
 
@@ -719,6 +781,7 @@ class _Forwarder:
             except Exception as exc:  # noqa: BLE001
                 log.info("bridge %s: worker check failed: %s", self.session, exc)
                 continue
+            await self._note_runs(health.runs)
             if health.state != (self.worker_state or "ok"):
                 await self._set_worker(health.state, health.reason, health.pollers)
             for retry in health.tool_retries:
@@ -730,12 +793,41 @@ class _Forwarder:
         since = time.time()
         self.worker_state = state
         turn = next((t for t in self.tel.open.values() if t.is_root), None)
-        event, data = telemetry.worker_frame(state, reason, since, turn=turn, pollers=pollers)
+        event, data = telemetry.worker_frame(
+            state, reason, since, turn=turn, pollers=pollers, root_agent_id=self.tel.root_agent_id,
+            workflow_id=self.session, runs=self.runs,
+        )
         await self._emit(event, data)
         with contextlib.suppress(Exception):
             await self.store.set_tracking(
                 self.session, worker={"state": state, "reason": reason, "since": since}
             )
+
+
+    # -- run ids ---------------------------------------------------------------------------
+
+    async def _refresh_run(self, workflow_id: str) -> None:
+        """Describe ``workflow_id`` (no Query, no worker needed) and record its current run."""
+        try:
+            desc = await self.temporal.get_workflow_handle(workflow_id).describe()
+        except Exception as exc:  # noqa: BLE001 - optional; the next refresh retries
+            log.info("bridge %s: describe %s for its run id failed: %s", self.session, workflow_id, exc)
+            return
+        run_id = getattr(desc, "run_id", None)
+        if run_id:
+            await self._note_runs({workflow_id: run_id})
+
+    def _spawn_run_refresh(self, workflow_id: str) -> None:
+        task = asyncio.create_task(self._refresh_run(workflow_id))
+        self._jobs.add(task)
+        task.add_done_callback(self._jobs.discard)
+
+    async def _note_runs(self, runs: dict[str, str]) -> None:
+        for wf, run_id in runs.items():
+            if run_id and self.runs.get(wf) != run_id:
+                self.runs[wf] = run_id
+                with contextlib.suppress(Exception):
+                    await self.store.set_tracking(wf, run_id=run_id)
 
 
 __all__ = ["Bridge", "SessionMeta", "sse_data"]

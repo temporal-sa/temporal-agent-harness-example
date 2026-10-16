@@ -1137,7 +1137,7 @@ def create_agent_router(
             seeded = await seed_once(session_id, body.demo)
         client = await temporal()
         try:
-            await client.start_workflow(
+            started = await client.start_workflow(
                 AGENT_WORKFLOW_TYPE,
                 args=[AgentConfig(), data],
                 id=session_id,
@@ -1163,6 +1163,9 @@ def create_agent_router(
             "demo": body.demo,
         }
         await sessions.put(uid, record)
+        run_id = getattr(started, "result_run_id", None)
+        if isinstance(run_id, str) and run_id:
+            await store.set_tracking(session_id, run_id=run_id)
         summary = _summary(record)
         if seeded is not None:
             summary["seed"] = seeded
@@ -1500,6 +1503,7 @@ def create_agent_router(
     async def status(session_id: str, uid: str = Depends(user_id)):
         await require(session_id, uid)
         meta = await store.meta(session_id)
+        # run_id: recorded at create, then by the bridge from Describe (follows continue-as-new).
         return JSONResponse(meta.to_status(), headers=NO_STORE)
 
     @router.get("/workflow-status/{session_id}")

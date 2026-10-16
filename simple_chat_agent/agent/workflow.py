@@ -235,7 +235,11 @@ class CodingAgent:
             # tell senders their buffered messages won't run.
             for message in self._deferred:
                 harness_ext.publish_rejection(
-                    self._runner, message_id=message.request_id, reason="The session closed."
+                    self._runner,
+                    kind="message",
+                    request_id=message.request_id,
+                    exc=None,
+                    message_text="The session closed.",
                 )
             self._deferred = []
             self._continuing = False
@@ -349,6 +353,13 @@ class CodingAgent:
             await harness_ext.admit_approval(self._runner, decision)
         except ApplicationError as exc:
             self._reject(approval.request_id, exc)
+            harness_ext.publish_rejection(
+                self._runner,
+                kind="approval",
+                request_id=approval.request_id,
+                tool_id=approval.tool_id,
+                exc=exc,
+            )
 
     def _admit(self, message: FrontDoorMessage) -> None:
         try:
@@ -360,7 +371,11 @@ class CodingAgent:
         except ApplicationError as exc:
             self._reject(message.request_id, exc)
             harness_ext.publish_rejection(
-                self._runner, message_id=message.request_id, reason=f"Not accepted: {exc.message}"
+                self._runner,
+                kind="message",
+                request_id=message.request_id,
+                exc=exc,
+                message_text=f"Not accepted: {exc.message}",
             )
 
     def _count_update(self) -> None:
