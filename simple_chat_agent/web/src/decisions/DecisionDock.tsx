@@ -5,6 +5,7 @@ import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type Focu
 
 import { errorCopy, type CodingSession, type DecisionDockProps, type SendRecord } from "../session";
 import { FailedNote, SendStateTrail } from "../recovery/SendStateTrail";
+import { usePhone } from "../recovery/usePhone";
 import { currentBranch, DETACHED } from "../workbench/changes";
 import { DiffView } from "../workbench/DiffView";
 import { agentLabel, anythingRunning, toolsOf } from "../workbench/tree";
@@ -93,6 +94,31 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
   // toggle, so the transcript keeps its room.
   const phone = usePhone();
   const [phoneOpen, setPhoneOpen] = useState(false);
+  // While the pointer or focus is on the card, its height is locked: opening a group, the
+  // decline form or an answer then scrolls the list instead of growing the card, which sits on
+  // the composer and would push its header (and Approve all) up (owner decision B).
+  const [lockH, setLockH] = useState<number | null>(null);
+  const engaged = hover || focusIn;
+  useLayoutEffect(() => {
+    if (!engaged) {
+      if (lockH !== null) setLockH(null);
+      return;
+    }
+    if (lockH === null && root.current) setLockH(root.current.getBoundingClientRect().height);
+  }, [engaged, lockH]);
+  // Wheel over the card scrolls its list, never the transcript behind it.
+  useEffect(() => {
+    const el = root.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+      e.preventDefault();
+      const body = el.querySelector<HTMLElement>(".dc-body");
+      if (body) body.scrollTop += e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  });
   const toggle = (key: string) =>
     setOpen((s) => {
       const n = new Set(s);
@@ -177,6 +203,7 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
     ref: (el: HTMLElement | null) => {
       root.current = el;
     },
+    style: lockH !== null ? { height: `${lockH}px` } : undefined,
     onPointerEnter: () => setHover(true),
     onPointerLeave: () => setHover(false),
     onFocus: () => {
@@ -221,10 +248,10 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
           </span>
           {from && <span className="hint">from {agentLabel(from)}</span>}
         </div>
+        {pausedLine}
         <div className="dc-body">
           <ReviewBody item={it} />
         </div>
-        {pausedLine}
         <div className="acts" data-row="one">
           {answered && a ? (
             <span className={`badge ${a.approved ? "good" : "leaving"}`}>{answeredText(a.approved, a.record.remember)}</span>
@@ -253,7 +280,8 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
     );
   }
 
-  // Several calls: one stacked card. The header stays put; the groups scroll inside a cap.
+  // Several calls: one stacked card. A column: the header (Approve all) and the paused line at
+  // the top, the footer at the bottom, and only the list of calls scrolls.
   const w = stack.waitingIds.length;
   const compact = phone && !phoneOpen;
   return (
@@ -273,6 +301,7 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
           <span aria-hidden="true">{phoneOpen ? "▾" : "▸"}</span> {phoneOpen ? "Hide the calls" : `Review ${w === 1 ? "the call" : `the ${stack.total} calls`}`}
         </button>
       )}
+      {!compact && pausedLine}
       {!compact && (
         <div className="dc-body">
           <ul className="stack">
@@ -294,25 +323,9 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
           </ul>
         </div>
       )}
-      {!compact && pausedLine}
       {(!compact || card.held.length > 0 || latest) && footer}
     </section>
   );
-}
-
-/** Phone width (the shell's sheet breakpoint). */
-function usePhone(): boolean {
-  const query = "(max-width: 600px)";
-  const get = () => typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia(query).matches;
-  const [phone, setPhone] = useState(get);
-  useEffect(() => {
-    if (typeof window.matchMedia !== "function") return;
-    const m = window.matchMedia(query);
-    const on = () => setPhone(m.matches);
-    m.addEventListener?.("change", on);
-    return () => m.removeEventListener?.("change", on);
-  }, []);
-  return phone;
 }
 
 /**

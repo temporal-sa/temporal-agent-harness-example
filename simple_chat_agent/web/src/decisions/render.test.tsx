@@ -135,6 +135,10 @@ describe("Workbench and recovery", () => {
     const live = renderToStaticMarkup(<Workbench session={session([running])} variant="panel" initialTab="terminal" />);
     expect(live).toContain('role="status">Running pytest -q</p>');
     expect(live).not.toMatch(/role="status">Running pytest -q \d/);
+    // No exit code to report: "finished", once.
+    const noExit = tool("r3", "run_command", { command: "pytest -q" }, { state: "done", output: "something unexpected" });
+    const done = renderToStaticMarkup(<Workbench session={session([noExit])} variant="panel" initialTab="terminal" />);
+    expect(done).toContain('role="status">pytest -q finished</p>');
     const edit = tool("e0", "edit_file", { path: "refund_service/refunds.py" }, { state: "done", output: "Edited refund_service/refunds.py (+1 -1).\n@@ -1 +1 @@\n-a\n+b\n" });
     const changes = renderToStaticMarkup(<Workbench session={session([edit])} variant="panel" initialTab="changes" />);
     expect(changes).toContain('<del class="del">');
@@ -192,6 +196,11 @@ describe("approval card styles (UX review)", async () => {
     expect(phone).toMatch(/\.dc-card\.stacked > \.top \{[^}]*flex-wrap: nowrap/);
     expect(phone).toMatch(/\.dc-card \.dc-review \{[^}]*min-height: 44px/);
     expect(phone).toMatch(/\.dc-card \.btn, \.dc-card \.chev, \.dc-card \.linkish \{[^}]*min-height: 44px/);
+  });
+
+  it("the group title is sized in rem, not the shell's .chev em (was 9.9 px)", () => {
+    expect(css).toMatch(/\.dc-card \.chev \{[^}]*font-size: \.88rem/);
+    expect(css).toMatch(/\.dc-card \.title \{[^}]*font-size: \.88rem/);
   });
 
   it("M1: answered and waiting rows share a fixed height, and the footer is fixed", () => {

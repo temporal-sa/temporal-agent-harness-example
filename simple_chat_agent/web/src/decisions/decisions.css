@@ -54,11 +54,13 @@
 }
 .dc-card .grp-wrap.open > .grp { border-color: var(--uv-light); }
 .dc-card .grp-acts, .dc-card .item-acts { display: inline-flex; gap: .4rem; align-items: center; flex-wrap: nowrap; }
-.dc-card .chev { display: inline-flex; gap: .55rem; align-items: center; text-align: left; min-height: 2rem; min-width: 0; color: var(--off-white); }
+/* Sized here, in rem: the shell styles a .chev of its own in em (the group title was 9.9 px). */
+.dc-card .chev { display: inline-flex; gap: .55rem; align-items: center; text-align: left; min-height: 2rem; min-width: 0; color: var(--off-white); font-size: .88rem; font-family: var(--sans); }
+.dc-card .item .chev { font-size: .85rem; }
 .dc-card .chev > [aria-hidden="true"]:first-child { font-family: var(--mono); color: var(--indigo-300); font-size: .8rem; width: 1em; flex: none; }
 .dc-card .chev.static { padding-left: calc(1em + .55rem); }
 /* The group title reads as a label, not a link: off-white, with the command in plain mono. */
-.dc-card .title { color: var(--off-white); }
+.dc-card .title { color: var(--off-white); font-size: .88rem; }
 .dc-card .title .code { color: var(--off-white); font-size: .82rem; }
 .dc-card .items-wrap { display: grid; gap: .3rem; padding-left: 1.6rem; }
 .dc-card .items-wrap > .why { padding: .1rem .6rem; }

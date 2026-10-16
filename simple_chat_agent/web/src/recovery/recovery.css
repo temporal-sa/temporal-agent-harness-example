@@ -14,10 +14,16 @@
 .rc-banner a { font-family: var(--mono); font-size: .8em; white-space: nowrap; }
 .rc-banner .d { grid-column: 2 / 4; color: var(--indigo-100); margin: 0; }
 .rc-banner .d b { color: var(--off-white); font-weight: 500; }
+/* Phone: one line (icon, title, Details, Temporal UI), the rest behind Details. */
+.rc-banner.compact { display: flex; flex-wrap: wrap; align-items: center; gap: 0 .6rem; padding: 0 .6rem; font-size: .85rem; }
+.rc-banner.compact .t { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rc-banner.compact .rc-details { font-family: var(--mono); font-size: .78rem; color: var(--indigo-100); min-height: 44px; display: inline-flex; align-items: center; gap: .3rem; }
+.rc-banner.compact a { min-height: 44px; display: inline-flex; align-items: center; }
+.rc-banner.compact .d { flex-basis: 100%; padding-bottom: .6rem; }
 @media (max-width: 600px) {
-  .rc-banner { grid-template-columns: auto minmax(0, 1fr); }
-  .rc-banner a { grid-column: 1 / 3; grid-row: 3; white-space: normal; min-height: 44px; display: inline-flex; align-items: center; }
-  .rc-banner .d { grid-column: 1 / 3; }
+  .rc-banner:not(.compact) { grid-template-columns: auto minmax(0, 1fr); }
+  .rc-banner:not(.compact) a { grid-column: 1 / 3; grid-row: 3; white-space: normal; min-height: 44px; display: inline-flex; align-items: center; }
+  .rc-banner:not(.compact) .d { grid-column: 1 / 3; }
 }
 
 .rc-divider {

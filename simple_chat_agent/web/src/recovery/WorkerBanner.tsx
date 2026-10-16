@@ -1,10 +1,11 @@
 // "Worker isn't answering" (PRD U6). Yellow, never red: nothing has failed, and Temporal
 // keeps everything until a worker returns.
 
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 
 import { api, type AgentConfig, type WorkerBannerProps as SlotProps } from "../session";
 import { bannerView, temporalUiUrl } from "./banner";
+import { usePhone } from "./usePhone";
 import "./recovery.css";
 
 export interface WorkerBannerProps extends SlotProps {
@@ -41,8 +42,44 @@ function useTemporalUiTemplate(given: string | null | undefined, active: boolean
 export function WorkerBanner({ session, temporalUiTemplate }: WorkerBannerProps) {
   const v = bannerView(session);
   const template = useTemporalUiTemplate(temporalUiTemplate, v.show);
+  // On a phone the banner is one line with a Details toggle, so the transcript keeps its room;
+  // the Temporal UI link stays on that line.
+  const phone = usePhone();
+  const [details, setDetails] = useState(false);
+  const panel = useId();
   if (!v.show) return null;
   const href = temporalUiUrl(template, v.workflowId, v.runId);
+  const linkText = v.runId ? "Open the pending Activity in Temporal UI ↗" : "Open the Workflow in Temporal UI ↗";
+  const body = (
+    <p className="d" id={panel}>
+      {v.lead}{" "}
+      {v.saved && (
+        <>
+          <b>Saved in Temporal:</b> {v.saved}.{" "}
+        </>
+      )}
+      <b>Waiting:</b> {v.waiting}
+    </p>
+  );
+  if (phone) {
+    return (
+      <section className="rc-banner compact" role="status" aria-label="Worker isn't answering">
+        <span className="ic" aria-hidden="true">
+          !
+        </span>
+        <span className="t">Worker isn't answering</span>
+        <button type="button" className="rc-details" aria-expanded={details} aria-controls={panel} onClick={() => setDetails((d) => !d)}>
+          Details <span aria-hidden="true">{details ? "▾" : "▸"}</span>
+        </button>
+        {href && (
+          <a href={href} target="_blank" rel="noopener noreferrer" aria-label={linkText}>
+            Temporal UI ↗
+          </a>
+        )}
+        {details && body}
+      </section>
+    );
+  }
   return (
     <section className="rc-banner" role="status" aria-label="Worker isn't answering">
       <span className="ic" aria-hidden="true">
@@ -51,20 +88,12 @@ export function WorkerBanner({ session, temporalUiTemplate }: WorkerBannerProps)
       <span className="t">Worker isn't answering</span>
       {href ? (
         <a href={href} target="_blank" rel="noopener noreferrer">
-          {v.runId ? "Open the pending Activity in Temporal UI ↗" : "Open the Workflow in Temporal UI ↗"}
+          {linkText}
         </a>
       ) : (
         <span />
       )}
-      <p className="d">
-        {v.lead}{" "}
-        {v.saved && (
-          <>
-            <b>Saved in Temporal:</b> {v.saved}.{" "}
-          </>
-        )}
-        <b>Waiting:</b> {v.waiting}
-      </p>
+      {body}
     </section>
   );
 }

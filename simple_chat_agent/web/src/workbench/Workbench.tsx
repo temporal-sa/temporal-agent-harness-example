@@ -385,7 +385,8 @@ export function runAnnouncement(command: string, state: ToolPart["state"], badge
       return workerAnswering ? `Running ${command}` : `${command} paused, waiting for a Worker`;
     case "done":
     case "failed":
-      return `${command} finished: ${badge.text}`;
+      // "finished" alone means there was no exit to report: don't say it twice.
+      return badge.text === "finished" ? `${command} finished` : `${command} finished: ${badge.text}`;
     case "denied":
       return `${command} declined`;
     default:

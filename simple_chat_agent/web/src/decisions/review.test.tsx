@@ -231,3 +231,41 @@ describe("review follow-ups", () => {
     expect(host.querySelector(".stack")).not.toBeNull();
   });
 });
+
+describe("verification fixes", () => {
+  let host: HTMLDivElement;
+  let root: Root;
+  beforeEach(() => {
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    root = createRoot(host);
+  });
+  afterEach(() => {
+    act(() => root.unmount());
+    host.remove();
+  });
+
+  it("the card is a column: header and paused line on top, the list, then the footer", () => {
+    act(() => root.render(<DecisionDock session={session(waiting([E1, E2, C1, C2]))} />));
+    const kids = [...host.querySelector("section.dc-card")!.children].map((c) => c.className);
+    expect(kids).toEqual(["top", "paused", "dc-body", "dc-foot"]);
+  });
+
+  it("wheel over the card scrolls its list and never reaches the page", () => {
+    act(() => root.render(<DecisionDock session={session(waiting([E1, E2, C1, C2]))} />));
+    const card = host.querySelector<HTMLElement>("section.dc-card")!;
+    const body = card.querySelector<HTMLElement>(".dc-body")!;
+    const grp = card.querySelector<HTMLElement>(".grp")!;
+    const e = new WheelEvent("wheel", { deltaY: 120, bubbles: true, cancelable: true });
+    let reachedPage = false;
+    const onDoc = (ev: Event) => {
+      if (!ev.defaultPrevented) reachedPage = true;
+    };
+    document.addEventListener("wheel", onDoc);
+    grp.dispatchEvent(e);
+    document.removeEventListener("wheel", onDoc);
+    expect(e.defaultPrevented).toBe(true);
+    expect(reachedPage).toBe(false);
+    expect(body.scrollTop).toBe(120);
+  });
+});
