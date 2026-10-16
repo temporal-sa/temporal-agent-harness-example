@@ -1,64 +1,42 @@
+"""Start an agent, send it one prompt, print its reply:
+python -m basic_file_agent.start_workflow "Create notes/hello.md ..."
+"""
+
 from __future__ import annotations
 
 import argparse
 import asyncio
-import json
-import os
-from uuid import uuid4
+import uuid
 
-from temporalio.client import Client
+from temporal_agent_harness.harness.agent_client import AgentClient
+from temporal_agent_harness.harness.agent_protocol import AgentConfig, MessageHandlerEnd, ToolStartEvent
 
-from basic_file_agent import TASK_QUEUE
-from basic_file_agent.env import env_flag, load_dotenv
-from basic_file_agent.workflow import (
-    BasicFileAgentRequest,
-    BasicFileAgentWorkflow,
-)
-
-
-async def main() -> None:
-    load_dotenv()
-    args = _parse_args()
-
-    client_config = {
-        "namespace": os.environ.get("TEMPORAL_NAMESPACE", "default"),
-        "tls": env_flag("TEMPORAL_TLS", default=False),
-    }
-    if os.environ.get("TEMPORAL_API_KEY"):
-        client_config["api_key"] = os.environ["TEMPORAL_API_KEY"]
-
-    client = await Client.connect(
-        os.environ.get("TEMPORAL_ENDPOINT", "localhost:7233"),
-        **client_config,
-    )
-    result = await client.execute_workflow(
-        BasicFileAgentWorkflow.run,
-        BasicFileAgentRequest(
-            prompt=args.prompt,
-            instructions=args.instructions,
-            model=args.model,
-        ),
-        id=args.workflow_id or f"basic-file-agent-{uuid4()}",
-        task_queue=TASK_QUEUE,
-    )
-    print(json.dumps(result, default=lambda value: vars(value), indent=2))
+from basic_file_agent import TASK_QUEUE, WORKFLOW_TYPE, connect
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the basic file agent workflow.")
-    parser.add_argument("prompt", help="Task prompt for the agent.")
-    parser.add_argument(
-        "--instructions",
-        default=BasicFileAgentRequest.instructions,
-        help="System instructions for the agent.",
-    )
-    parser.add_argument(
-        "--model",
-        default=BasicFileAgentRequest.model,
-        help="Claude model name.",
-    )
-    parser.add_argument("--workflow-id", default="", help="Optional workflow id.")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("prompt")
     return parser.parse_args()
+
+
+async def main() -> None:
+    prompt = _parse_args().prompt
+    client = await connect()
+    workflow_id = f"basic-file-agent-{uuid.uuid4().hex[:8]}"
+    await client.start_workflow(WORKFLOW_TYPE, AgentConfig(), id=workflow_id, task_queue=TASK_QUEUE)
+    turn = await AgentClient(client, workflow_id).send_message(
+        "chat", {"text": prompt}, on_item=lambda item, _offset: item
+    )
+    async for item in turn:
+        if isinstance(item, Exception):  # AgentTurnError / AgentTurnTimeout
+            raise item
+        if isinstance(item.event, ToolStartEvent):
+            print(f"[tool] {item.event.tool_name}")
+        elif isinstance(item.event, MessageHandlerEnd):
+            print(item.event.output["text"])
+    # One prompt per run here; the agent itself would keep taking messages until closed.
+    await client.get_workflow_handle(workflow_id).signal("close")
 
 
 if __name__ == "__main__":

@@ -1,9 +1,5 @@
-from __future__ import annotations
-
 import asyncio
 
-from .worker import main
+from basic_file_agent.worker import main
 
-
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())

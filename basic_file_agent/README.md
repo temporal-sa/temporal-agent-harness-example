@@ -1,76 +1,41 @@
 # Basic File Agent
 
-`basic_file_agent` is the smallest runnable example in this repo. It uses
-`agent_harness` without the chat UI, user registry, OAuth, attachments,
-approvals, artifact storage, demo workspace controller, or sideband event
-stream.
+The smallest agent in this repo: a Temporal Workflow on
+[`temporal-agent-harness`](https://pypi.org/project/temporal-agent-harness/) with
+Pydantic AI, and two file tools. It uses only the harness's public API.
 
-The workflow receives one prompt plus system instructions, lets the model call
-`read_file` and `write_file`, and returns the final assistant message as the
-workflow result.
-
-Read it in this order when using it as a template: `tool_types.py`,
-`guards.py`, `tools.py`, `workflow.py`, then `worker.py`. That shows the app's
-category vocabulary, policy, side-effect boundaries, workflow construction, and
-worker registration without the larger chat application's product code.
-
-## Files
-
-| File | Purpose |
+| File | What it shows |
 | --- | --- |
-| `workflow.py` | Temporal workflow and request/result dataclasses. |
-| `tool_types.py` | App-owned tool category vocabulary for this example. |
-| `guards.py` | Demo write-file approval guard. |
-| `tools.py` | Two harness tools plus their file-system activities. |
-| `worker.py` | Worker entrypoint that registers the workflow, provider activity, and generic tool/guard routers. |
-| `start_workflow.py` | Small CLI client for starting the workflow. |
-| `env.py` | Tiny `.env` loader used only by this example. |
+| `tools.py` | `read_file` and `write_file` as activity tools (`@agent.activity_tool_defn`), confined to the workspace. A path outside it is refused. |
+| `workflow.py` | The agent: `@agent.defn`, one `@agent.accepts` handler, an `AgentWorkflowRunner`, and a Pydantic AI `TemporalAgent` whose tools run through the harness. |
+| `worker.py` | The worker. `AgentHarnessPlugin(tools=...)` registers the tool activities, and `AgentPlugin` registers the model activities. |
+| `start_workflow.py` | Starts an agent, sends one prompt with `AgentClient.send_message`, prints the tools it ran and its reply, then closes it. |
 
-## Run It
+**Approvals.** The approval policy is
+`ToolApprovalPolicy.allow_tools(["write_file"], also_inherently_safe=True)`.
+`read_file` is marked `inherently_safe`, and `write_file` is allow-listed by name,
+so no call waits for a person. To make writes wait for a human, drop
+`"write_file"` from that list. Each write then waits until something calls
+`AgentClient.approve_tool(...)`.
 
-Start Temporal locally:
+## Run it
 
-```bash
-temporal server start-dev --ip 0.0.0.0
-```
-
-Set an Anthropic key, or put it in `.env`:
+You need a Temporal server and an `ANTHROPIC_API_KEY` in the environment.
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-...
-TEMPORAL_ENDPOINT=localhost:7233
-TEMPORAL_NAMESPACE=default
-TEMPORAL_TLS=0
-```
-
-Start the worker:
-
-```bash
+# Terminal 1: the worker
 uv run python -m basic_file_agent
-```
 
-In another terminal, start a workflow:
-
-```bash
+# Terminal 2: one prompt
 uv run python -m basic_file_agent.start_workflow \
-  "Create notes/hello.md with a short note explaining Temporal workflows."
+  "Create notes/hello.md with one sentence about Temporal, then read it back."
 ```
 
-By default, files are read from and written to `./basic_file_agent_workspace`.
-Override that with `BASIC_FILE_AGENT_WORKSPACE`.
+| Variable | Default |
+| --- | --- |
+| `TEMPORAL_ADDRESS` | `127.0.0.1:7244`, this repo's local stack. Use `localhost:7233` for `temporal server start-dev`. |
+| `TEMPORAL_NAMESPACE` | `default` |
+| `BASIC_FILE_AGENT_WORKSPACE` | `./basic_file_agent_workspace` |
+| `BASIC_FILE_AGENT_MODEL` | `anthropic:claude-haiku-5-5` at low effort. Any Pydantic AI model string works, with that provider's key. |
 
-## What It Intentionally Leaves Out
-
-This example defines custom `READ_FILE` and `WRITE_FILE` tool categories in
-`tool_types.py`. Its workflow uses
-`GuardPolicy.require_pre(BasicFileToolType.WRITE_FILE)`, and `write_file`
-attaches `approve_file_write`. The workflow registers both tools with
-`ToolSet(..., tools=[read_file, write_file])`.
-
-The demo guard always approves so the example stays runnable without a UI or
-human approval workflow. Production-style guards should check the path, content,
-user, workspace policy, approval state, or whatever the mutation requires.
-
-This example also disables continue-as-new handling. A long-running or
-multi-turn workflow should carry `AgentResult.continuation_state` into a new run
-when the agent asks for it.
+The task queue is `basic-file-agent`.
