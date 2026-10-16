@@ -117,8 +117,19 @@
 .dc-judge.deciding { border-left-color: var(--slate-500); background: transparent; }
 .dc-judge.deciding .badge { color: var(--slate-300); }
 
-/* Phone: 44 px tap targets, actions wrap under the label */
+/* The phone's "Review the N calls" toggle (hidden elsewhere: the component renders it only
+   on a phone). */
+.dc-card .dc-review { display: flex; gap: .5rem; align-items: center; font-family: var(--mono); font-size: .8rem; color: var(--indigo-100); text-align: left; }
+
+/* Phone: denser, capped at 45vh, 44 px tap targets, actions wrap under the label */
 @media (max-width: 600px) {
+  .dc-card { padding: .45rem .55rem; gap: .35rem; max-height: 45vh; }
+  .dc-card.stacked > .top { flex-wrap: nowrap; gap: .5rem; }
+  .dc-card.stacked > .top .badge { display: none; }
+  .dc-card.stacked > .top .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1; }
+  .dc-card.stacked > .top .spacer { display: none; }
+  .dc-card .all { min-width: 0; flex: none; }
+  .dc-card .dc-review { min-height: 44px; }
   .dc-card .btn, .dc-card .chev, .dc-card .linkish { min-height: 44px; }
   .dc-card .item { height: auto; min-height: 52px; }
   .dc-card .item .ok, .dc-card .item .no { min-width: 44px; height: 44px; }

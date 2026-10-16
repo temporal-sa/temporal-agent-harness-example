@@ -3,8 +3,8 @@
 
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FocusEvent, type ReactNode } from "react";
 
-import type { CodingSession, DecisionDockProps, SendRecord } from "../session";
-import { SendStateTrail } from "../recovery/SendStateTrail";
+import { errorCopy, type CodingSession, type DecisionDockProps, type SendRecord } from "../session";
+import { FailedNote, SendStateTrail } from "../recovery/SendStateTrail";
 import { currentBranch, DETACHED } from "../workbench/changes";
 import { DiffView } from "../workbench/DiffView";
 import { agentLabel, anythingRunning, toolsOf } from "../workbench/tree";
@@ -89,6 +89,10 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
   const stack = buildStack(items, answers);
   const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
   const [declining, setDeclining] = useState<DeclineTarget | null>(null);
+  // On a phone the stacked card starts as one line (heading and Approve all) plus a "Review"
+  // toggle, so the transcript keeps its room.
+  const phone = usePhone();
+  const [phoneOpen, setPhoneOpen] = useState(false);
   const toggle = (key: string) =>
     setOpen((s) => {
       const n = new Set(s);
@@ -251,8 +255,9 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
 
   // Several calls: one stacked card. The header stays put; the groups scroll inside a cap.
   const w = stack.waitingIds.length;
+  const compact = phone && !phoneOpen;
   return (
-    <section className="dc-card stacked" aria-label={stackHeading(w)} {...cardProps}>
+    <section className={`dc-card stacked${compact ? " compact" : ""}`} aria-label={stackHeading(w)} {...cardProps}>
       <div className="top" data-row="all">
         <span className="badge edit">{w} need approval</span>
         <span className="t" aria-live="polite" tabIndex={-1} data-heading="">
@@ -263,29 +268,51 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
           Approve all {w}
         </button>
       </div>
-      <div className="dc-body">
-        <ul className="stack">
-          {stack.groups.map((g) => (
-            <GroupRows
-              key={g.toolName}
-              group={g}
-              open={open}
-              toggle={toggle}
-              answers={answers}
-              fresh={(id) => !initial.current!.has(id)}
-              agentKey={agentKey}
-              onApprove={approve}
-              onDecline={(target) => setDeclining(target)}
-              declining={declining}
-              declineForm={declineForm}
-            />
-          ))}
-        </ul>
-      </div>
-      {pausedLine}
-      {footer}
+      {phone && (
+        <button type="button" className="dc-review" aria-expanded={phoneOpen} onClick={() => setPhoneOpen((o) => !o)}>
+          <span aria-hidden="true">{phoneOpen ? "▾" : "▸"}</span> {phoneOpen ? "Hide the calls" : `Review ${w === 1 ? "the call" : `the ${stack.total} calls`}`}
+        </button>
+      )}
+      {!compact && (
+        <div className="dc-body">
+          <ul className="stack">
+            {stack.groups.map((g) => (
+              <GroupRows
+                key={g.toolName}
+                group={g}
+                open={open}
+                toggle={toggle}
+                answers={answers}
+                fresh={(id) => !initial.current!.has(id)}
+                agentKey={agentKey}
+                onApprove={approve}
+                onDecline={(target) => setDeclining(target)}
+                declining={declining}
+                declineForm={declineForm}
+              />
+            ))}
+          </ul>
+        </div>
+      )}
+      {!compact && pausedLine}
+      {(!compact || card.held.length > 0 || latest) && footer}
     </section>
   );
+}
+
+/** Phone width (the shell's sheet breakpoint). */
+function usePhone(): boolean {
+  const query = "(max-width: 600px)";
+  const get = () => typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia(query).matches;
+  const [phone, setPhone] = useState(get);
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const m = window.matchMedia(query);
+    const on = () => setPhone(m.matches);
+    m.addEventListener?.("change", on);
+    return () => m.removeEventListener?.("change", on);
+  }, []);
+  return phone;
 }
 
 /**
@@ -385,11 +412,9 @@ function ReviewBody({ item }: { item: Pick<ApprovalItem, "toolName" | "input"> }
 
 function SendError({ answer }: { answer: Answer | undefined }) {
   if (!answer || answer.phase !== "failed") return null;
-  return (
-    <p className="err" role="alert">
-      Your answer didn't reach Temporal{answer.error ? `: ${answer.error}` : ""}. Try again.
-    </p>
-  );
+  const r = answer.record;
+  const copy = errorCopy({ code: r.errorCode ?? null, status: r.errorStatus ?? null, message: r.error }, "Check your connection and try again.");
+  return <FailedNote className="err" copy={{ text: `Your answer didn't reach Temporal. ${copy.text}`, detail: copy.detail }} />;
 }
 
 export const DECLINE_PLACEHOLDER = "Reason (optional). The agent sees this.";
@@ -524,6 +549,7 @@ function FoldBody(p: GroupRowsProps & { fold: Fold }) {
     return (
       <div className="review">
         <ReviewBody item={f.items[0]!} />
+        <SendError answer={p.answers.get(f.items[0]!.toolId)} />
       </div>
     );
   }

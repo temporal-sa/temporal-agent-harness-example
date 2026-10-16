@@ -23,7 +23,7 @@ function waiting(parts: ToolPart[], agentId = "root"): PendingApproval[] {
 }
 
 function sent(toolId: string, approved = true): SendRecord {
-  return { id: `s-${toolId}`, kind: "approval", messageId: null, toolId, approved, remember: false, phase: "in_temporal", at: { sending: 1, in_temporal: 2 }, error: null };
+  return { id: `s-${toolId}`, kind: "approval", messageId: null, toolId, approved, remember: false, phase: "in_temporal", at: { sending: 1, in_temporal: 2 }, error: null, errorCode: null, errorStatus: null };
 }
 
 function session(pending: PendingApproval[], sends: SendRecord[] = [], calls: { approve: string[][] } = { approve: [] }): CodingSession {
@@ -171,3 +171,63 @@ describe("copy and names", () => {
   });
 });
 
+
+describe("review follow-ups", () => {
+  let host: HTMLDivElement;
+  let root: Root;
+  const realMatchMedia = window.matchMedia;
+  beforeEach(() => {
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    root = createRoot(host);
+  });
+  afterEach(() => {
+    act(() => root.unmount());
+    host.remove();
+    window.matchMedia = realMatchMedia;
+  });
+  const render = (s: CodingSession) => act(() => root.render(<DecisionDock session={s} />));
+  const phoneWidth = (on: boolean) => {
+    window.matchMedia = ((q: string) => ({ matches: on && q.includes("max-width: 600px"), media: q, addEventListener() {}, removeEventListener() {} })) as unknown as typeof window.matchMedia;
+  };
+
+  it("a failed answer reads in plain words, with the raw text behind Details", () => {
+    const failed: SendRecord = { ...sent("e1"), phase: "failed", error: "upstream connect error 503", errorCode: null, errorStatus: 503 };
+    render(session(waiting([E1, C1]), [failed]));
+    act(() => host.querySelector<HTMLButtonElement>('[data-row="g:edit_file"] [data-group-toggle]')!.click());
+    const alert = host.querySelector('[role="alert"]')!;
+    expect(alert.textContent).toContain("Your answer didn't reach Temporal. The app's API isn't answering.");
+    expect(alert.querySelector("details summary")!.textContent).toBe("Details");
+    expect(alert.querySelector("details pre")!.textContent).toBe("upstream connect error 503");
+    // The trail in the footer shows the same plain copy, never the raw text as the headline.
+    const foot = host.querySelector(".dc-foot")!;
+    expect(foot.querySelector('[role="alert"] > span')!.textContent).toBe(
+      "Not sent. The app's API isn't answering. Your session is safe in Temporal; try again shortly.",
+    );
+  });
+
+  it("phone: a five-call card starts as the heading, Approve all and a Review toggle", () => {
+    phoneWidth(true);
+    render(session(waiting([E1, E2, C1, C2, C3])));
+    const card = host.querySelector("section.dc-card")!;
+    expect(card.classList.contains("compact")).toBe(true);
+    expect(card.querySelector(".stack")).toBeNull();
+    expect(card.querySelector(".paused")).toBeNull();
+    expect(card.querySelector(".dc-foot")).toBeNull();
+    const review = [...card.querySelectorAll("button")].find((b) => b.textContent?.includes("Review the 5 calls"))!;
+    expect(review.getAttribute("aria-expanded")).toBe("false");
+    expect([...card.querySelectorAll("button")].some((b) => b.textContent === "Approve all 5")).toBe(true);
+    act(() => review.click());
+    expect(card.querySelector(".stack")).not.toBeNull();
+    expect(review.getAttribute("aria-expanded")).toBe("true");
+    // Groups are still collapsed until opened.
+    expect(card.querySelectorAll('[data-group-toggle][aria-expanded="true"]')).toHaveLength(0);
+  });
+
+  it("desktop: no Review toggle, the groups show at once", () => {
+    phoneWidth(false);
+    render(session(waiting([E1, E2, C1, C2, C3])));
+    expect(host.querySelector(".dc-review")).toBeNull();
+    expect(host.querySelector(".stack")).not.toBeNull();
+  });
+});

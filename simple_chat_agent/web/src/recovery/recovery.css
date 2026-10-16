@@ -45,3 +45,8 @@
 .sendstate .now .chip { color: var(--space-black); background: var(--yellow); border-color: var(--yellow); font-weight: 600; }
 .sendstate.failed { color: var(--red); }
 @media (prefers-reduced-motion: no-preference) { .sendstate .chip { transition: background-color .15s, color .15s; } }
+.sendstate.failed { display: grid; gap: .2rem; }
+.err-detail summary { cursor: pointer; color: var(--slate-300); font-size: .75rem; }
+.err-detail summary:focus-visible { outline: none; box-shadow: var(--focus); }
+.err-detail pre { margin: .2rem 0 0; font-size: .75rem; color: var(--slate-300); white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 600px) { .err-detail summary { min-height: 44px; display: flex; align-items: center; } }

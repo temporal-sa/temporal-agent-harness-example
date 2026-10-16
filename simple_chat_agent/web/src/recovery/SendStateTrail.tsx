@@ -4,7 +4,7 @@
 import { useEffect, useState } from "react";
 
 import type { SendStateTrailProps as SlotProps } from "../session";
-import { failedText, trailSteps, WAITING_FOR_WORKER_MS } from "./sendTrail";
+import { failedCopy, trailSteps, WAITING_FOR_WORKER_MS } from "./sendTrail";
 import "./recovery.css";
 
 export interface SendStateTrailProps extends SlotProps {
@@ -23,14 +23,8 @@ export function SendStateTrail({ record, workerAnswering }: SendStateTrailProps)
     return () => window.clearTimeout(t);
   }, [waiting, record.at.in_temporal]);
 
-  const failed = failedText(record);
-  if (failed) {
-    return (
-      <p className="sendstate failed" role="alert">
-        {failed}
-      </p>
-    );
-  }
+  const failed = failedCopy(record);
+  if (failed) return <FailedNote copy={failed} />;
   const steps = trailSteps(record, { now, ...(workerAnswering === undefined ? {} : { workerAnswering }) });
   return (
     <ol className="sendstate" aria-label="Delivery">
@@ -49,5 +43,20 @@ export function SendStateTrail({ record, workerAnswering }: SendStateTrailProps)
         </li>
       ))}
     </ol>
+  );
+}
+
+/** A failure in plain words, with the raw server or agent text behind "Details". */
+export function FailedNote({ copy, className = "sendstate failed" }: { copy: { text: string; detail: string | null }; className?: string }) {
+  return (
+    <div className={className} role="alert">
+      <span>{copy.text}</span>
+      {copy.detail && (
+        <details className="err-detail">
+          <summary>Details</summary>
+          <pre>{copy.detail}</pre>
+        </details>
+      )}
+    </div>
   );
 }

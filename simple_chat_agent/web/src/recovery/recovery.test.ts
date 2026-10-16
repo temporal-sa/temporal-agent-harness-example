@@ -4,7 +4,7 @@ import type { Recovery, SendRecord, TurnRecovery } from "../session";
 import { CHECKING, COMPARISON, dividerView } from "./divider";
 import { temporalUiUrl } from "./banner";
 import { hms } from "./format";
-import { trailSteps } from "./sendTrail";
+import { failedCopy, trailSteps } from "./sendTrail";
 
 const LOST = Date.UTC(2026, 9, 16, 14, 2, 11);
 
@@ -105,6 +105,8 @@ describe("send-state trail", () => {
     phase,
     at: { sending: 1000, in_temporal: 1100 },
     error: null,
+    errorCode: null,
+    errorStatus: null,
     ...over,
   });
 
@@ -138,5 +140,23 @@ describe("Temporal UI link", () => {
   it("falls back to the Workflow page without a run id, and to nothing without a template", () => {
     expect(temporalUiUrl(T, "w", null)).toBe("https://ui.example/namespaces/demo/workflows/w");
     expect(temporalUiUrl(null, "w", "r")).toBeNull();
+  });
+});
+
+describe("failed sends (facade errorCopy)", () => {
+  const failed = (over: Partial<SendRecord>): SendRecord => ({
+    id: "1", kind: "approval", messageId: null, toolId: "t", approved: true, remember: false, phase: "failed", at: {}, error: null, errorCode: null, errorStatus: null, ...over,
+  });
+
+  it("words the failure from its code or status and keeps the raw text as detail", () => {
+    expect(failedCopy(failed({ errorCode: "already_resolved", error: "tool t already resolved" }))).toEqual({
+      text: "Not sent. That call was already answered.",
+      detail: "tool t already resolved",
+    });
+    expect(failedCopy(failed({ errorStatus: 503, error: "503 Service Unavailable" }))!.text).toBe(
+      "Not sent. The app's API isn't answering. Your session is safe in Temporal; try again shortly.",
+    );
+    expect(failedCopy(failed({}))).toEqual({ text: "Not sent. Check your connection and try again.", detail: null });
+    expect(failedCopy(failed({ phase: "accepted" }))).toBeNull();
   });
 });

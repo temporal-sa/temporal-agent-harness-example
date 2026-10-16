@@ -1,6 +1,6 @@
 // Send-state chips (PRD U4): Sending → In Temporal → Accepted → Running. Pure.
 
-import type { SendPhase, SendRecord } from "../session";
+import { errorCopy, type ErrorCopy, type SendPhase, type SendRecord } from "../session";
 
 export type StepState = "done" | "now" | "todo";
 
@@ -41,7 +41,10 @@ export function trailSteps(
   });
 }
 
-export function failedText(record: Pick<SendRecord, "phase" | "error">): string | null {
+/** Copy for a failed send: plain words from the facade's `errorCopy`, the raw server or
+ *  agent text kept apart as `detail` (for a "Details" disclosure). */
+export function failedCopy(record: Pick<SendRecord, "phase" | "error" | "errorCode" | "errorStatus">): ErrorCopy | null {
   if (record.phase !== "failed") return null;
-  return record.error ? `Not sent: ${record.error}` : "Not sent. Try again.";
+  const copy = errorCopy({ code: record.errorCode ?? null, status: record.errorStatus ?? null, message: record.error }, "Check your connection and try again.");
+  return { text: `Not sent. ${copy.text}`, detail: copy.detail };
 }

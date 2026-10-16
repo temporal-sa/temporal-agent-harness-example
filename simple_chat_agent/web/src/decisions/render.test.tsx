@@ -186,6 +186,14 @@ describe("approval card styles (UX review)", async () => {
     expect(sizes.filter((v) => parseFloat(v) < 0.75)).toEqual([]);
   });
 
+  it("phone: denser and capped at 45vh, with 44 px targets", () => {
+    const phone = css.slice(css.indexOf("@media (max-width: 600px)"));
+    expect(phone).toMatch(/\.dc-card \{[^}]*max-height: 45vh/);
+    expect(phone).toMatch(/\.dc-card\.stacked > \.top \{[^}]*flex-wrap: nowrap/);
+    expect(phone).toMatch(/\.dc-card \.dc-review \{[^}]*min-height: 44px/);
+    expect(phone).toMatch(/\.dc-card \.btn, \.dc-card \.chev, \.dc-card \.linkish \{[^}]*min-height: 44px/);
+  });
+
   it("M1: answered and waiting rows share a fixed height, and the footer is fixed", () => {
     expect(css).toMatch(/\.dc-card \.item \{[^}]*height: 2\.6rem/);
     expect(css).toMatch(/\.dc-card \.dc-foot \{[^}]*height: 1\.7rem/);

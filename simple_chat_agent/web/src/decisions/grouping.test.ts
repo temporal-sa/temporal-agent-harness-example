@@ -42,7 +42,7 @@ const edit = (id: string, path: string) => itemOf(pending(id, "edit_file", { pat
 const pytest = (id: string, agent = "root") => itemOf(pending(id, "run_command", { command: "pytest -q" }, agent));
 
 function sent(toolId: string, approved: boolean, phase: SendRecord["phase"] = "sending"): SendRecord {
-  return { id: `s-${toolId}`, kind: "approval", messageId: null, toolId, approved, remember: false, phase, at: { sending: 1 }, error: null };
+  return { id: `s-${toolId}`, kind: "approval", messageId: null, toolId, approved, remember: false, phase, at: { sending: 1 }, error: null, errorCode: null, errorStatus: null };
 }
 
 /** The decision-B scenario: 3 edits and 2 identical commands (validation step 3e). */
@@ -124,7 +124,7 @@ describe("partial answers", () => {
   });
 
   it("a failed answer puts the call back in the counts", () => {
-    const answers = answersFrom([{ ...sent("e1", true), phase: "failed", error: "503" }]);
+    const answers = answersFrom([{ ...sent("e1", true), phase: "failed", error: "503", errorCode: null, errorStatus: 503 }]);
     expect(isAnswered(answers.get("e1"))).toBe(false);
     expect(buildStack(FIVE, answers).waitingIds).toContain("e1");
   });
