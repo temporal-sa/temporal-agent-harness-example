@@ -714,14 +714,24 @@ class DirectorySyncTests(AgentRoutesTestBase):
         return [(s["start_signal"], s["start_signal_args"][0]) for s in self.temporal.starts if s["id"] == manager]
 
     def test_model_and_posture_changes_update_the_list(self) -> None:
+        """Review #7: the list follows what the agent APPLIED (its SettingsAck, delivered by
+        the bridge through session_settings_updater), never the request alone."""
         from simple_chat_agent.agent.sessions import SessionUpdate
 
         sid = self.create()["workflow_id"]
         self.assertEqual(self.manager_signals()[0][1].posture, "trust_safe")
-        r = self.send(sid, "set_model", {"model": {"provider": "openai", "model": "gpt-5.5", "effort": "high"}})
+        before = self.listed(sid)
+        new_model = {"provider": "openai", "model": "gpt-5.5", "effort": "high"}
+        r = self.send(sid, "set_model", {"model": new_model})
         self.assertEqual(r.status_code, 200, r.text)
         r = self.send(sid, "set_posture", {"posture": "auto"})
         self.assertEqual(r.status_code, 200, r.text)
+        # Landed in Temporal, not yet applied (workers may be down): the list is unchanged.
+        self.assertEqual(self.listed(sid), before)
+        self.assertNotIn("update_session_signal", [n for n, _ in self.manager_signals()])
+        update = agent_routes.session_settings_updater(self.directory, self.store)
+        self.run_async(update(sid, {"ok": True, "setting": "model", "model": new_model}))
+        self.run_async(update(sid, {"ok": True, "setting": "posture", "posture": "auto"}))
         entry = self.listed(sid)
         self.assertEqual(entry["model"], {"provider": "openai", "model": "gpt-5.5", "effort": "high"})
         self.assertEqual(entry["posture"], "auto")
@@ -736,6 +746,20 @@ class DirectorySyncTests(AgentRoutesTestBase):
                 SessionUpdate(session_id=sid, model=None, posture="auto"),
             ],
         )
+
+    def test_a_change_the_worker_refused_puts_the_old_value_back(self) -> None:
+        sid = self.create()["workflow_id"]
+        before = self.listed(sid)
+        update = agent_routes.session_settings_updater(self.directory, self.store)
+        # A refusal carries the model the agent still holds.
+        self.run_async(update(sid, {"ok": False, "setting": "model", "model": before["model"]}))
+        self.assertEqual(self.listed(sid)["model"], before["model"])
+        self.run_async(update(sid, {"ok": False, "setting": "posture", "posture": before["posture"]}))
+        self.assertEqual(self.listed(sid)["posture"], before["posture"])
+        # Not a settings result: ignored.
+        self.run_async(update(sid, {"ok": True, "detail": "x"}))
+        after = self.listed(sid)
+        self.assertEqual((after["model"], after["posture"]), (before["model"], before["posture"]))
 
     def test_refused_or_malformed_changes_leave_the_list_alone(self) -> None:
         sid = self.create()["workflow_id"]
@@ -2006,6 +2030,7 @@ class ProductViewMountTests(unittest.TestCase):
         for path in ("/app/..%2fsecret.txt", "/app/%2e%2e/secret.txt", "/app/assets/..%2f..%2fsecret.txt"):
             r = self.client.get(path, headers=self.CATALOG)
             self.assertNotIn("outside dist", r.text, path)
+
 
 
 class SecurityReviewTests(AgentRoutesTestBase):

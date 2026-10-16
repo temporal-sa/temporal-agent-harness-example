@@ -758,8 +758,8 @@ class RejectionAndRootIdTests(_RedisCase):
 
 class SubagentMarkerTests(_RedisCase):
     """A replay that mounts a subagent whose workflow has completed gets a synthetic
-    ``subagent_stream_unavailable`` from the harness merge. Not news when that subagent's turn is
-    already stored in full; real news when its turn was cut short."""
+    ``subagent_stream_unavailable`` from the harness merge. Not news when every turn that
+    subagent was opened for is already stored in full; real news otherwise."""
 
     @staticmethod
     def marker() -> AgentEvent:
@@ -768,6 +768,29 @@ class SubagentMarkerTests(_RedisCase):
         return AgentEvent(agent_id=CHILD, turn_id="", turn_number=0, message_id=None, timestamp=0.0,
                           event=SubagentStreamUnavailable(subagent_id=CHILD, workflow_id="child-wf-1", reason="gone"))
 
+    @staticmethod
+    def sent(turn: int, ts: float) -> AgentEvent:
+        from temporal_agent_harness.harness.agent_protocol.events import SubagentMessageSent
+
+        return item(SubagentMessageSent(subagent_id=CHILD, agent_key="helper", workflow_id="child-wf-1",
+                                        handler="investigate", subagent_turn=turn, from_offset=0), ts=ts)
+
+    def script(self, child_turns: int, *, end_of: set[int]) -> list:
+        """Root turn: subagent started, then per child turn: sent (root), the child's
+        turn_started / delta / turn_end (turn_end only for turns in ``end_of``)."""
+        base = turn_script(False)[:-1]  # root offsets 1..6, no root turn_end
+        entries = base + [(item(SubagentStarted(subagent_id=CHILD, agent_key="helper", workflow_id="child-wf-1"),
+                                ts=1006.0), 7)]
+        ro = 7
+        for t in range(1, child_turns + 1):
+            ro += 1
+            entries.append((self.sent(t, 1006.0 + t), ro))
+            entries.append((item(TurnStarted(), agent=CHILD, turn=f"c{t}", n=t, msg=None, ts=1100.0 + t), ro))
+            entries.append((item(ReplyDelta(text=f"turn {t}"), agent=CHILD, turn=f"c{t}", n=t, ts=1110.0 + t), ro))
+            if t in end_of:
+                entries.append((item(TurnEnded(), agent=CHILD, turn=f"c{t}", n=t, msg=None, ts=1120.0 + t), ro))
+        return entries
+
     async def forward(self, entries: list) -> None:
         await self.r.delete(self.store._k("s", "lease"))
         b = self.bridge()
@@ -775,22 +798,75 @@ class SubagentMarkerTests(_RedisCase):
         with mock.patch.object(agent_bridge, "AgentClient", Script(entries).client):
             await _Forwarder(b, "s")._forward_once()
 
+    async def markers(self) -> list:
+        return [f for f in await self.store.read_from("s", 0) if f.event == "subagent_stream_unavailable"]
+
     async def test_takeover_replay_marker_for_a_stored_subagent_turn_is_dropped(self) -> None:
-        entries = turn_script()
-        await self.forward(entries[:-1])  # A stored the child's whole turn; the root turn is open
+        stored = self.script(1, end_of={1})
+        await self.forward(stored)  # A stored the child's whole (only) turn; the root turn is open
         # B replays the turn; the child's workflow has completed, so the merge can't mount it.
-        replay = entries[:7] + [(self.marker(), 7), entries[-1]]
+        replay = [e for e in stored if e[0].agent_id == ROOT] + [(self.marker(), 8)]
         await self.forward(replay)
-        frames = await self.store.read_from("s", 0)
-        self.assertEqual([f for f in frames if f.event == "subagent_stream_unavailable"], [])
-        self.assertFalse((await self.store.meta("s")).turn_active)
+        self.assertEqual(await self.markers(), [])
+
+    async def test_review_2_marker_for_an_unstored_later_turn_is_kept(self) -> None:
+        """Turn 1 stored in full; the old holder died before storing anything of turn 2."""
+        full = self.script(2, end_of={1, 2})
+        stored = [e for e in full if not (e[0].agent_id == CHILD and e[0].turn_number == 2) and e[1] <= 8]
+        await self.forward(stored)
+        replay = [e for e in full if e[0].agent_id == ROOT] + [(self.marker(), 9)]
+        await self.forward(replay)
+        self.assertEqual(len(await self.markers()), 1)
 
     async def test_marker_for_a_cut_short_subagent_turn_is_kept(self) -> None:
-        entries = turn_script()
-        cut = entries[:9] + [(self.marker(), 7), entries[-1]]  # child turn_started, a delta, no turn_end
+        cut = self.script(1, end_of=set()) + [(self.marker(), 8)]
         await self.forward(cut)
-        frames = await self.store.read_from("s", 0)
-        self.assertEqual(len([f for f in frames if f.event == "subagent_stream_unavailable"]), 1)
+        self.assertEqual(len(await self.markers()), 1)
+
+
+class SettingsResultTests(_RedisCase):
+    """Review #7: the session list follows the agent's set_model / set_posture RESULT."""
+
+    async def test_settings_results_reach_on_settings_and_others_do_not(self) -> None:
+        from temporal_agent_harness.harness.agent_protocol.events import MessageHandlerEnd
+
+        applied = {"ok": True, "detail": "Approvals: auto.", "setting": "posture", "model": None, "posture": "auto"}
+        refused = {"ok": False, "detail": "no key", "setting": "model",
+                   "model": {"provider": "anthropic", "model": "claude-sonnet-5-5", "effort": None}, "posture": None}
+        entries = turn_script(False)[:-1] + [
+            (item(MessageHandlerEnd(output=applied), msg="p1"), 7),
+            (item(MessageHandlerEnd(output=refused), msg="p2"), 8),
+            (item(MessageHandlerEnd(output={"text": "chat reply"}), msg="m1"), 9),
+            (item(TurnEnded(), msg=None, ts=2000.0), 10),
+        ]
+        calls: list[tuple[str, dict]] = []
+
+        async def on_settings(session: str, ack: dict) -> None:
+            calls.append((session, ack))
+
+        b = Bridge(self.temporal, self.store, on_settings=on_settings)  # type: ignore[arg-type]
+        self.bridges.append(b)
+        self.assertTrue(await self.store.acquire_lease("s", b.holder))
+        with mock.patch.object(agent_bridge, "AgentClient", Script(entries).client):
+            await _Forwarder(b, "s")._forward_once()
+        self.assertEqual(calls, [("s", applied), ("s", refused)])
+
+    async def test_a_failing_update_never_stops_the_transcript(self) -> None:
+        from temporal_agent_harness.harness.agent_protocol.events import MessageHandlerEnd
+
+        async def boom(session: str, ack: dict) -> None:
+            raise RuntimeError("redis blip")
+
+        entries = turn_script(False)[:-1] + [
+            (item(MessageHandlerEnd(output={"ok": True, "setting": "posture", "posture": "auto"})), 7),
+            (item(TurnEnded(), msg=None, ts=2000.0), 8),
+        ]
+        b = Bridge(self.temporal, self.store, on_settings=boom)  # type: ignore[arg-type]
+        self.bridges.append(b)
+        await self.store.acquire_lease("s", b.holder)
+        with mock.patch.object(agent_bridge, "AgentClient", Script(entries).client):
+            await _Forwarder(b, "s")._forward_once()
+        self.assertFalse((await self.store.meta("s")).turn_active)
 
 
 class RunIdTests(_RedisCase):

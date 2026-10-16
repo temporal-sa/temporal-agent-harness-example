@@ -645,7 +645,7 @@ class EvaluatorWiring(unittest.TestCase):
                 self.assertIsNone(plugin)
 
     def test_activities_exported(self) -> None:
-        self.assertEqual([a.__name__ for a in APPROVAL_ACTIVITIES], ["judge_tool_call"])
+        self.assertEqual([a.__name__ for a in APPROVAL_ACTIVITIES], ["judge_tool_call", "judge_status"])
         self.assertEqual(approvals.JUDGE_SCHEDULE_TO_CLOSE, timedelta(seconds=20))
         self.assertEqual(approvals.JUDGE_RETRY.maximum_attempts, 2)
 

@@ -22,7 +22,7 @@ from temporal_agent_harness.plugin import AgentHarnessPlugin
 
 from simple_chat_agent.agent.harness_ext import payload_storage
 from simple_chat_agent.api.agent_bridge import Bridge
-from simple_chat_agent.api.agent_routes import create_agent_router
+from simple_chat_agent.api.agent_routes import SessionDirectory, create_agent_router, session_settings_updater
 from simple_chat_agent.api.agent_store import AgentStore
 
 
@@ -51,10 +51,14 @@ def build_app(*, task_queue: str, temporal_address: str) -> FastAPI:
         return state["client"]  # type: ignore[return-value]
 
     store = AgentStore.from_env()
+    # The routes' default list (Redis only); the bridge updates it from set_model/set_posture.
+    directory = SessionDirectory(store.r, temporal=None, task_queue=task_queue, sync_workflow=False)
 
     async def bridge() -> Bridge:
         if "bridge" not in state:
-            state["bridge"] = Bridge(await temporal(), store)
+            state["bridge"] = Bridge(
+                await temporal(), store, on_settings=session_settings_updater(directory, store)
+            )
         return state["bridge"]  # type: ignore[return-value]
 
     @asynccontextmanager
@@ -71,6 +75,7 @@ def build_app(*, task_queue: str, temporal_address: str) -> FastAPI:
             bridge=bridge,
             current_user=header_user,
             task_queue=task_queue,
+            directory=directory,
         ),
         prefix="/api/agent",
     )

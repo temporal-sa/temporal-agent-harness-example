@@ -88,6 +88,7 @@ from simple_chat_agent.agent.contracts import (
     Posture,
     SetModel,
     SetPosture,
+    SettingsAck,
     SteerMessage,
 )
 # Key-free: the executor log reader is a plain HTTP helper (no tools runtime, no LLM keys).
@@ -567,7 +568,7 @@ _CODING_AGENT_HANDLERS: tuple[tuple[str, type[BaseModel], type[BaseModel], str, 
     (
         "set_model",
         SetModel,
-        Ack,
+        SettingsAck,
         "Switch the provider and/or model. Takes effect from the next turn.",
         MidTurn.ACCEPT,
         False,
@@ -575,7 +576,7 @@ _CODING_AGENT_HANDLERS: tuple[tuple[str, type[BaseModel], type[BaseModel], str, 
     (
         "set_posture",
         SetPosture,
-        Ack,
+        SettingsAck,
         "Change how tool calls are approved. Applies to new calls; pending ones stay with you.",
         MidTurn.ACCEPT,
         False,
@@ -1484,18 +1485,15 @@ def create_agent_router(
                 **message_payload,
                 "attachments": await checked_attachments(message_payload["attachments"], uid, body.session_id),
             }
-        # set_posture / set_model get the same checks as POST sessions, and once accepted
-        # they update the session list. A malformed payload is left to the workflow's own
-        # validation and doesn't touch the list.
+        # set_posture / set_model get the same checks as POST sessions. A malformed payload is
+        # left to the workflow's own validation.
         kind = body.message.get("type")
         payload = body.message.get("payload")
-        new_posture: str | None = None
         new_model: ModelChoice | None = None
         if kind == "set_posture" and isinstance(payload, dict) and isinstance(payload.get("posture"), str):
             refusal = posture_refusal(payload["posture"], agent_environment(), auto_mode_status(configured_judge_backend()))
             if refusal is not None:
                 raise HarnessError(422, "posture_not_allowed", refusal)
-            new_posture = payload["posture"]
         elif kind == "set_model" and isinstance(payload, dict):
             try:
                 new_model = ModelChoice.model_validate(payload.get("model"))
@@ -1519,11 +1517,9 @@ def create_agent_router(
                 raise not_found("The session has ended.") from None
             raise
         await store.note_sent(body.session_id, message_id)
-        if new_posture is not None or new_model is not None:
-            try:
-                await sessions.update_settings(uid, body.session_id, model=new_model, posture=new_posture)
-            except Exception as exc:  # noqa: BLE001 - the change is in Temporal; the list catches up next time
-                log.warning("session list not updated for %s: %s", body.session_id, exc)
+        # The session list changes when the agent applies the change, not here: the bridge
+        # copies each set_model / set_posture result into it (session_settings_updater), so a
+        # change the worker refuses never shows. Until then (workers down) it shows the old value.
         await _wake(await bridge(), body.session_id)
         meta = await store.meta(body.session_id)
         # The real turn number and disposition arrive on the stream with message_accepted;
@@ -1636,6 +1632,25 @@ def create_agent_router(
     return router
 
 
+def session_settings_updater(
+    directory: SessionDirectory, store: AgentStore
+) -> Callable[[str, dict[str, Any]], Awaitable[None]]:
+    """The bridge's ``on_settings``: copy a set_model / set_posture result (``SettingsAck``)
+    into the owner's session list. The ack carries the value the agent holds, so a refused
+    change puts the previous value back."""
+
+    async def update(session_id: str, ack: dict[str, Any]) -> None:
+        owner = await store.owner_of(session_id)
+        if owner is None:
+            return
+        if ack.get("setting") == "model" and ack.get("model"):
+            await directory.update_settings(owner, session_id, model=ModelChoice.model_validate(ack["model"]))
+        elif ack.get("setting") == "posture" and ack.get("posture"):
+            await directory.update_settings(owner, session_id, posture=str(ack["posture"]))
+
+    return update
+
+
 class AgentApi:
     """Everything the agent routes need in one app: a lazily connected Temporal client (with
     the agent plugins), the Redis store, the bridge and the session directory. ``aclose`` from
@@ -1670,7 +1685,9 @@ class AgentApi:
             client = await self.temporal()  # takes the lock itself; not re-entrant
             async with self._lock:
                 if self._bridge is None:
-                    self._bridge = Bridge(client, self.store)
+                    self._bridge = Bridge(
+                        client, self.store, on_settings=session_settings_updater(self.directory, self.store)
+                    )
         return self._bridge
 
     def router(self, *, app_store: Callable[[], Any] | None = None) -> APIRouter:

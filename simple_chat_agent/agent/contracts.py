@@ -168,6 +168,17 @@ class Ack(BaseModel):
     detail: str = ""
 
 
+class SettingsAck(Ack):
+    """Acknowledgement of ``set_model`` / ``set_posture`` with the value the agent now holds:
+    the new one when ``ok``, the unchanged one when it refused. The bridge copies it into the
+    session list, so the list never shows a setting the agent refused."""
+
+    setting: Literal["model", "posture"]
+    # set_model: the model for the next turn (the current one if the change was refused).
+    model: ModelChoice | None = None
+    posture: Posture | None = None
+
+
 class ForgetAlwaysAllowed(BaseModel):
     """Forget the "always allow" approvals given in this session (no fields)."""
 

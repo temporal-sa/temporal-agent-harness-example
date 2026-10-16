@@ -62,7 +62,7 @@ import os
 import time
 import uuid
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from temporalio.client import Client
@@ -126,9 +126,30 @@ def _digest(event: str, data: dict[str, Any]) -> str:
     return hashlib.sha256(f"{event}|{json.dumps(body, sort_keys=True)}".encode()).hexdigest()
 
 
-def _track_child_turn(child_open: dict[str, bool], event: str, data: dict[str, Any]) -> None:
-    if event in ("turn_started", "turn_end") and data.get("agent_id"):
-        child_open[data["agent_id"]] = event == "turn_started"
+class _SubagentTurns:
+    """Per subagent: the turns its parent opened (root ``subagent_message_sent.subagent_turn``)
+    and the turns whose own ``turn_end`` is stored. A replay that mounts a subagent whose
+    workflow has completed can't read it and gets ``subagent_stream_unavailable``; that marker
+    is news unless EVERY turn the subagent was opened for is already stored in full (a holder
+    can die after storing turn 1 and before storing anything of turn 2)."""
+
+    def __init__(self) -> None:
+        self.opened: dict[str, set[int]] = {}
+        self.ended: dict[str, set[int]] = {}
+
+    def note(self, event: str, data: dict[str, Any], *, is_root: bool) -> None:
+        if is_root and event == "subagent_message_sent" and data.get("subagent_id"):
+            if data.get("subagent_turn") is not None:
+                self.opened.setdefault(data["subagent_id"], set()).add(int(data["subagent_turn"]))
+        elif not is_root and event == "turn_end" and data.get("agent_id"):
+            self.ended.setdefault(data["agent_id"], set()).add(int(data.get("turn_number") or 0))
+
+    def stored_in_full(self, subagent_id: str | None) -> bool:
+        opened = self.opened.get(subagent_id or "")
+        return bool(opened) and opened <= self.ended.get(subagent_id or "", set())
+
+
+SettingsCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
 class _LeaseLostError(Exception):
@@ -151,8 +172,19 @@ async def _stop(task: asyncio.Task[Any] | None) -> None:
 
 
 class Bridge:
-    def __init__(self, temporal: Client, store: AgentStore, *, holder: str | None = None) -> None:
+    def __init__(
+        self,
+        temporal: Client,
+        store: AgentStore,
+        *,
+        holder: str | None = None,
+        on_settings: SettingsCallback | None = None,
+    ) -> None:
+        """``on_settings(session, ack)`` is called with each root ``set_model`` /
+        ``set_posture`` result (a ``SettingsAck`` as a dict), so the session list follows what
+        the agent applied, not what was asked."""
         self._temporal = temporal
+        self._on_settings = on_settings
         self._store = store
         self._holder = holder or f"api-{uuid.uuid4().hex[:8]}"
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -510,11 +542,9 @@ class _Forwarder:
         # repeat, e.g. two equal deltas published in one workflow task).
         seen_roots: set[int] = set()
         seen = Counter()
-        # Subagent agent id -> whether its latest turn is open, from the frames stored and
-        # forwarded. A replay that mounts a subagent whose workflow has since completed can't
-        # read it (``subagent_stream_unavailable``); if its turn is already stored in full, the
-        # marker is not news and isn't stored.
-        child_open: dict[str, bool] = {}
+        # Which subagent turns are stored in full (see _SubagentTurns), from the frames stored
+        # and forwarded.
+        sub_turns = _SubagentTurns()
         self.tel.root_agent_id = self.tel.root_agent_id or meta.root_agent_id
         for f in await self.store.read_from(self.session, from_offset):
             if f.event.startswith("x_"):
@@ -522,9 +552,10 @@ class _Forwarder:
             if "event_offset" in f.data:
                 seen_roots.add(int(f.data["event_offset"]))
                 self.tel.root_agent_id = self.tel.root_agent_id or f.data.get("agent_id")
+                sub_turns.note(f.event, f.data, is_root=True)
             else:
                 seen[_digest(f.event, f.data)] += 1
-                _track_child_turn(child_open, f.event, f.data)
+                sub_turns.note(f.event, f.data, is_root=False)
         self.highest_root = max(self.highest_root, meta.head)
         self.turn_active = meta.turn_active
         if meta.run_id:
@@ -571,14 +602,13 @@ class _Forwarder:
                     if is_root:
                         await self.store.save_meta(self.session, meta)
                     continue
-                if not is_root:
-                    if event == "subagent_stream_unavailable":
-                        sub = data.get("subagent_id") or data.get("agent_id")
-                        if child_open.get(sub) is False:
-                            log.info("bridge %s: %s already stored in full; dropping replay marker",
-                                     self.session, sub)
-                            continue
-                    _track_child_turn(child_open, event, data)
+                if not is_root and event == "subagent_stream_unavailable":
+                    sub = data.get("subagent_id") or data.get("agent_id")
+                    if sub_turns.stored_in_full(sub):
+                        log.info("bridge %s: %s already stored in full; dropping replay marker",
+                                 self.session, sub)
+                        continue
+                sub_turns.note(event, data, is_root=is_root)
                 if is_root:
                     data["event_offset"] = resume_offset - 1
                 obs = self.tel.observe(event, data, resume_offset, is_root=is_root)
@@ -623,6 +653,10 @@ class _Forwarder:
                         await self.store.save_meta(
                             self.session, meta, pending_added=change.added, pending_removed=change.removed
                         )
+                if is_root and event == "message_handler_end":
+                    # Also for a dup: the previous holder may have died before applying it
+                    # (the update is idempotent).
+                    await self._apply_settings(data.get("output"))
                 if event == "subagent_started" and data.get("workflow_id"):
                     await self.store.register_subagent(
                         data["workflow_id"], self.session, agent_id=data.get("subagent_id")
@@ -827,6 +861,21 @@ class _Forwarder:
                 self.session, worker={"state": state, "reason": reason, "since": since}
             )
 
+
+    # -- session settings ----------------------------------------------------------------
+
+    async def _apply_settings(self, output: Any) -> None:
+        """A root ``set_model`` / ``set_posture`` result: copy the value the agent now holds
+        (new when ok, unchanged when refused) into the session list."""
+        callback = self.b._on_settings
+        if callback is None or not isinstance(output, dict):
+            return
+        if output.get("setting") not in ("model", "posture"):
+            return
+        try:
+            await callback(self.session, output)
+        except Exception as exc:  # noqa: BLE001 - the list catches up on the next change
+            log.warning("bridge %s: session list not updated: %s", self.session, exc)
 
     # -- run ids ---------------------------------------------------------------------------
 

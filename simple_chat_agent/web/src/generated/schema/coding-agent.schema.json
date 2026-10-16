@@ -45,7 +45,7 @@
         "$ref": "#/$defs/SetModel"
       },
       "output": {
-        "$ref": "#/$defs/Ack"
+        "$ref": "#/$defs/SettingsAck"
       }
     },
     "set_posture": {
@@ -55,7 +55,7 @@
         "$ref": "#/$defs/SetPosture"
       },
       "output": {
-        "$ref": "#/$defs/Ack"
+        "$ref": "#/$defs/SettingsAck"
       }
     },
     "steer": {
@@ -176,12 +176,12 @@
           "type": "array"
         },
         "model": {
-          "$ref": "#/$defs/ModelChoice"
+          "$ref": "#/$defs/ModelChoice-Input"
         },
         "pending_model": {
           "anyOf": [
             {
-              "$ref": "#/$defs/ModelChoice"
+              "$ref": "#/$defs/ModelChoice-Input"
             },
             {
               "type": "null"
@@ -416,7 +416,7 @@
           "type": "string"
         },
         "model": {
-          "$ref": "#/$defs/ModelChoice"
+          "$ref": "#/$defs/ModelChoice-Input"
         },
         "posture": {
           "default": "trust_safe",
@@ -582,7 +582,7 @@
       "title": "InterruptRequest",
       "type": "object"
     },
-    "ModelChoice": {
+    "ModelChoice-Input": {
       "description": "A provider plus a model id from that provider's allowlist.",
       "properties": {
         "provider": {
@@ -618,6 +618,50 @@
           "title": "Effort"
         }
       },
+      "title": "ModelChoice",
+      "type": "object"
+    },
+    "ModelChoice-Output": {
+      "description": "A provider plus a model id from that provider's allowlist.",
+      "properties": {
+        "provider": {
+          "default": "anthropic",
+          "enum": [
+            "anthropic",
+            "openai",
+            "google"
+          ],
+          "title": "Provider",
+          "type": "string"
+        },
+        "model": {
+          "default": "claude-sonnet-5-5",
+          "title": "Model",
+          "type": "string"
+        },
+        "effort": {
+          "anyOf": [
+            {
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effort"
+        }
+      },
+      "required": [
+        "provider",
+        "model",
+        "effort"
+      ],
       "title": "ModelChoice",
       "type": "object"
     },
@@ -696,7 +740,7 @@
       "description": "Switch provider and/or model. Applies from the next turn.",
       "properties": {
         "model": {
-          "$ref": "#/$defs/ModelChoice"
+          "$ref": "#/$defs/ModelChoice-Input"
         }
       },
       "required": [
@@ -723,6 +767,67 @@
         "posture"
       ],
       "title": "SetPosture",
+      "type": "object"
+    },
+    "SettingsAck": {
+      "description": "Acknowledgement of ``set_model`` / ``set_posture`` with the value the agent now holds:\nthe new one when ``ok``, the unchanged one when it refused. The bridge copies it into the\nsession list, so the list never shows a setting the agent refused.",
+      "properties": {
+        "ok": {
+          "default": true,
+          "title": "Ok",
+          "type": "boolean"
+        },
+        "detail": {
+          "default": "",
+          "title": "Detail",
+          "type": "string"
+        },
+        "setting": {
+          "enum": [
+            "model",
+            "posture"
+          ],
+          "title": "Setting",
+          "type": "string"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelChoice-Output"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "posture": {
+          "anyOf": [
+            {
+              "enum": [
+                "ask_everything",
+                "trust_safe",
+                "auto",
+                "never_ask"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Posture"
+        }
+      },
+      "required": [
+        "ok",
+        "detail",
+        "setting",
+        "model",
+        "posture"
+      ],
+      "title": "SettingsAck",
       "type": "object"
     },
     "SteerMessage": {

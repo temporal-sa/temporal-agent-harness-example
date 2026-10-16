@@ -862,7 +862,36 @@ async def judge_tool_call(request: JudgeRequest) -> JudgeVerdict:
     )
 
 
-APPROVAL_ACTIVITIES = [judge_tool_call]
+class JudgeStatus(BaseModel):
+    """Whether the auto-mode judge can run on this worker."""
+
+    available: bool
+    reason: str | None = None
+
+
+@activity.defn(name="judge_status")
+async def judge_status(judge: str) -> JudgeStatus:
+    """Whether this worker can run the auto-mode judge for ``judge``: Jev with its key and
+    extra, else the LLM judge's model setting (``AGENT_JUDGE_MODEL``) and that provider's key.
+    Reads worker env, so the workflow asks through a local activity (recorded in history,
+    replay-safe) before switching to Auto. Never returns a key."""
+    if judge == "jev" and _typesafe_key() and _typesafe_importable():
+        return JudgeStatus(available=True)
+    try:
+        provider, _name = _judge_model_spec()
+    except ApplicationError:
+        return JudgeStatus(available=False, reason=f"the judge model setting ({JUDGE_MODEL_ENV}) is malformed")
+    from simple_chat_agent.agent.model_registry import _KEY_ENV
+
+    keys = _KEY_ENV.get(provider)  # type: ignore[call-overload]
+    if not keys:
+        return JudgeStatus(available=False, reason=f"the judge's provider {provider!r} isn't offered")
+    if not any(os.environ.get(k, "").strip() for k in keys):
+        return JudgeStatus(available=False, reason=f"the workers have no {provider} key for the judge")
+    return JudgeStatus(available=True)
+
+
+APPROVAL_ACTIVITIES = [judge_tool_call, judge_status]
 
 
 def decide(

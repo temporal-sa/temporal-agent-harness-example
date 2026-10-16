@@ -32,8 +32,8 @@ export interface CarriedState {
   turn_counter?: number;
   stream_acked?: number;
   recent_request_ids?: string[];
-  model?: ModelChoice;
-  pending_model?: ModelChoice | null;
+  model?: ModelChoiceInput;
+  pending_model?: ModelChoiceInput | null;
   observable?: {
     [k: string]:
       | {
@@ -88,7 +88,7 @@ export interface PublisherState {
 /**
  * A provider plus a model id from that provider's allowlist.
  */
-export interface ModelChoice {
+export interface ModelChoiceInput {
   provider?: "anthropic" | "openai" | "google";
   model?: string;
   effort?: ("low" | "medium" | "high") | null;
@@ -393,7 +393,7 @@ export interface ChatReply {
 export interface CodingAgentInit {
   owner_id?: string;
   session_id?: string;
-  model?: ModelChoice;
+  model?: ModelChoiceInput;
   posture?: "ask_everything" | "trust_safe" | "auto" | "never_ask";
   environment?: "catalog" | "local";
   judge?: "llm" | "jev";
@@ -442,6 +442,22 @@ export interface Issue {
   path: string;
   line: number | null;
   comment: string;
+}
+/**
+ * A provider plus a model id from that provider's allowlist.
+ */
+export interface ModelChoice {
+  provider?: "anthropic" | "openai" | "google";
+  model?: string;
+  effort?: ("low" | "medium" | "high") | null;
+}
+/**
+ * A provider plus a model id from that provider's allowlist.
+ */
+export interface ModelChoiceOutput {
+  provider: "anthropic" | "openai" | "google";
+  model: string;
+  effort: ("low" | "medium" | "high") | null;
 }
 /**
  * One step of the agent's plan.
@@ -494,13 +510,25 @@ export interface ReviewRequest {
  * Switch provider and/or model. Applies from the next turn.
  */
 export interface SetModel {
-  model: ModelChoice;
+  model: ModelChoiceInput;
 }
 /**
  * Change how tool calls are approved. Applies to new calls; pending ones stay with you.
  */
 export interface SetPosture {
   posture: "ask_everything" | "trust_safe" | "auto" | "never_ask";
+}
+/**
+ * Acknowledgement of ``set_model`` / ``set_posture`` with the value the agent now holds:
+ * the new one when ``ok``, the unchanged one when it refused. The bridge copies it into the
+ * session list, so the list never shows a setting the agent refused.
+ */
+export interface SettingsAck {
+  ok: boolean;
+  detail: string;
+  setting: "model" | "posture";
+  model: ModelChoiceOutput | null;
+  posture: ("ask_everything" | "trust_safe" | "auto" | "never_ask") | null;
 }
 /**
  * Guidance for the turn in progress, injected before the agent's next model call.
