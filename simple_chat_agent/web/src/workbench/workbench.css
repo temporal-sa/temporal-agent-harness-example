@@ -1,0 +1,113 @@
+/* Workbench (PRD U3). Visual reference: the wireframes' .s-bench, .tabs, .plan, .term, .cfile,
+   .diff and .ws rules. Square corners. Diffs never use red: deletions are pink with a
+   strikethrough. */
+
+.wb { display: grid; grid-template-rows: auto minmax(0, 1fr); min-height: 0; height: 100%; }
+.wb-tabs { display: flex; border-bottom: 1px solid var(--border); overflow-x: auto; scrollbar-width: none; }
+.wb-tab {
+  font-family: var(--mono); font-size: .76em; font-weight: 500; padding: .8em 1em; color: var(--slate-300);
+  border-bottom: 2px solid transparent; white-space: nowrap; display: inline-flex; gap: .45em; align-items: center;
+}
+.wb-tab:hover { color: var(--indigo-100); }
+.wb-tab[aria-selected="true"] { color: var(--off-white); border-bottom-color: var(--green); }
+.wb-tab .n { font-size: .85em; color: var(--indigo-200); }
+.wb-tab .live-dot { width: .5em; height: .5em; background: var(--green); display: inline-block; }
+.wb-body { padding: 1em; display: grid; gap: .8em; align-content: start; overflow-y: auto; min-height: 0; }
+.wb-body:focus-visible { box-shadow: inset var(--focus); outline: none; }
+
+.wb-empty { margin: 0; color: var(--slate-300); font-size: .88em; }
+.wb-hint { margin: 0; font-size: .72em; color: var(--slate-300); }
+.wb-note { margin: 0; font-size: .78em; color: var(--slate-300); padding: .4em .8em; }
+.wb-goal { margin: 0; font-size: .88em; color: var(--indigo-100); }
+
+/* Plan */
+.wb-plan { display: grid; gap: .45em; font-size: .88em; margin: 0; padding: 0; list-style: none; }
+.wb-plan .it { display: grid; grid-template-columns: 1.3em minmax(0, 1fr); gap: .5em; align-items: start; }
+.wb-plan .box-ic {
+  width: 1em; height: 1em; border: 1.5px solid var(--slate-500); margin-top: .2em; display: grid; place-items: center;
+  font-size: .7em; font-family: var(--mono);
+}
+.wb-plan .done .box-ic { background: var(--green); border-color: var(--green); color: var(--space-black); }
+.wb-plan .done .txt { color: var(--slate-300); text-decoration: line-through; text-decoration-color: var(--slate-500); }
+.wb-plan .in_progress .box-ic { border-color: var(--yellow); background: rgba(254, 203, 47, .2); }
+.wb-plan .in_progress .box-ic::after { content: ""; width: .4em; height: .4em; background: var(--yellow); }
+.wb-plan .in_progress .txt { color: var(--off-white); font-weight: 500; }
+.wb-plan .skipped .txt { color: var(--slate-300); font-style: italic; }
+
+/* Workspace facts */
+.wb-facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: .3em 1em; font-size: .78em; padding-top: .6em; border-top: 1px solid var(--border); margin: 0; }
+.wb-facts dt { color: var(--slate-300); font-family: var(--mono); font-size: .9em; }
+.wb-facts dd { margin: 0; font-family: var(--mono); font-size: .9em; overflow-wrap: anywhere; }
+
+/* Changes */
+.wb-file { border: 1px solid var(--border); }
+.wb-file .fh { display: flex; gap: .6em; align-items: center; padding: .5em .8em; font-family: var(--mono); font-size: .76em; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.wb-file .path { overflow-wrap: anywhere; }
+.wb-file .status { color: var(--slate-300); font-size: .9em; }
+.wb-file .st { margin-left: auto; display: inline-flex; gap: .4em; }
+.wb-file .st .a { color: var(--green); }
+.wb-file .st .r { color: var(--pink); }
+.wb-commits ul { margin: .3em 0 0; padding: 0; list-style: none; font-size: .8em; display: grid; gap: .2em; }
+.wb-commits .hash { color: var(--cyan); }
+
+/* Diff: shared with the approval card */
+.wb-diff { font-family: var(--mono); font-size: .74em; line-height: 1.55; background: #111116; overflow-x: auto; display: grid; }
+.wb-diff.framed { border: 1px solid var(--border); }
+.wb-diff > * { padding: 0 .9em; white-space: pre; display: block; min-width: max-content; }
+.wb-diff .mk { display: inline-block; width: 1.2em; }
+.wb-diff .h { color: var(--indigo-300); background: rgba(68, 76, 231, .08); }
+.wb-diff .ctx { color: var(--slate-300); }
+.wb-diff .meta { color: var(--slate-300); font-style: italic; }
+.wb-diff ins.add { color: var(--green); background: rgba(31, 241, 165, .07); text-decoration: none; }
+.wb-diff del.del { color: var(--pink); background: rgba(255, 107, 255, .07); text-decoration: none; }
+.wb-diff del.del .txt { text-decoration: line-through; text-decoration-color: rgba(255, 107, 255, .6); }
+
+/* Terminal */
+.wb-term-head { display: flex; gap: .6em; align-items: center; font-family: var(--mono); font-size: .74em; color: var(--slate-300); flex-wrap: wrap; }
+.wb-term-head .cmd { color: var(--off-white); overflow-wrap: anywhere; }
+summary.wb-term-head { cursor: pointer; list-style: none; padding: .2em 0; }
+summary.wb-term-head::-webkit-details-marker { display: none; }
+summary.wb-term-head::before { content: "▸"; color: var(--indigo-300); }
+details[open] > summary.wb-term-head::before { content: "▾"; }
+summary.wb-term-head:focus-visible { outline: none; box-shadow: var(--focus); }
+.wb-earlier { display: grid; gap: .6em; }
+.wb-earlier details { display: grid; gap: .4em; }
+.wb-term {
+  font-family: var(--mono); font-size: .72em; line-height: 1.6; background: #0b0b0e; border: 1px solid var(--border);
+  padding: .7em .9em; overflow: auto; max-height: 28em; display: grid; align-content: start;
+}
+.wb-term > div { white-space: pre; min-width: max-content; }
+.wb-term .cmd { color: var(--indigo-200); }
+.wb-term .out { color: var(--off-white); }
+.wb-term .err { color: var(--indigo-300); }
+.wb-term .ok { color: var(--green); }
+.wb-term .muted { color: var(--slate-300); }
+.wb-term .pause { color: var(--yellow); }
+.wb-term .reattach { color: var(--slate-300); }
+.wb-exit { font-family: var(--mono); font-size: .95em; font-weight: 600; padding: .15em .5em; white-space: nowrap; }
+.wb-exit.fail { background: var(--yellow); color: var(--space-black); }
+.wb-exit.ok { background: var(--grad-green); color: var(--space-black); }
+.wb-exit.run { border: 1px solid var(--green); color: var(--green); }
+.wb-exit.wait { border: 1px solid var(--yellow); color: var(--yellow); }
+.wb-exit.muted { border: 1px solid var(--slate-500); color: var(--slate-300); }
+.wb-exit.error { border: 1px solid var(--red); color: var(--red); }
+.wb-sandbox { margin: 0; border: 1px solid var(--yellow); background: rgba(254, 203, 47, .08); color: var(--yellow); padding: .5em .8em; font-size: .8em; font-family: var(--mono); }
+
+/* Artifacts */
+.wb-artifacts { margin: 0; padding: 0; list-style: none; display: grid; gap: .3em; }
+.wb-artifacts button { width: 100%; display: flex; gap: .6em; align-items: baseline; padding: .45em .6em; border: 1px solid var(--border); text-align: left; font-size: .82em; }
+.wb-artifacts button[aria-pressed="true"] { border-color: var(--uv-light); background: rgba(68, 76, 231, .12); }
+.wb-preview { display: grid; gap: .4em; }
+.wb-preview iframe { width: 100%; height: 26em; border: 1px solid var(--border); background: #fff; }
+.wb-preview img { max-width: 100%; border: 1px solid var(--border); }
+.wb-preview-links { display: flex; gap: 1em; font-family: var(--mono); font-size: .76em; }
+
+/* Phone: the shell's bottom sheet holds the "sheet" variant. */
+.wb-sheet .wb-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.wb-sheet .wb-tab { justify-content: center; padding: .6em .3em; }
+.wb-sheet .wb-term { max-height: none; }
+@media (max-width: 600px) {
+  .wb-tab, summary.wb-term-head, .wb-artifacts button, .wb-preview-links a { min-height: 44px; }
+  .wb-preview-links a { display: inline-flex; align-items: center; }
+  .wb-preview iframe { height: 60dvh; }
+}
