@@ -147,3 +147,98 @@ test("the rail shows the open session's status by shape as well as color", async
   const transform = await current.locator(".dot").evaluate((d) => getComputedStyle(d).transform);
   expect(transform, "waiting-for-you square is turned into a diamond").not.toBe("none");
 });
+
+async function footerProblems(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const out: string[] = [];
+    const r = (sel: string) => document.querySelector(sel)?.getBoundingClientRect() ?? null;
+    const dock = r('[data-slot="decisions"]');
+    const strip = r('[data-slot="sheet"]');
+    const composer = r('[data-slot="composer"]');
+    if (!dock || !strip || !composer) return ["footer slot missing"];
+    if (dock.bottom > strip.top + 1) out.push(`dock bottom ${Math.round(dock.bottom)} overlaps strip top ${Math.round(strip.top)}`);
+    if (strip.bottom > composer.top + 1) out.push(`strip bottom ${Math.round(strip.bottom)} overlaps composer top ${Math.round(composer.top)}`);
+    const card = document.querySelector("section.dc-card");
+    if (!card) return [...out, "no card"];
+    const cb = card.getBoundingClientRect();
+    for (const el of card.querySelectorAll<HTMLElement>("button, a[href], textarea, input, [role='button']")) {
+      const b = el.getBoundingClientRect();
+      if (!b.width || !b.height || getComputedStyle(el).visibility === "hidden") continue;
+      const x = b.left + b.width / 2;
+      const y = b.top + b.height / 2;
+      // Controls the card shows: inside the viewport, and inside its scrolling list's window.
+      if (y < 0 || y > innerHeight) continue;
+      const list = el.closest(".dc-body");
+      if (list) {
+        const lb = list.getBoundingClientRect();
+        if (y < lb.top || y > lb.bottom) continue;
+      }
+      if (y < cb.top || y > cb.bottom) {
+        out.push(`"${(el.getAttribute("aria-label") ?? el.textContent ?? "").trim().slice(0, 30)}" at y${Math.round(y)} lies outside the card (${Math.round(cb.top)}-${Math.round(cb.bottom)})`);
+        continue;
+      }
+      const hit = document.elementFromPoint(x, y);
+      if (!hit || !(hit === el || el.contains(hit))) {
+        const name = (el.getAttribute("aria-label") ?? el.textContent ?? "").trim().slice(0, 30);
+        out.push(`"${name}" at y${Math.round(y)} (card ${Math.round(cb.top)}-${Math.round(cb.bottom)}) hits ${hit?.tagName}.${hit?.className}`);
+      }
+    }
+    return out;
+  });
+}
+
+test.describe("phone footer", () => {
+  test.use({ viewport: { width: 320, height: 690 }, hasTouch: true, isMobile: true });
+
+  test("dock, sheet strip and composer stack; every visible card control is tappable", async ({ page, mockApi }) => {
+    const api = await mockApi();
+    await openScripted(page, api, stacked(), { session_id: sessionId("phone-footer"), posture: "trust_safe" });
+    const card = page.locator("section.dc-card");
+    await expect(card).toBeVisible();
+    expect(await footerProblems(page), "collapsed card").toEqual([]);
+    // Open everything without the pointer or focus on the card (so it isn't height-locked):
+    // the card grows to its cap and the footer stacks under it.
+    await page.evaluate(() => {
+      for (let i = 0; i < 8; i++) {
+        const next = document.querySelector<HTMLElement>(
+          "section.dc-card .dc-review[aria-expanded='false'], section.dc-card button[aria-expanded='false'][data-group-toggle]",
+        );
+        if (!next) break;
+        next.click();
+      }
+    });
+    await page.waitForTimeout(200);
+    expect(await footerProblems(page), "card opened").toEqual([]);
+  });
+
+  test("opening the card with a tap keeps every control tappable", async ({ page, mockApi }) => {
+    // A real tap (no hover), as on a phone.
+    const api = await mockApi();
+    await openScripted(page, api, stacked(), { session_id: sessionId("phone-footer-tap"), posture: "trust_safe" });
+    await expect(page.locator("section.dc-card")).toBeVisible();
+    await page.getByRole("button", { name: /^Review/ }).first().tap();
+    await page.waitForTimeout(200);
+    expect(await footerProblems(page)).toEqual([]);
+  });
+
+  test("opening a group with clicks (mobile browsers' compatibility mouse events) keeps every control tappable", async ({ page, mockApi }) => {
+    // GAP (Eng W, decisions/DecisionDock.tsx height lock): after a tap, mobile browsers send
+    // compatibility mouse events, so the card sees the pointer on it and locks its height at
+    // the collapsed size (about 120 px). "Review" then opens a list that gets 0 px inside the
+    // locked card; its rows lie below the card's box, under the sheet strip, and a tap there
+    // lands on "Changes (n)". The shell's footer stacks correctly (tests above). The lock
+    // should not apply across the Review toggle (or should re-measure when it opens).
+    test.fail();
+    const api = await mockApi();
+    await openScripted(page, api, stacked(), { session_id: sessionId("phone-footer-click"), posture: "trust_safe" });
+    await expect(page.locator("section.dc-card")).toBeVisible();
+    await page.getByRole("button", { name: /^Review/ }).first().click();
+    await page.waitForTimeout(200);
+    // The opened list must get room inside the card: today the card stays locked at its
+    // collapsed height, the list gets 0 px, and its first row (y≈527) sits under the strip.
+    const listHeight = await page.evaluate(() => document.querySelector("section.dc-card .dc-body")?.getBoundingClientRect().height ?? 0);
+    expect(listHeight, "room for the opened list").toBeGreaterThanOrEqual(44);
+    await page.locator("section.dc-card button[aria-expanded='false'][data-group-toggle]").first().click({ timeout: 3000 });
+    expect(await footerProblems(page)).toEqual([]);
+  });
+});

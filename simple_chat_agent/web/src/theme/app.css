@@ -118,7 +118,13 @@ a.view:hover { border-color: var(--slate-500); }
 html[data-presenter="on"] .body { grid-template-columns: var(--rail-w) minmax(0, 1fr) var(--bench-w); }
 
 .slot-side { grid-area: side; min-height: 0; }
-.slot-main { grid-area: main; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto auto; }
+/* A column: the transcript takes what's left; the pinned notices, the decision dock, the
+   phone's sheet strip and the composer keep their own heights and stack, so none can overlap
+   another. (A grid let the dock's row shrink below the card, which then spilled over the
+   strip at 320.) */
+.slot-main { grid-area: main; min-height: 0; display: flex; flex-direction: column; }
+.slot-main > * { flex: none; }
+.slot-main > .transcript-slot { flex: 1 1 0; min-height: 0; }
 .pinned-slot { display: grid; justify-items: center; gap: .5em; padding: 0 1.6em; }
 .pinned-slot:not(:empty) { padding-top: .8em; padding-bottom: .4em; border-bottom: 1px solid var(--border); background: var(--space-black); position: relative; z-index: 1; }
 .pinned-slot > * { width: 100%; max-width: 46em; }
@@ -229,7 +235,7 @@ html[data-presenter="on"] .body { grid-template-columns: var(--rail-w) minmax(0,
   .meters-compact .nr { color: var(--slate-300); }
   .body, .body.rail, html[data-presenter="on"] .body { display: flex; flex-direction: column; flex: 1; min-height: 0; }
   .slot-side, .slot-bench { display: none; }
-  .slot-main { flex: 1; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto auto; }
+  .slot-main { flex: 1; min-height: 0; display: flex; flex-direction: column; }
   .pinned-slot { padding: 0 .6em; }
   .pinned-slot:not(:empty) { padding-top: .5em; }
 
