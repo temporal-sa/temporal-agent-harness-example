@@ -13,6 +13,7 @@
 
 | Date | Version | Change | By |
 |---|---|---|---|
+| 2026-10-16 | 1.2 | **P1 complete** (`docs/phases/P1-report.md`). All validation steps pass, including the scripted fix-the-bug task 15/15 across Claude, GPT and Gemini. Deep review (1 blocker, 4 majors, 17 minors) → fix pass → verification → follow-up; git tools now fail closed on non-allowlisted repo config. Claude thinking display set to summarized. Deferred items listed in the report. Awaiting owner go for P2. | PM |
 | 2026-10-16 | 1.1 | **Owner approved P1 (agent core)** by `/yes` in chat. | Owner |
 | 2026-10-16 | 1.1 | **P0 spike complete; go/no-go memo recommends GO for P1** (`docs/decisions/P0-go-no-go.md`). All 9 validation steps passed and no kill criterion fired. Design inputs for P1: per-turn byte growth (enforce A17/A20 plus offload, re-measure with a 30-tool Sonnet turn), and bridge-acknowledged truncation at continue-as-new (P2). Seven ecosystem bugs to file upstream. Awaiting owner go for P1. | PM |
 | 2026-10-16 | 1.0 | **Owner approved the plan (PRD v0.3 → v1.0)** by `/yes` in chat. Low-stakes defaults applied, unanswered: D5 rewrite `basic_file_agent` in P4; D7 MCP off in catalog, on locally; D8 console on in catalog once cross-user tests pass; D9 catalog audience is employees only. Eng work begins with the P0 spike on branch `refactor/official-harness`. | Owner |
@@ -272,7 +273,7 @@ Turn flow:
 | Phase | Work | Exit criterion (measurable) | Status |
 |---|---|---|---|
 | **P0 Spike (time-boxed)** | Claude end to end. Then `set_model` to GPT in the same chat. Bare-defn run loop plus forced continue-as-new. Interrupt. Worker `SIGKILL` detection. `useAgentSession` against our attach. Cross-user 404. Executor `/files` symlink suite. History and Action budget at 50, 250 and 500 ms. | A written **go/no-go memo** closing CTO-1 to CTO-6. Each item has a kill criterion, for example "continue-as-new can't preserve pending state, so we only continue-as-new when idle and cap session length". | Done (`fde9da8`) |
-| **P1 Agent core** | A1–A7, A10, A13–A15, A17–A21 | Scripted task passes in at least 4 of 5 runs per provider. Replay tests pass over 3 recorded histories. Red-team tests pass (SSRF, injection, judge failures). The longest turn stays under 10,240 events and 10 MB. | Not started |
+| **P1 Agent core** | A1–A7, A10, A13–A15, A17–A21 | Scripted task passes in at least 4 of 5 runs per provider. Replay tests pass over 3 recorded histories. Red-team tests pass (SSRF, injection, judge failures). The longest turn stays under 10,240 events and 10 MB. | Done |
 | **P2 API and streaming** | S1–S8 | Contract test against client 0.1.0. Three tabs use one subscriber. Workers-down: transcript renders; sends land as Signals, then apply exactly once. Cross-user 404 on every route. | Not started |
 | **P3 UI** | U0 (owner review first), U1–U8, demo seed | The §2.5 demo script passes end to end twice in a row. Playwright: 100 ms accepted state; no Query from the browser. Copy review against guide 09. | Not started |
 | **P4 Demo extras** | A8 MCP, A11 Code Mode, A12 callbacks, provider web search as a sources list, `basic_file_agent` | Each feature's AC. A cost per demo run is measured and written to the README. | Not started |
