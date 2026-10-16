@@ -129,6 +129,38 @@ def user_prompt(text: str, attachments: list[ChatAttachment]) -> str | list[str]
     return [text, "\n".join(lines)]
 
 
+PLAN_REMINDER_PREFIX = "(Plan reminder, not from the user:"
+_PLAN_MARKS = {"done": "[x]", "in_progress": "[~]"}
+
+
+def plan_reminder(plan: PlanState) -> str | None:
+    """The short plan reminder the model sees on each request while steps are open, or None."""
+    if not plan.items or all(i.status == "done" for i in plan.items):
+        return None
+    steps = " · ".join(
+        f"{_PLAN_MARKS.get(i.status, '[ ]')} {i.text[:80]}{' (in progress)' if i.status == 'in_progress' else ''}"
+        for i in plan.items
+    )
+    return (
+        f"{PLAN_REMINDER_PREFIX} {steps}. Call update_plan to mark each step done as you finish "
+        "it, and before your final reply.)"
+    )
+
+
+def _strip_plan_reminders(messages: list[Any]) -> None:
+    """Remove plan reminders from requests (in place), so none reaches history."""
+    for message in messages:
+        if getattr(message, "kind", None) != "request":
+            continue
+        kept = [
+            p
+            for p in message.parts
+            if not (isinstance(p, UserPromptPart) and isinstance(p.content, str) and p.content.startswith(PLAN_REMINDER_PREFIX))
+        ]
+        if len(kept) != len(message.parts):
+            message.parts = kept
+
+
 # Versioning behavior comes from the worker's deployment config (PINNED by default), so the
 # same class also runs on an unversioned local worker.
 @workflow.defn(name=AGENT_WORKFLOW_TYPE)
@@ -611,9 +643,11 @@ class CodingAgent:
             raise harness_ext.CheckpointNeeded(reason)
         self._snapshot = list(request_context.messages)
         self._steer_into_request(request_context)
+        self._remind_plan(request_context)
         return request_context
 
     async def _after_model_request(self, ctx: Any, *, request_context: Any, response: Any) -> Any:
+        _strip_plan_reminders(request_context.messages)
         self._snapshot = [*request_context.messages, response]
         # If this response ends the run (no tool calls), steer that arrived while it streamed
         # would otherwise be lost: enqueue it, which redirects the run. Otherwise it goes into
@@ -621,6 +655,25 @@ class CodingAgent:
         if self._steer and not any(p.part_kind == "tool-call" for p in response.parts):
             ctx.enqueue(self._take_steer())
         return response
+
+    def _remind_plan(self, request_context: Any) -> None:
+        """While the plan has open steps, show it to the model at the end of the request it is
+        about to send, and remind it to tick steps off (models write a plan and then leave it
+        untouched; 0 of 21 Sonnet runs ticked one without this).
+
+        Computed from the plan state, so replay sends the same request. Kept OUT of history:
+        the reminder goes on a copy of the last request (history keeps the original object),
+        and ``_after_model_request`` removes it from the copy that pydantic-ai then stores."""
+        _strip_plan_reminders(request_context.messages)  # left over from a failed request
+        reminder = plan_reminder(self.plan.current)
+        if reminder is None or not request_context.messages:
+            return
+        last = request_context.messages[-1]
+        if getattr(last, "kind", None) != "request":
+            return
+        request_context.messages[-1] = dataclasses.replace(
+            last, parts=[*last.parts, UserPromptPart(content=reminder)]
+        )
 
     def _take_steer(self) -> str:
         text = "\n\n".join(self._steer)

@@ -291,3 +291,44 @@ class DemoBehaviourTests(unittest.TestCase):
         for bad in ("-p", "--output=/tmp/x", "HEAD..main", "a b", "$(id)", "x;rm", ""):
             self.assertFalse(_COMMIT_REF.fullmatch(bad), bad)
         self.assertEqual(GitDiffResult(staged=False, commit="HEAD").model_text(), "No changes in HEAD.")
+
+
+class PlanReminderTests(unittest.TestCase):
+    """The plan is shown to the model on each request while steps are open, never stored."""
+
+    def plan(self, *statuses: str) -> Any:
+        from simple_chat_agent.agent.state import PlanItem, PlanState
+
+        return PlanState(goal="fix", items=[PlanItem(text=f"step {i}", status=s) for i, s in enumerate(statuses)])
+
+    def test_reminder_text(self) -> None:
+        from simple_chat_agent.agent.workflow import plan_reminder
+
+        self.assertIsNone(plan_reminder(self.plan()))
+        self.assertIsNone(plan_reminder(self.plan("done", "done")))
+        self.assertEqual(
+            plan_reminder(self.plan("done", "in_progress", "pending")),
+            "(Plan reminder, not from the user: [x] step 0 · [~] step 1 (in progress) · [ ] step 2. "
+            "Call update_plan to mark each step done as you finish it, and before your final reply.)",
+        )
+
+    def test_shown_on_the_request_and_kept_out_of_history(self) -> None:
+        from pydantic_ai.messages import ModelRequest, ToolReturnPart, UserPromptPart
+
+        from simple_chat_agent.agent.workflow import PLAN_REMINDER_PREFIX, _strip_plan_reminders
+
+        original = ModelRequest(parts=[ToolReturnPart(tool_name="t", content="ok", tool_call_id="c1")])
+        context = SimpleNamespace(messages=[ModelRequest(parts=[UserPromptPart(content="hi")]), original])
+        agent = SimpleNamespace(plan=SimpleNamespace(current=self.plan("in_progress", "pending")))
+        CodingAgent._remind_plan(agent, context)
+        sent = context.messages[-1]
+        self.assertIsNot(sent, original)
+        self.assertTrue(sent.parts[-1].content.startswith(PLAN_REMINDER_PREFIX))
+        self.assertEqual(len(original.parts), 1)  # the stored request is untouched
+        history = list(context.messages)  # pydantic-ai stores the processed list
+        _strip_plan_reminders(context.messages)  # _after_model_request
+        self.assertEqual([p.part_kind for p in history[-1].parts], ["tool-return"])
+        # No open steps: nothing added.
+        context = SimpleNamespace(messages=[ModelRequest(parts=[UserPromptPart(content="hi")])])
+        CodingAgent._remind_plan(SimpleNamespace(plan=SimpleNamespace(current=self.plan("done"))), context)
+        self.assertEqual(len(context.messages[-1].parts), 1)
