@@ -13,6 +13,7 @@
 
 | Date | Version | Change | By |
 |---|---|---|---|
+| 2026-10-16 | 1.2 | **Owner approved P4 (demo extras)** by `/yes`, with the instruction to reduce testing (time and tokens). P4 handoff (`docs/phases/P4-handoff.md`) sets a lean test plan: one live check per feature on Haiku, one regression and one demo pass at the end, one combined review. PM calls: MCP local only (D7); provider web search off by default behind a per-session toggle, local only until the owner says otherwise. | Owner |
 | 2026-10-16 | 1.2 | **P3 complete** (`docs/phases/P3-report.md`). Product view at `/app/`; every validation step passes; the §2.5 demo script passed all 8 beats twice in a row. UX review (3 blockers, 9 majors) → fixes → second review (2 majors) → fixes; security review (no blockers) → fixes. Agent behaviour tuned from live runs (plan, explorers, Reviewer, git_commit; plan reminder). PM call: "Worker" capitalized in copy. Deferred items listed in the report. Awaiting owner go for P4. | PM |
 | 2026-10-16 | 1.2 | **Owner signed off U0 wireframes** (`/yes`): workbench right (1a), sidebar full at 1920 / rail at 1366 (2a), gradient-only backdrop (3a), meters strip under header (4a). Owner added: every approval card offers Approve / Always approve / Decline (Always approve stays `workspace_edit` only, option a); stacked approvals in one card with Approve all N, grouping by tool, "× n" for identical calls, and per-item review. P3 handoff written (`docs/phases/P3-handoff.md`). | Owner |
 | 2026-10-16 | 1.2 | **Owner approved P3 (UI)** ("ok start p3" in chat). U0 wireframes go to the owner before any UI code. Old `agent_harness/` deletion stays in P5 (old UI and `basic_file_agent` still depend on it); owner asked about it, PM offered to pull it forward, no change requested. | Owner |
@@ -281,7 +282,7 @@ Turn flow:
 | **P1 Agent core** | A1–A7, A10, A13–A15, A17–A21 | Scripted task passes in at least 4 of 5 runs per provider. Replay tests pass over 3 recorded histories. Red-team tests pass (SSRF, injection, judge failures). The longest turn stays under 10,240 events and 10 MB. | Done |
 | **P2 API and streaming** | S1–S8 | Contract test against client 0.1.0. Three tabs use one subscriber. Workers-down: transcript renders; sends land as Signals, then apply exactly once. Cross-user 404 on every route. | Done |
 | **P3 UI** | U0 (owner review first), U1–U8, demo seed | The §2.5 demo script passes end to end twice in a row. Playwright: 100 ms accepted state; no Query from the browser. Copy review against guide 09. | Done |
-| **P4 Demo extras** | A8 MCP, A11 Code Mode, A12 callbacks, provider web search as a sources list, `basic_file_agent` | Each feature's AC. A cost per demo run is measured and written to the README. | Not started |
+| **P4 Demo extras** | A8 MCP, A11 Code Mode, A12 callbacks, provider web search as a sources list, `basic_file_agent` | Each feature's AC. A cost per demo run is measured and written to the README. | In progress |
 | **P5 Hardening** | Security checklist (each item linked to a test), docs, Docker, cutover runbook dry run on a dev namespace, deletion of old code | Independent deep review passes. Image builds. Recorded local demo. | Not started |
 | Release | Catalog deploy | Owner `/go release` | Not started |
 
