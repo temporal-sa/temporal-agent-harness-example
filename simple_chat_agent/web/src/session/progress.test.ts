@@ -10,8 +10,13 @@ const frame = (tool_id: string, progress_delta: string, timestamp = 10) => ({
   data: { tool_id, tool_name: "run_command", progress_delta, timestamp },
 });
 const tagged = (body: object) => RS + JSON.stringify(body);
-const output = (seq: number | null, ...chunks: [string, string][]) =>
-  tagged({ v: 1, type: "output", seq, chunks: chunks.map(([stream, text]) => ({ stream, text })) });
+// Chunks get consecutive seqs ending at the frame's seq (notes get null), like run_command.
+const output = (seq: number | null, ...chunks: [string, string][]) => {
+  let n = seq === null ? 0 : seq - chunks.filter(([s]) => s !== "note").length;
+  return tagged({ v: 1, type: "output", seq, chunks: chunks.map(([stream, text]) => ({ stream, seq: stream === "note" ? null : ++n, text })) });
+};
+const frameOf = (chunks: { stream: string; seq: number | null; text: string }[]) =>
+  tagged({ v: 1, type: "output", seq: Math.max(0, ...chunks.map((c) => c.seq ?? 0)), chunks });
 
 describe("progress parser", () => {
   it("reads tagged output with its streams", () => {
@@ -19,14 +24,14 @@ describe("progress parser", () => {
       kind: "output",
       seq: 12,
       chunks: [
-        { stream: "stdout", text: "a\n" },
-        { stream: "stderr", text: "E boom\n" },
+        { stream: "stdout", seq: 11, text: "a\n" },
+        { stream: "stderr", seq: 12, text: "E boom\n" },
       ],
     });
   });
 
   it("treats untagged text as stdout and drops tagged frames it can't read", () => {
-    expect(parseDelta("plain")).toEqual({ kind: "output", seq: null, chunks: [{ stream: "stdout", text: "plain" }] });
+    expect(parseDelta("plain")).toEqual({ kind: "output", seq: null, chunks: [{ stream: "stdout", seq: null, text: "plain" }] });
     expect(parseDelta(RS + "{not json")).toEqual({ kind: "ignored" });
     expect(parseDelta(tagged({ v: 2, type: "mystery" }))).toEqual({ kind: "ignored" });
   });
@@ -45,7 +50,7 @@ describe("progress parser", () => {
     expect(v.text.t2).toBe("x");
   });
 
-  it("drops a frame whose seq was already shown (a reattach replays)", () => {
+  it("skips chunks whose seq was already shown, per chunk (a repeated frame shows once)", () => {
     const folder = new ProgressFolder();
     const v = folder.update([
       frame("t1", output(3, ["stdout", "a"])),
@@ -55,6 +60,22 @@ describe("progress parser", () => {
       frame("t1", output(6, ["stdout", "c"])),
     ]);
     expect(v.text.t1).toBe("abc");
+  });
+
+  it("after a reattach replays 3–9 in one frame, each line shows once, in order, with the note", () => {
+    const line = (n: number) => ({ stream: "stdout", seq: n, text: `line${n}\n` });
+    const folder = new ProgressFolder();
+    const v = folder.update([
+      // Attempt 1 shows seqs 1–6, then its worker is lost.
+      frame("t1", frameOf([1, 2, 3].map(line))),
+      frame("t1", frameOf([4, 5, 6].map(line))),
+      // Attempt 2 reattaches and replays 3–9 in one frame, after its note.
+      frame("t1", frameOf([{ stream: "note", seq: null, text: "\n[worker restarted; reattaching ...]\n" }, ...[3, 4, 5, 6, 7, 8, 9].map(line)])),
+    ]);
+    expect(v.text.t1).toBe(
+      ["line1", "line2", "line3", "line4", "line5", "line6", "[worker restarted; reattaching ...]", "line7", "line8", "line9", ""].join("\n"),
+    );
+    expect(v.chunks.t1?.map((c) => c.stream)).toEqual(["stdout", "stdout", "stdout", "stdout", "stdout", "stdout", "note", "stdout", "stdout", "stdout"]);
   });
 
   it("turns sandbox notices into sandbox health, never into output", () => {

@@ -3,9 +3,11 @@
 //
 // The harness event has one free-text field, `progress_delta`, so run_command tags each chunk
 // inside it (format: top of simple_chat_agent/agent/tools/workspace.py):
-// * "\x1e" + {"v":1,"type":"output","seq":n,"chunks":[{"stream":"stdout"|"stderr"|"note","text":…}]}
-//   `seq` only grows within a run, across a reattach too: a frame whose seq was already shown
-//   is a duplicate and is dropped.
+// * "\x1e" + {"v":1,"type":"output","seq":n,"chunks":[{"stream":"stdout"|"stderr"|"note","seq":k|null,"text":…}]}
+//   Each output chunk carries its own `seq` (null for notes). It only grows within a run, also
+//   across a reattach, so a chunk at or below the last seq shown for that tool is a replay and
+//   is skipped; notes always show. (Whole frames are never dropped by the frame's `seq`: a
+//   reattach replays old and new output in one frame.)
 // * "\x1e" + {"v":1,"type":"sandbox","state":"down"|"up",…}: the executor isn't answering (or
 //   is again). Never output: it feeds `sandbox`.
 // * Anything not starting with "\x1e" is legacy untagged output: stdout.
@@ -33,14 +35,14 @@ export const SANDBOX_ANSWERING: SandboxHealth = {
 };
 
 export type ParsedDelta =
-  | { kind: "output"; seq: number | null; chunks: { stream: "stdout" | "stderr" | "note"; text: string }[] }
+  | { kind: "output"; seq: number | null; chunks: { stream: "stdout" | "stderr" | "note"; seq: number | null; text: string }[] }
   | { kind: "sandbox"; notice: Obj }
   | { kind: "ignored" };
 
 /** One `progress_delta` string, parsed. */
 export function parseDelta(delta: string): ParsedDelta {
   if (!delta.startsWith(RECORD_SEPARATOR)) {
-    return delta ? { kind: "output", seq: null, chunks: [{ stream: "stdout", text: delta }] } : { kind: "ignored" };
+    return delta ? { kind: "output", seq: null, chunks: [{ stream: "stdout", seq: null, text: delta }] } : { kind: "ignored" };
   }
   let body: unknown;
   try {
@@ -51,11 +53,11 @@ export function parseDelta(delta: string): ParsedDelta {
   if (!isObj(body)) return { kind: "ignored" };
   if (body.type === "sandbox") return { kind: "sandbox", notice: body };
   if (body.type !== "output" || !Array.isArray(body.chunks)) return { kind: "ignored" };
-  const chunks: { stream: "stdout" | "stderr" | "note"; text: string }[] = [];
+  const chunks: { stream: "stdout" | "stderr" | "note"; seq: number | null; text: string }[] = [];
   for (const c of body.chunks) {
     if (!isObj(c) || typeof c.text !== "string") continue;
     const stream = c.stream === "stderr" || c.stream === "note" ? c.stream : "stdout";
-    chunks.push({ stream, text: c.text });
+    chunks.push({ stream, seq: stream === "note" ? null : num(c.seq), text: c.text });
   }
   return { kind: "output", seq: num(body.seq), chunks };
 }
@@ -141,13 +143,14 @@ export class ProgressFolder {
         continue;
       }
       if (parsed.kind !== "output") continue;
-      if (parsed.seq !== null) {
-        const last = this.#lastSeq[toolId];
-        if (last !== undefined && parsed.seq <= last) continue;
-        this.#lastSeq[toolId] = parsed.seq;
-      }
       const at = typeof f.data.timestamp === "number" ? Math.round(f.data.timestamp * 1000) : null;
       for (const c of parsed.chunks) {
+        // Per chunk: a seq already shown is a replay (after a reattach). Notes have none.
+        if (c.seq !== null) {
+          const last = this.#lastSeq[toolId];
+          if (last !== undefined && c.seq <= last) continue;
+          this.#lastSeq[toolId] = c.seq;
+        }
         const list = (this.#chunks[toolId] ??= []);
         const before = this.#text[toolId] ?? "";
         const text = tidy(c, list[list.length - 1], before);

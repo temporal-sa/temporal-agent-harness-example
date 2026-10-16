@@ -80,3 +80,23 @@ describe("chat attachments", () => {
     expect(toChatAttachments(many)).toHaveLength(20);
   });
 });
+
+describe("settings replies (SettingsAck)", () => {
+  const seed = { provider: "anthropic" as const, model: "claude-sonnet-5-5" };
+  it("uses the value the agent applied", () => {
+    const msgs = [control("set_model", { model: { provider: "openai", model: "gpt-5.5" } }, { output: { ok: true, detail: "", setting: "model", model: { provider: "openai", model: "gpt-5.5", effort: "low" }, posture: null } })];
+    expect(currentModel(msgs, seed)).toEqual({ provider: "openai", model: "gpt-5.5", effort: "low" });
+  });
+
+  it("reverts to the previous value when the agent refuses", () => {
+    const refusedModel = control("set_model", { model: { provider: "google", model: "gemini-x" } }, { output: { ok: false, detail: "No google key.", setting: "model", model: null, posture: null } });
+    const refusedPosture = control("set_posture", { posture: "auto" }, { output: { ok: false, detail: "Auto mode isn't available: the workers have no anthropic key for the judge.", setting: "posture", model: null, posture: null } });
+    expect(currentModel([refusedModel], seed)).toEqual(seed);
+    expect(currentPosture([refusedPosture], "trust_safe")).toBe("trust_safe");
+  });
+
+  it("applies the asked-for value while the reply is pending", () => {
+    const pending = control("set_posture", { posture: "auto" }, { status: "running", output: null, endedAt: null });
+    expect(currentPosture([pending], "trust_safe")).toBe("auto");
+  });
+});

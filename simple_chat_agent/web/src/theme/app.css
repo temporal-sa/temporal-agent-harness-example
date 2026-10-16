@@ -173,7 +173,7 @@ html[data-presenter="on"] .body { grid-template-columns: var(--rail-w) minmax(0,
 /* Main column */
 .transcript-slot { overflow-y: auto; padding: 1.4em 1.6em 0; display: grid; align-content: start; justify-items: center; }
 .col { width: 100%; max-width: 46em; display: grid; gap: .9em; align-content: start; padding-bottom: 1em; }
-.decision-slot { display: grid; justify-items: center; padding: 0 1.6em; }
+.decision-slot { display: grid; justify-items: center; align-content: start; padding: 0 1.6em; overflow-y: auto; }
 .decision-slot > * { width: 100%; max-width: 46em; }
 .composer-slot { padding: .8em 1.6em 1em; display: grid; justify-items: center; }
 .composer-slot > * { width: 100%; max-width: 46em; }

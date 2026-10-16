@@ -14,6 +14,7 @@ function render(messages: Message[], over: Partial<CodingSession> = {}) {
     telemetry: summarize(emptyAcc()),
     sendFor: () => undefined,
     toolProgress: {},
+    pendingApprovals: [],
     agent: () => undefined,
     modelCallTiming: () => ({ startedAt: 0, firstThoughtAt: 0, firstOutputAt: 4000, endedAt: 5000 }),
     ...over,
@@ -99,5 +100,20 @@ describe("Transcript", () => {
   it("capitalizes Worker in the lost-attempt fold (UX review m12)", () => {
     const html = render([message([call("running"), text("partial words"), call(), text("final")])]);
     expect(html).toContain("Attempt 1 (Worker lost)");
+  });
+
+  it("says when the agent refused a posture change, with its reason", () => {
+    const html = render([
+      message([], { id: "p1", handler: "set_posture", input: { posture: "auto" }, output: { ok: false, detail: "Auto mode isn't available: the workers have no anthropic key for the judge.", setting: "posture", model: null, posture: null } }),
+    ]);
+    expect(html).toContain("Approvals didn&#x27;t change. Auto mode isn&#x27;t available: the workers have no anthropic key for the judge.");
+    expect(html).not.toContain("Approvals: auto");
+  });
+
+  it("mutes a waiting row while the decision card shows it (UX review m11)", () => {
+    const waiting = tool("edit_file", { toolId: "t-wait", state: "awaiting_approval", input: { path: "a.py", old_string: "a", new_string: "b" } });
+    const html = render([message([call(), waiting])], { pendingApprovals: [{ agentId: "root", messageId: "m1", part: waiting, riskClass: "workspace_edit", rememberAllowed: true }] } as never);
+    expect(html).toContain('<span class="badge idle">waiting · see card</span>');
+    expect(html).not.toContain(">Waiting for you<");
   });
 });

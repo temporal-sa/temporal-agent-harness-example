@@ -26,11 +26,16 @@ const MAX_CHIPS = 5;
 const clock = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 
 function StateBadge({ part, elapsed }: { part: ToolPart; elapsed: number | null }) {
-  const { workerAnswering } = useTranscript();
+  const { workerAnswering, session } = useTranscript();
   const cmd = part.toolName === "run_command" ? commandSummary(part.output) : null;
   switch (part.state) {
     case "awaiting_approval":
-      return <span className="badge git">Waiting for you</span>;
+      // The decision card is the one pink focus; the row only points at it (UX review m11).
+      return session.pendingApprovals.some((w) => w.part.toolId === part.toolId) ? (
+        <span className="badge idle">waiting · see card</span>
+      ) : (
+        <span className="badge git">Waiting for you</span>
+      );
     case "evaluating":
       return <span className="badge prog">Judge deciding</span>;
     case "denied":

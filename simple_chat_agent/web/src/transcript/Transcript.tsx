@@ -10,6 +10,7 @@ import { buildItems, type Item } from "./items";
 import { StreamingMarkdown } from "./Markdown";
 import { ErrorNote } from "./ErrorNote";
 import { errorCopy } from "../session/errors";
+import { settingsAck } from "../session/derive";
 import { SubagentCard } from "./SubagentCard";
 import { Thinking } from "./Thinking";
 import { ToolGroup, ToolRow } from "./ToolRow";
@@ -148,6 +149,12 @@ function ChatTurn({ message, recoveries }: { message: Message; recoveries: TurnR
   );
 }
 
+/** The agent refused a model or posture change: its reason, and that nothing changed. */
+export function refusedLine(setting: "model" | "posture", detail: string): string {
+  const what = setting === "model" ? "The model didn't change." : "Approvals didn't change.";
+  return detail ? `${what} ${detail}` : what;
+}
+
 /** The model-change line: "applies from the next turn" until a later turn has started. */
 export function modelLine(name: string, failed: boolean, nextTurnStarted: boolean): string {
   if (failed) return `Couldn't change the model to ${name}.`;
@@ -163,18 +170,23 @@ function ControlLine({ message, nextTurnStarted }: { message: Message; nextTurnS
     case "set_model": {
       const m = isObj(input.model) ? input.model : {};
       const name = modelLabel(String(m.provider ?? ""), String(m.model ?? ""));
+      const ack = settingsAck(message);
+      if (ack && !ack.ok) return <div className="sys-line">{refusedLine("model", ack.detail)}</div>;
       return (
         <div className="sys-line" title={failed ? message.error ?? undefined : undefined}>
           {modelLine(name, failed, nextTurnStarted)}
         </div>
       );
     }
-    case "set_posture":
+    case "set_posture": {
+      const ack = settingsAck(message);
+      if (ack && !ack.ok) return <div className="sys-line">{refusedLine("posture", ack.detail)}</div>;
       return (
         <div className="sys-line">
           {failed ? "Couldn't change approvals. The previous setting still applies." : `Approvals: ${postureLabel(String(input.posture ?? ""))}`}
         </div>
       );
+    }
     case "steer":
       return (
         <div className="user-turn">

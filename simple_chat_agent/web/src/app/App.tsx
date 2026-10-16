@@ -1,7 +1,7 @@
 // The app shell (PRD U1, U5, U7, U8): boot (reachability and sign-in), the session list, the
 // selected session, and the layout grid with its slots.
 
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { Composer } from "../composer/Composer";
 import { MetersStrip } from "../meters/MetersStrip";
@@ -21,6 +21,7 @@ import {
   type WorkbenchFocus,
 } from "../session";
 import { Dialog } from "../shell/Dialog";
+import { useAnchoredDock } from "./anchoredDock";
 import { Header } from "../shell/Header";
 import { useMaxWidth, usePresenterMode } from "../shell/presenter";
 import { Rail, Sidebar, type SidebarProps } from "../shell/Sidebar";
@@ -193,6 +194,7 @@ function Shell({ me, auth, onUnreachable }: { me: Me; auth: AuthConfig; onUnreac
     clearActionError: () => setActionError(null),
     select,
     create,
+    refresh,
     modelName,
     onUnreachable,
   };
@@ -219,6 +221,7 @@ interface ShellParts {
   clearActionError(): void;
   select(id: string | null): void;
   create(kind: "demo" | "empty"): Promise<void>;
+  refresh(): Promise<void>;
   modelName(choice: Partial<ModelChoice> | null | undefined, withProvider?: boolean): string;
   onUnreachable(): void;
 }
@@ -335,6 +338,18 @@ function Layout({ parts, session, page = { kind: "landing" } }: { parts: ShellPa
   );
 
   const modal = drawer || (sheet !== null && !!session && phone);
+  const dockRef = useRef<HTMLDivElement>(null);
+  const dockHeight = useAnchoredDock(dockRef, !!session && !phone && session.pendingApprovals.length > 0);
+
+  // The agent applies (or refuses) a model or posture change when its handler ends; then the
+  // session list carries the new value, so refetch it once per such reply.
+  const settled = session
+    ? session.messages.filter((m) => (m.handler === "set_model" || m.handler === "set_posture") && (m.status === "done" || m.status === "error")).length
+    : 0;
+  const { refresh } = parts;
+  useEffect(() => {
+    if (settled > 0) void refresh();
+  }, [settled, refresh]);
   return (
     <div className="app">
       <div className="app-frame" inert={modal}>
@@ -379,7 +394,12 @@ function Layout({ parts, session, page = { kind: "landing" } }: { parts: ShellPa
             </div>
           )}
           {session && (
-            <div className="decision-slot" data-slot="decisions">
+            <div
+              className="decision-slot"
+              data-slot="decisions"
+              ref={dockRef}
+              style={dockHeight !== null ? { height: dockHeight } : undefined}
+            >
               <DecisionDock session={session} />
             </div>
           )}

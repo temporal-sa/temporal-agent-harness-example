@@ -18,9 +18,17 @@ function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** A control message counts once the agent admitted it (it may still be running). */
+/** The agent's SettingsAck for a finished set_model / set_posture, if it has one. */
+export function settingsAck(m: Pick<Message, "output" | "status">): { ok: boolean; detail: string; model: unknown; posture: unknown } | null {
+  if (m.status !== "done" || !isObj(m.output)) return null;
+  const o = m.output;
+  return typeof o.ok === "boolean" ? { ok: o.ok, detail: typeof o.detail === "string" ? o.detail : "", model: o.model, posture: o.posture } : null;
+}
+
+/** A control message counts once the agent admitted it, unless it failed or the agent
+ *  refused it (SettingsAck ok=false: the setting stays as it was). */
 function admitted(m: Message): boolean {
-  return m.acceptedAt !== null && m.status !== "error";
+  return m.acceptedAt !== null && m.status !== "error" && settingsAck(m)?.ok !== false;
 }
 
 /** The model the next turn uses: the session's start model, then each admitted set_model. */
@@ -28,8 +36,10 @@ export function currentModel(messages: readonly Message[], seed: ModelChoice | n
   let model = seed;
   for (const m of messages) {
     if (m.handler !== "set_model" || !admitted(m)) continue;
+    // The value the agent applied (its reply), else what was asked for while it's pending.
+    const applied = settingsAck(m)?.model;
     const input = m.input as unknown;
-    const choice = isObj(input) && isObj(input.model) ? input.model : null;
+    const choice = isObj(applied) ? applied : isObj(input) && isObj(input.model) ? input.model : null;
     if (choice && typeof choice.provider === "string" && typeof choice.model === "string") {
       model = {
         provider: choice.provider as ModelChoice["provider"],
@@ -59,8 +69,9 @@ export function currentPosture(messages: readonly Message[], seed: Posture | nul
   let posture = seed;
   for (const m of messages) {
     if (m.handler !== "set_posture" || !admitted(m)) continue;
+    const applied = settingsAck(m)?.posture;
     const input = m.input as unknown;
-    const p = isObj(input) ? input.posture : null;
+    const p = typeof applied === "string" ? applied : isObj(input) ? input.posture : null;
     if (typeof p === "string" && POSTURES.has(p)) posture = p as Posture;
   }
   return posture;
