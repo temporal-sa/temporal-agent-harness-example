@@ -1,5 +1,9 @@
 # Playwright output: results, traces, the HTML report, and the layout screenshots (3a), which
 # are regenerated on every run for review rather than diffed.
 .results/
+.results-live/
 .report/
 __screenshots__/
+# The demo script's evidence per run (live/demo.spec.ts), kept out of .results so the next
+# Playwright run doesn't delete it.
+.demo-runs/

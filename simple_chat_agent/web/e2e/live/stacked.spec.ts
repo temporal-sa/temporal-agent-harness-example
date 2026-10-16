@@ -114,7 +114,7 @@ test("3e live: five gated calls, one card, answer one alone, Approve all the res
   await expect(card.getByRole("button", { name: `Approve 2 identical calls: ${args(TWICE)}` })).toBeVisible();
 
   // Answer one call alone: counts update at once.
-  await card.getByRole("button", { name: `Approve ${args(TEXTS[1]!)}`, exact: true }).click();
+  await card.getByRole("button", { name: `Approve gated_echo call: ${args(TEXTS[1]!)}`, exact: true }).click({ timeout: 30_000 });
   await expect(card).toHaveAccessibleName("4 tool calls are waiting");
   await expect(card.getByRole("button", { name: "Approve all 4" })).toBeVisible();
 

@@ -21,7 +21,9 @@ const build = process.env.E2E_SKIP_BUILD === "1" || process.env.E2E_WEB_DIST ? "
 
 export default defineConfig({
   testDir: "e2e",
-  outputDir: "e2e/.results",
+  // E2E_OUTPUT_DIR keeps a live run's artifacts safe from a mocked run started alongside it
+  // (Playwright empties its output folder at the start of every run).
+  outputDir: process.env.E2E_OUTPUT_DIR ?? (LIVE ? "e2e/.results-live" : "e2e/.results"),
   fullyParallel: !LIVE,
   // The live tests share one worker process on one task queue and crash it on purpose.
   workers: LIVE ? 1 : undefined,
