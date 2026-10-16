@@ -57,6 +57,19 @@ describe("tool rows", () => {
     expect(created).toMatchObject({ added: 3, removed: 0, hidden: 1 });
     const rewrite = miniDiff(tool("write_file", { output: "Wrote t.py (20 bytes, +4 -2).", input: { content: "x" } }));
     expect(rewrite).toEqual({ rows: [], added: 4, removed: 2, hidden: 0 });
+    const withDiff = miniDiff(
+      tool("write_file", { output: "Wrote t.py (20 bytes, +1 -1).\n--- a/t.py\n+++ b/t.py\n@@ -1 +1 @@\n-old\n+new", input: { path: "t.py", content: "new" } }),
+    );
+    expect(withDiff).toEqual({
+      rows: [
+        { kind: "hunk", text: "@@ -1 +1 @@" },
+        { kind: "del", text: "old" },
+        { kind: "add", text: "new" },
+      ],
+      added: 1,
+      removed: 1,
+      hidden: 0,
+    });
   });
 
   it("lists path chips for file tools and files a command changed", () => {

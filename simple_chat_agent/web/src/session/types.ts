@@ -301,22 +301,31 @@ export interface Rejection {
   message: string;
 }
 
-/** The workspace sandbox (executor), from the run_command activity's notice while it retries
- *  an executor that isn't answering. Answering until a notice says otherwise. */
+/** The workspace sandbox (executor), from the sandbox notices a tool publishes on its
+ *  progress channel while Temporal retries an executor that isn't answering. Answering until
+ *  a notice says otherwise; cleared by an "up" notice or when that tool call ends. */
 export interface SandboxHealth {
   answering: boolean;
-  /** The activity attempt that is waiting. */
+  /** The activity attempt the notice is about. */
   attempt: number | null;
-  /** When Temporal tries again (ms since epoch). */
+  maxAttempts: number | null;
+  /** False on the last attempt: Temporal won't retry it. */
+  willRetry: boolean | null;
+  /** When Temporal tries again (ms since epoch, approximate). */
   nextRetryAt: number | null;
   reason: string | null;
+  /** The tool's own sentence for the UI. */
+  message: string | null;
+  /** The tool call the notice came from. */
   toolId: string | null;
 }
 
-/** One chunk of a running tool's live output. `stream` is null until the backend tags it. */
+/** One chunk of a running tool's live output. Untagged (legacy) output is "stdout"; "note"
+ *  is a line from us, not the command (reattach, dropped output, limit reached). */
 export interface ToolProgressChunk {
   text: string;
-  stream: "stdout" | "stderr" | null;
+  /** Never null from the facade; null stays in the type for older hand-built values. */
+  stream: "stdout" | "stderr" | "note" | null;
   /** ms since epoch, from the frame. */
   at: number | null;
 }
@@ -332,7 +341,6 @@ export interface SessionTelemetry {
   turnRecoveries: TurnRecovery[];
   recoveryTotals: RecoveryTotals;
   worker: WorkerHealth;
-  sandbox: SandboxHealth;
   /** The current Temporal run id per agent id (root and subagents), once the bridge reports it. */
   runIds: Readonly<Record<string, string>>;
   /** The same by workflow id (x_worker `runs`, `workflow_id` + `run_id`). */
@@ -386,7 +394,7 @@ export interface CodingSession {
   /** Every live output chunk per tool id, accumulated (the harness keeps only the latest). */
   toolProgress: Readonly<Record<string, string>>;
   toolProgressChunks: Readonly<Record<string, readonly ToolProgressChunk[]>>;
-  /** Same as `telemetry.sandbox`. */
+  /** The sandbox's health, from tool progress notices. */
   sandbox: SandboxHealth;
   /** Same as `telemetry.runIds`; the root's is `runIds[rootAgentId]`. */
   runIds: Readonly<Record<string, string>>;

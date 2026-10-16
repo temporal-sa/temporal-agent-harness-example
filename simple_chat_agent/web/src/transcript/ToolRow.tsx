@@ -117,14 +117,16 @@ function OutputPanel({ part }: { part: ToolPart }) {
 }
 
 export function ToolRow({ part, nested = false }: { part: ToolPart; nested?: boolean }) {
-  const { openFile } = useTranscript();
+  const { openFile, session } = useTranscript();
   const [open, setOpen] = useState(false);
   const badge = toolBadge(part.toolName);
   const running = part.state === "running" || part.state === "approved" || part.state === "requested" || part.state === "awaiting_callback";
   const elapsed = useElapsed(running);
   const diff = miniDiff(part);
   const paths = pathsOf(part);
-  const liveLine = running && part.progress ? part.progress.trimEnd().split("\n").pop() ?? "" : "";
+  // The parsed output (part.progress is the raw, tagged chunk).
+  const live = session.toolProgress[part.toolId];
+  const liveLine = running && live ? live.trimEnd().split("\n").pop() ?? "" : "";
 
   return (
     <>

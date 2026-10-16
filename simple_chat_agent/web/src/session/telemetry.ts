@@ -9,7 +9,6 @@
 // * Retracted recoveries (not a lost worker after all) are kept but never counted or shown.
 
 import type {
-  SandboxHealth,
   ModelCallUsage,
   Recovery,
   RecoveryTotals,
@@ -61,8 +60,7 @@ export const X_USAGE = "x_usage";
 export const X_RECOVERY = "x_recovery";
 export const X_WORKER = "x_worker";
 export const X_REJECTED = "x_rejected";
-/** The sandbox notice. The name is provisional until the run_command activity publishes it. */
-export const X_SANDBOX = "x_sandbox";
+
 
 export interface RawFrame {
   event: string;
@@ -75,13 +73,10 @@ export interface TelemetryAcc {
   recoveries: Map<string, Recovery>;
   worker: WorkerHealth;
   rejections: Map<string, Rejection>;
-  sandbox: SandboxHealth;
   runIds: Record<string, string>;
   runIdsByWorkflow: Record<string, string>;
   unknown: Record<string, number>;
 }
-
-export const SANDBOX_OK: SandboxHealth = { answering: true, attempt: null, nextRetryAt: null, reason: null, toolId: null };
 
 export const HEALTHY: WorkerHealth = {
   answering: true,
@@ -93,7 +88,7 @@ export const HEALTHY: WorkerHealth = {
 };
 
 export function emptyAcc(): TelemetryAcc {
-  return { usage: new Map(), recoveries: new Map(), worker: HEALTHY, rejections: new Map(), sandbox: SANDBOX_OK, runIds: {}, runIdsByWorkflow: {}, unknown: {} };
+  return { usage: new Map(), recoveries: new Map(), worker: HEALTHY, rejections: new Map(), runIds: {}, runIdsByWorkflow: {}, unknown: {} };
 }
 
 // -- field readers (frames are untrusted JSON) ---------------------------------------------
@@ -224,18 +219,6 @@ export function foldFrames(acc: TelemetryAcc, frames: readonly RawFrame[]): bool
         if (wf && runId) runs[wf] = runId;
         if (Object.entries(runs).some(([w, r]) => acc.runIdsByWorkflow[w] !== r)) acc.runIdsByWorkflow = { ...acc.runIdsByWorkflow, ...runs };
         acc.worker = parseWorker(d);
-        changed = true;
-        break;
-      }
-      case X_SANDBOX: {
-        if (!d) break;
-        acc.sandbox = {
-          answering: d.state !== "down" && d.answering !== false,
-          attempt: num(d.attempt),
-          nextRetryAt: ms(d.next_retry_at),
-          reason: str(d.reason),
-          toolId: str(d.tool_id),
-        };
         changed = true;
         break;
       }
@@ -371,7 +354,6 @@ export function summarize(acc: TelemetryAcc): SessionTelemetry {
     turnRecoveries,
     recoveryTotals: recoveryTotals(turnRecoveries),
     worker: acc.worker,
-    sandbox: acc.sandbox,
     runIds: acc.runIds,
     runIdsByWorkflow: acc.runIdsByWorkflow,
     rejections: [...acc.rejections.values()],

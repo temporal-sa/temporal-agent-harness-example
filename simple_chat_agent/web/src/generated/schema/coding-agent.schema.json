@@ -666,8 +666,13 @@
     },
     "WorkspaceState": {
       "additionalProperties": false,
-      "description": "What the workspace's terminal did last.",
+      "description": "What the workspace's terminal did last, and the branch it is on.\n\nEvery field has a default: a run restores this from CarriedState JSON written by an\nolder version.",
       "properties": {
+        "branch": {
+          "default": "",
+          "title": "Branch",
+          "type": "string"
+        },
         "last_command": {
           "default": "",
           "title": "Last Command",
@@ -692,6 +697,7 @@
         }
       },
       "required": [
+        "branch",
         "last_command",
         "last_exit_code",
         "commands_run"

@@ -13,6 +13,7 @@ function render(messages: Message[], over: Partial<CodingSession> = {}) {
     rootAgentId: "root",
     telemetry: summarize(emptyAcc()),
     sendFor: () => undefined,
+    toolProgress: {},
     agent: () => undefined,
     modelCallTiming: () => ({ startedAt: 0, firstThoughtAt: 0, firstOutputAt: 4000, endedAt: 5000 }),
     ...over,

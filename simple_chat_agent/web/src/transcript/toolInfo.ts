@@ -198,6 +198,9 @@ export function miniDiff(part: Pick<ToolPart, "toolName" | "input" | "output" | 
       const rows = content.replace(/\n$/, "").split("\n").map((t) => ({ kind: "add" as const, text: t }));
       return bounded(rows, max, head ? Number(head[1]) : undefined, head ? Number(head[2]) : 0);
     }
+    // A rewrite of an existing file carries edit_file's unified diff after its first line.
+    const nl = out.indexOf("\n");
+    if (head && nl > 0) return bounded(parseDiff(out.slice(nl + 1)), max, Number(head[1]), Number(head[2]));
     if (head) return { rows: [], added: Number(head[1]), removed: Number(head[2]), hidden: 0 };
   }
   return null;

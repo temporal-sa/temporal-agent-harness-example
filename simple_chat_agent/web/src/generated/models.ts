@@ -261,9 +261,13 @@ export interface SubagentInit {
   model?: ModelChoice;
 }
 /**
- * What the workspace's terminal did last.
+ * What the workspace's terminal did last, and the branch it is on.
+ *
+ * Every field has a default: a run restores this from CarriedState JSON written by an
+ * older version.
  */
 export interface WorkspaceState {
+  branch: string;
   last_command: string;
   last_exit_code: number | null;
   commands_run: number;

@@ -258,7 +258,7 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
     pendingApprovals,
     toolProgress: progress.text,
     toolProgressChunks: progress.chunks,
-    sandbox: telemetry.sandbox,
+    sandbox: progress.sandbox,
     runIds: telemetry.runIds,
     runId:
       telemetry.runIdsByWorkflow[sessionId] ??
