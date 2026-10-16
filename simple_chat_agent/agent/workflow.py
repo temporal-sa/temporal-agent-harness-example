@@ -9,6 +9,7 @@ stream; Pydantic AI owns the model/tool loop inside each ``chat`` turn.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from collections import deque
 from datetime import timedelta
 from typing import Any
@@ -317,7 +318,7 @@ class CodingAgent:
         risk = approvals.risk_class_for(tool, self._runner.auto_approval_criteria)
         if approvals.remember_allowed(risk):
             return decision
-        return decision.model_copy(update={"remember": False})
+        return dataclasses.replace(decision, remember=False)
 
     def _is_duplicate(self, request_id: str) -> bool:
         if request_id in self._seen_requests:
@@ -365,7 +366,14 @@ class CodingAgent:
             # cancelled") from an in-flight activity, or as TurnInterrupted from the
             # before-request hook. Anything else is a real failure, interrupt or not.
             if not (self._interrupted and harness_ext.is_cancellation(exc)):
-                raise
+                kind = harness_ext.explained_failure(exc)
+                if kind is None:
+                    raise
+                if self._snapshot is not None:
+                    self._history = harness_ext.close_with_note(
+                        self._snapshot, tool_note=INTERRUPTED_TOOL_NOTE, user_note=f"(The turn stopped: {kind}.)"
+                    )
+                return ChatReply(text=harness_ext.EXPLAINED_FAILURES[kind], error=kind)
             # The turn was stopped. If it reached the model, keep everything up to the last
             # model response, close the tool calls it left open, and record the stop so the
             # next turn has context. If it never reached the model, history is unchanged.

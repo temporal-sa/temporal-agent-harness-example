@@ -20,6 +20,8 @@ RUN apt-get update \
         util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir "fastapi==0.136.1" "uvicorn==0.47.0" "pydantic==2.13.4" \
+    # pytest is preinstalled for the agent: the demo fixture's tests run with network off.
+    && pip install --no-cache-dir "pytest==8.4.2" \
     && groupadd --gid 65532 sandbox \
     && useradd --uid 65532 --gid 65532 --create-home --home-dir /home/sandbox sandbox \
     && mkdir /workspace /workspaces \

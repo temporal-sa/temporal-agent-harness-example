@@ -429,6 +429,29 @@ def is_cancellation(exc: BaseException) -> bool:
     return False
 
 
+# Failures the product explains to the user instead of showing as an unexpected error.
+EXPLAINED_FAILURES = {
+    "SpendCapReached": "This session reached its usage limit, so I stopped. Start a new session or try again tomorrow.",
+    "SpendGuardUnavailable": "I can't check the usage limit right now, so I stopped to be safe. Try again shortly.",
+    "ProviderRejected": "The model provider rejected the request. Try another model.",
+    "ContextOverflow": "This conversation no longer fits the model's context window, even after trimming. Start a new session.",
+}
+
+
+def explained_failure(exc: BaseException) -> str | None:
+    """The ApplicationError type behind ``exc`` if it is one we explain, else None."""
+    from temporalio.exceptions import ApplicationError as AppError
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, AppError) and current.type in EXPLAINED_FAILURES:
+            return current.type
+        current = getattr(current, "cause", None) or current.__cause__
+    return None
+
+
 def publish_rejection(runner: AgentWorkflowRunner, *, message_id: str, reason: str) -> None:
     """Report a front-door message the agent refused, on the stream, as a harness event.
 

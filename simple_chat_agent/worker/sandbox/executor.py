@@ -1104,7 +1104,12 @@ def _execute_events(request: ExecuteRequest) -> AsyncIterator[dict[str, Any]]:
     cached = _load_cached_result(state_path)
     if cached is not None:
         cached["cached"] = True
-        return _replay_cached(request, workspace_key, cached)
+        # A client reattaching after the job finished (a retried activity whose worker died
+        # mid-run) still needs the output it missed, so the job's replay buffer is kept
+        # with its result.
+        return _replay_cached(
+            request, workspace_key, cached, _load_cached_events(state_path)
+        )
     if _started_marker(state_path).exists():
         # The process started under an executor that has since restarted: the job and its
         # result are gone. Running it again would run the command twice.
@@ -1146,10 +1151,43 @@ def _settle_job(job: "_Job", request: ExecuteRequest) -> None:
 
 
 async def _replay_cached(
-    request: ExecuteRequest, workspace_key: str, result: dict[str, Any]
+    request: ExecuteRequest,
+    workspace_key: str,
+    result: dict[str, Any],
+    events: list[dict[str, Any]] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    yield {"kind": "start", "payload": _start_payload(request, workspace_key)}
+    yield {
+        "kind": "start",
+        "payload": {
+            **_start_payload(request, workspace_key),
+            "execution_id": request.execution_id,
+            "attached": True,
+            "state": "done",
+            "cached": True,
+        },
+    }
+    events = events or []
+    first = events[0].get("seq", 0) if events else 0
+    if isinstance(first, int) and first > 0:
+        yield _dropped_event(first, 0)
+    for event in events:
+        yield event
     yield {"kind": "result", "payload": result}
+
+
+def _dropped_event(first: int, cursor: int) -> dict[str, Any]:
+    return {
+        "kind": "dropped",
+        "payload": {
+            "dropped_events": first - cursor,
+            # The first seq still available: a client that already has everything
+            # before it can ignore this marker.
+            "next_seq": first,
+            "message": (
+                f"[{first - cursor} earlier output chunk(s) dropped from the replay buffer]"
+            ),
+        },
+    }
 
 
 async def _subscribe(
@@ -1178,16 +1216,7 @@ async def _subscribe(
             wakeup = job.wakeup
             first = job.events[0][0] if job.events else job.next_seq
             if cursor < first:
-                yield {
-                    "kind": "dropped",
-                    "payload": {
-                        "dropped_events": first - cursor,
-                        "message": (
-                            f"[{first - cursor} earlier output chunk(s) dropped from "
-                            "the replay buffer]"
-                        ),
-                    },
-                }
+                yield _dropped_event(first, cursor)
                 cursor = first
             for seq, event, _ in list(job.events):
                 if seq >= cursor:
@@ -1235,6 +1264,8 @@ async def _run_job(job: "_Job", request: ExecuteRequest, state_path: Path) -> No
             result = _stopped_payload(request, job, "WorkspaceSandboxError")
         if store:
             with suppress(OSError):
+                # Events first: a request that finds the result also finds its output.
+                _store_cached_events(state_path, [event for _, event, _ in job.events])
                 _store_cached_result(state_path, result)
         # Cache first, then unregister: a request that misses _jobs finds the cache.
         _jobs.pop((job.workspace_key, job.execution_id), None)
@@ -1836,6 +1867,29 @@ def _mark_started(state_path: Path) -> None:
     marker = _started_marker(state_path)
     marker.parent.mkdir(mode=WORKSPACE_MODE, parents=True, exist_ok=True)
     marker.touch()
+
+
+def _events_path(state_path: Path) -> Path:
+    return state_path.with_suffix(".events.json")
+
+
+def _store_cached_events(state_path: Path, events: list[dict[str, Any]]) -> None:
+    # Bounded by the job's replay buffer (JOB_REPLAY_BUFFER_CHARS / _EVENTS).
+    path = _events_path(state_path)
+    path.parent.mkdir(mode=WORKSPACE_MODE, parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(events, default=str), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _load_cached_events(state_path: Path) -> list[dict[str, Any]]:
+    try:
+        events = json.loads(_events_path(state_path).read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(events, list):
+        return []
+    return [event for event in events if isinstance(event, dict)]
 
 
 def _store_cached_result(path: Path, result: dict[str, Any]) -> None:

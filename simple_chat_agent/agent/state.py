@@ -154,10 +154,14 @@ def fold_tool_result(
             if len(draft.files) > MAX_CHANGED_FILES:
                 del draft.files[: len(draft.files) - MAX_CHANGED_FILES]
 
-    commit_hash = getattr(result, "commit_hash", None)
+    # GitCommitResult reports `committed` and the new hash as `commit`.
+    commit_hash = getattr(result, "commit_hash", None) or (
+        getattr(result, "commit", None) if getattr(result, "committed", False) else None
+    )
     if commit_hash:
         with changes.mutate() as draft:
-            draft.commits.append(Commit(hash=commit_hash, message=getattr(result, "message", "") or args.get("message", "")))
+            message = getattr(result, "message", "") or args.get("message", "") or getattr(result, "summary", "")
+            draft.commits.append(Commit(hash=str(commit_hash), message=str(message)[:300]))
             if len(draft.commits) > MAX_COMMITS:
                 del draft.commits[: len(draft.commits) - MAX_COMMITS]
 

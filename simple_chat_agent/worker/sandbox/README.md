@@ -13,7 +13,7 @@ A job is keyed by `(workspace, execution_id)`, and it outlives the HTTP stream t
 
 - **First request** for an `execution_id` starts the job. The job waits for the workspace lock, then runs.
 - **Same `execution_id` while the job is queued or running**: the request attaches to that job; it does not start a second process. The executor first replays the buffered events, then streams the rest live. Every stream event carries a `seq`, so a client can skip events it has already seen. The `start` event says `"attached": true`.
-- **Same `execution_id` after the job finished**: the executor returns the cached result with `"cached": true`.
+- **Same `execution_id` after the job finished**: the executor replays the job's saved replay buffer (stored next to the result, so it has the same bounds), then returns the cached result with `"cached": true`. A client that reattaches after the command ended still gets the output it missed, and it can skip events by `seq`.
 - **Same `execution_id` with a different command** while the job is live: HTTP 409.
 - **Executor restarted mid-job**: the job is gone, but a `.started` marker remains. The request gets a `WorkspaceJobLost` result. The command is never run a second time.
 - **Replay buffer limits**: the buffer is capped at `JOB_REPLAY_BUFFER_CHARS` (128k) and `JOB_REPLAY_BUFFER_EVENTS` (2048), and the oldest events are dropped first. A client that fell behind gets one `{"kind": "dropped"}` marker. The final result is stored outside the buffer and is never dropped.

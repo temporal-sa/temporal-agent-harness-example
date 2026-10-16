@@ -584,6 +584,9 @@ async def _stream_execute(
                         continue
                     if event_kind == "result":
                         return payload, attached
+                    if event_kind == "dropped" and isinstance(payload.get("next_seq"), int):
+                        if payload["next_seq"] - 1 <= last_seq:
+                            continue  # nothing this client is missing was dropped
                     seq = item.get("seq")
                     if isinstance(seq, int):
                         if seq <= last_seq:

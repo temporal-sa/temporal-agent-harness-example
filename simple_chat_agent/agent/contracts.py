@@ -108,6 +108,9 @@ class ChatReply(BaseModel):
     # Set when the turn stopped early to keep the workflow inside Temporal's history limits
     # (PRD A20). The agent continues as new; the user says "continue" to carry on.
     checkpoint: str | None = None
+    # Set when the turn stopped on a known, explainable failure (spend cap, provider
+    # rejection, context overflow) rather than an unexpected error.
+    error: str | None = None
 
 
 class SetModel(BaseModel):

@@ -354,6 +354,31 @@ class ExecutorJobTests(_ExecutorEnv, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cached[-1]["payload"]["stdout"], "hi\n")
         self.assertEqual((ws_dir / "runs.txt").read_text(), "run\n")
 
+    async def test_finished_job_replays_its_output_to_a_late_client(self) -> None:
+        # Regression (1.1c): attempt 2 of a crashed run_command often arrives after the
+        # command finished. It must still get the output, not just the result.
+        self.workspace()
+        command = "echo hi; sleep 0.1; echo finished"
+        live = await _collect(ex._execute_events(self.request(command)))
+        late = await _collect(ex._execute_events(self.request(command)))
+        self.assertTrue(late[0]["payload"]["attached"])
+        self.assertTrue(late[0]["payload"]["cached"])
+        self.assertEqual(_text(late), "hi\nfinished\n")
+        self.assertEqual(
+            [e["seq"] for e in late if "seq" in e], [e["seq"] for e in live if "seq" in e]
+        )
+        self.assertEqual(late[-1]["kind"], "result")
+
+    async def test_finished_job_replay_marks_dropped_events(self) -> None:
+        self.workspace()
+        command = "for i in $(seq 1 10); do echo line$i; sleep 0.01; done"
+        with patch.object(ex, "JOB_REPLAY_BUFFER_EVENTS", 3):
+            await _collect(ex._execute_events(self.request(command)))
+        late = await _collect(ex._execute_events(self.request(command)))
+        self.assertEqual(late[1]["kind"], "dropped")
+        self.assertEqual(late[1]["payload"]["next_seq"], late[2]["seq"])
+        self.assertEqual(_text(late), "line8\nline9\nline10\n")
+
     async def test_events_carry_increasing_seq(self) -> None:
         self.workspace()
         events = await _collect(ex._execute_events(self.request("echo a; sleep 0.1; echo b >&2")))
@@ -591,6 +616,47 @@ class RunCommandActivityTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
         self.assertIn("reattaching", retried)
         self.assertIn("done", retried)
         self.assertNotIn("hi\n", retried)  # not re-published
+
+    async def test_retry_after_the_command_finished_publishes_the_missed_output(self) -> None:
+        # Regression (1.1c): worker A dies mid-command; by the time attempt 2 runs, the
+        # command has finished. Attempt 2 must publish the output produced after the
+        # crash ("finished"), not only the reattach note, and must not re-publish "hi".
+        command = "echo run >> runs.txt; echo hi; sleep 0.8; echo finished"
+        heartbeats: list[Any] = []
+        first_env = self.env()
+        first_env.on_heartbeat = lambda *d: heartbeats.append(d)
+        with patch.object(ws, "_cancel_execution", self._no_cancel):
+            attempt1 = asyncio.create_task(first_env.run(ws.run_command_activity, self.input(command)))
+            while not any(d[0].get("seq", -1) >= 0 for d in heartbeats):
+                await asyncio.sleep(0.02)
+            attempt1.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await attempt1
+        deadline = time.monotonic() + 10
+        while ex._jobs and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        self.assertEqual(ex._jobs, {})  # finished before the retry
+        delivered = len(self.publisher.events)
+
+        result = await self.env(attempt=2, heartbeat_details=[heartbeats[-1][0]]).run(
+            ws.run_command_activity, self.input(command)
+        )
+        retried = "".join(e.progress_delta for _, e in self.publisher.events[delivered:])
+        self.assertIn("reattaching", retried)
+        self.assertIn("finished\n", retried)
+        self.assertNotIn("hi\n", retried)
+        self.assertNotIn("dropped", retried)
+        self.assertTrue(result.reattached)
+        self.assertEqual(result.stdout_tail, "hi\nfinished\n")
+        self.assertEqual((self.ws_dir / "runs.txt").read_text(), "run\n")
+
+    async def test_retry_without_heartbeat_replays_everything_from_a_finished_job(self) -> None:
+        command = "echo hi; echo finished"
+        await self.env().run(ws.run_command_activity, self.input(command))
+        delivered = len(self.publisher.events)
+        await self.env(attempt=2).run(ws.run_command_activity, self.input(command))
+        retried = "".join(e.progress_delta for _, e in self.publisher.events[delivered:])
+        self.assertIn("hi\nfinished\n", retried)
 
     async def test_cancelled_activity_cancels_the_job(self) -> None:
         task = asyncio.create_task(self.env().run(ws.run_command_activity, self.input("echo hi; sleep 30")))
