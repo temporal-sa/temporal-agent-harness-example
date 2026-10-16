@@ -16,6 +16,18 @@ frame before it:
 Every frame has an ``id``; the latest frame with a given ``id`` wins (a confirmed frame
 replaces the live one). Fields a provider doesn't report are ``null``, never 0.
 
+Honesty rules (the UI shows recoveries as durability savings):
+
+* A retry counts as a lost worker only when the failed attempt hit its heartbeat timeout, or
+  the attempt ran on a different worker than the one before it. A start-to-close timeout alone
+  is a slow provider or tool: the frame is confirmed with ``cause: "timeout"`` and
+  ``retracted: true``.
+* ``kept`` counts only work that finished: model calls that completed and tools that ended
+  without error, before the failed attempt. It never includes the repeated call.
+* ``repeated.resent_input_tokens_estimate`` is the retried call's prompt size times the extra
+  attempts: the input tokens sent again. It is an estimate (the lost attempt's own usage was
+  never reported) and is never added to anything kept.
+
 Nothing here needs a worker: history, Describe and DescribeTaskQueue are served by Temporal.
 """
 
@@ -24,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -48,7 +61,8 @@ MODEL_ACTIVITY_SUFFIXES = ("__model_request_stream", "__model_request")
 INTERNAL_ACTIVITY_SUFFIXES = ("__event_stream_handler", "__cancel_suspended_response")
 INTERNAL_ACTIVITY_NAMES = frozenset({"judge_tool_call", "run_subagent_turn"})
 COMMAND_ACTIVITY_NAMES = frozenset({"run_command", "workspace.run_command"})
-WORKER_LOST_CAUSES = frozenset({"heartbeat_timeout", "start_to_close_timeout"})
+# Most recent (workflow, activity, attempt) -> worker identities remembered per session.
+IDENTITY_CAP = 1000
 
 # A pending activity that heartbeats but hasn't for this long looks orphaned.
 HEARTBEAT_STALE_SECONDS = 6.0
@@ -181,9 +195,20 @@ class ActivityRecord:
     def cause(self) -> str | None:
         return failure_cause(self.last_failure)
 
-    @property
-    def retried_after_worker_loss(self) -> bool:
-        return self.attempt > 1 and self.cause in WORKER_LOST_CAUSES
+
+def worker_lost(cause: str | None, previous_worker: str | None, worker: str | None) -> bool:
+    """Was a retry caused by losing a worker? Yes on a heartbeat timeout (the attempt stopped
+    heartbeating), or when the next attempt ran on another worker than the failed one. A
+    start-to-close timeout on the same worker is a slow call, not a crash."""
+    if cause == "heartbeat_timeout":
+        return True
+    return bool(previous_worker and worker and previous_worker != worker)
+
+
+def shown_cause(cause: str | None, lost: bool) -> str | None:
+    if not lost and cause == "start_to_close_timeout":
+        return "timeout"
+    return cause
 
 
 def parse_activities(events: list[HistoryEvent], run_id: str = "") -> list[ActivityRecord]:
@@ -447,8 +472,14 @@ class Telemetry:
         self.workflows: dict[str, str] = {}  # subagent agent_id -> child workflow id
         self.turns: dict[tuple[str, str], Turn] = {}
         self.open: dict[str, Turn] = {}  # agent_id -> its open turn
-        # (workflow_id, activity_id, attempt) -> worker identity, from Describe.
-        self.identities: dict[tuple[str, str, int], str] = {}
+        # (workflow_id, activity_id, attempt) -> worker identity, from Describe. Bounded.
+        self.identities: OrderedDict[tuple[str, str, int], str] = OrderedDict()
+        # Tool ids waiting on a human (approval) or a client (callback), per agent.
+        self.awaiting: dict[str, set[str]] = {}
+
+    @property
+    def awaiting_human(self) -> bool:
+        return any(self.awaiting.values())
 
     def workflow_for(self, agent_id: str) -> str:
         return self.workflows.get(agent_id, self.session)
@@ -530,20 +561,29 @@ class Telemetry:
                     )
                     if call.retries:
                         obs.jobs.append(Job("recovery_confirm", turn, call))
-        elif event in ("tool_end", "tool_error"):
-            turn.tool_ends += 1
+        elif event == "tool_end":
+            turn.tool_ends += 1  # only tools that finished without error count as kept
+        elif event in ("tool_approval_requested", "callback_requested") and data.get("tool_id"):
+            self.awaiting.setdefault(turn.agent_id, set()).add(data["tool_id"])
         elif event == "turn_end":
             turn.ended_ts = ts
+            self.awaiting.pop(turn.agent_id, None)
             if self.open.get(turn.agent_id) is turn:
                 self.open.pop(turn.agent_id, None)
             obs.jobs.append(Job("turn_confirm", turn))
+        if event in ("tool_approval_resolved", "callback_resolved", "tool_start", "tool_end", "tool_error"):
+            self.awaiting.get(turn.agent_id, set()).discard(data.get("tool_id"))
         if ts is not None:
             turn.last_frame_ts = ts
         return obs
 
     def note_pending(self, workflow_id: str, activity_id: str, attempt: int, identity: str) -> None:
         if identity:
-            self.identities[(workflow_id, activity_id, attempt)] = identity
+            key = (workflow_id, activity_id, attempt)
+            self.identities[key] = identity
+            self.identities.move_to_end(key)
+            while len(self.identities) > IDENTITY_CAP:
+                self.identities.popitem(last=False)
 
     def live_kept(self, turn: Turn, call: Call) -> dict[str, int]:
         done = [c for c in turn.calls if c.index < call.index and c.usage is not None]
@@ -619,6 +659,10 @@ async def detect_recovery(client: Client, tel: Telemetry, turn: Turn, call: Call
         if pa.state == PendingActivityState.PENDING_ACTIVITY_STATE_STARTED:
             call.resumed_on = pa.last_worker_identity or None
         call.lost_worker = tel.identities.get((turn.workflow_id, pa.activity_id, pa.attempt - 1))
+        if cause is not None and not worker_lost(cause, call.lost_worker, call.resumed_on):
+            # A slow or failing call retried on the same worker: no crash to show.
+            # History confirms (and retracts) at completion.
+            return []
     return [
         recovery_frame(
             turn,
@@ -630,7 +674,7 @@ async def detect_recovery(client: Client, tel: Telemetry, turn: Turn, call: Call
             lost_worker=call.lost_worker,
             resumed_on=call.resumed_on,
             kept=tel.live_kept(turn, call),
-            repeated={"model_calls": attempt - 1, "tool_calls": 0, "tokens_estimate": None},
+            repeated={"model_calls": attempt - 1, "tool_calls": 0, "resent_input_tokens_estimate": None},
             attempt=attempt,
             cause=cause,
             call_index=call.index,
@@ -648,28 +692,33 @@ def _model_recovery_from_history(
     usages: dict[int, dict[str, Any]],
     live: Call | None,
 ) -> tuple[str, dict[str, Any]] | None:
-    worker_lost = rec.retried_after_worker_loss
-    if not worker_lost and not (live and live.retries):
-        return None
+    if rec.attempt <= 1:
+        if not (live and live.retries):
+            return None
+    lost_worker = (live.lost_worker if live else None) or tel.identities.get(
+        (turn.workflow_id, rec.activity_id, rec.attempt - 1)
+    )
+    lost = rec.attempt > 1 and worker_lost(rec.cause, lost_worker, rec.identity)
+    if not lost and not (live and live.retries):
+        return None  # a retry for another reason, never shown as a recovery
     usage = usages.get(rec.scheduled_event_id) or {}
-    est = None
-    if usage.get("input_tokens") is not None:
-        est = usage["input_tokens"] * (rec.attempt - 1) + ((live.failed_chars // 4) if live else 0)
+    resent = None
+    if usage.get("input_tokens") is not None and rec.attempt > 1:
+        resent = usage["input_tokens"] * (rec.attempt - 1)
     return recovery_frame(
         turn,
         key=f"model:{index}",
         kind="model_call",
         confirmed=True,
-        retracted=not worker_lost,
+        retracted=not lost,
         detected_at=live.detected_at if live else None,
         lost_at=live.lost_at if live else None,
-        lost_worker=(live.lost_worker if live else None)
-        or tel.identities.get((turn.workflow_id, rec.activity_id, rec.attempt - 1)),
+        lost_worker=lost_worker,
         resumed_on=rec.identity,
         kept=_kept_from_history(records, rec, usages),
-        repeated={"model_calls": rec.attempt - 1, "tool_calls": 0, "tokens_estimate": est},
+        repeated={"model_calls": max(rec.attempt - 1, 0), "tool_calls": 0, "resent_input_tokens_estimate": resent},
         attempt=rec.attempt,
-        cause=rec.cause,
+        cause=shown_cause(rec.cause, lost),
         call_index=index,
         activity_id=rec.activity_id,
     )
@@ -736,7 +785,9 @@ async def confirm_turn(client: Client, tel: Telemetry, turn: Turn) -> list[tuple
                 reattached = isinstance(result, dict) and bool(result.get("reattached"))
             except Exception:  # noqa: BLE001
                 reattached = False
-        if not (reattached or rec.retried_after_worker_loss):
+        lost_worker = tel.identities.get((turn.workflow_id, rec.activity_id, rec.attempt - 1))
+        lost = rec.attempt > 1 and worker_lost(rec.cause, lost_worker, rec.identity)
+        if not (reattached or lost):
             continue
         kept = _kept_from_history(records, rec, usages)
         if reattached:
@@ -749,12 +800,13 @@ async def confirm_turn(client: Client, tel: Telemetry, turn: Turn) -> list[tuple
                 confirmed=True,
                 detected_at=None,
                 lost_at=None,
-                lost_worker=tel.identities.get((turn.workflow_id, rec.activity_id, rec.attempt - 1)),
+                lost_worker=lost_worker,
                 resumed_on=rec.identity,
                 kept=kept,
-                repeated={"model_calls": 0, "tool_calls": 0 if reattached else rec.attempt - 1, "tokens_estimate": None},
+                repeated={"model_calls": 0, "tool_calls": 0 if reattached else rec.attempt - 1,
+                          "resent_input_tokens_estimate": None},
                 attempt=rec.attempt,
-                cause=rec.cause,
+                cause=shown_cause(rec.cause, lost),
                 activity_id=rec.activity_id,
                 tool_name=rec.name,
             )
@@ -806,8 +858,11 @@ async def check_health(client: Client, tel: Telemetry, *, now: float | None = No
             if started and pa.last_worker_identity:
                 tel.note_pending(wf, pa.activity_id, pa.attempt, pa.last_worker_identity)
             cause = failure_cause(pa.last_failure) if pa.HasField("last_failure") else None
-            if pa.attempt > 1 and cause in WORKER_LOST_CAUSES:
-                reasons.append(f"{name} is on attempt {pa.attempt} after {cause.replace('_', ' ')}")
+            previous = tel.identities.get((wf, pa.activity_id, pa.attempt - 1))
+            current = pa.last_worker_identity if started else None
+            if pa.attempt > 1 and worker_lost(cause, previous, current):
+                why = (cause or "a worker change").replace("_", " ")
+                reasons.append(f"{name} is on attempt {pa.attempt} after {why}")
                 if activity_kind(name) == "tool":
                     tool_retries.append({"workflow_id": wf, "activity_id": pa.activity_id, "name": name,
                                          "attempt": pa.attempt, "cause": cause,
@@ -878,7 +933,7 @@ def live_tool_recovery_frame(tel: Telemetry, turn: Turn, retry: dict[str, Any]) 
             "tokens_in": sum((c.usage or {}).get("input_tokens") or 0 for c in turn.calls),
             "tokens_out": sum((c.usage or {}).get("output_tokens") or 0 for c in turn.calls),
         },
-        repeated={"model_calls": 0, "tool_calls": retry["attempt"] - 1, "tokens_estimate": None},
+        repeated={"model_calls": 0, "tool_calls": retry["attempt"] - 1, "resent_input_tokens_estimate": None},
         attempt=retry["attempt"],
         cause=retry["cause"],
         activity_id=retry["activity_id"],

@@ -245,11 +245,24 @@ class CodingAgent:
         # the truncation and silently skipping the last turn's closing events. (P2: truncate
         # to the Redis bridge's acknowledged offset instead of a fixed tail.)
         head = harness_ext.stream_head(self._stream)
+        base = harness_ext.stream_base(self._stream)
         if self._stream_acked > 0:
             cutoff = min(self._stream_acked, head - CAN_TAIL_PAST_ACK)
         else:
             cutoff = head - CAN_RETAINED_WITHOUT_ACK
-        cutoff = max(cutoff, head - CAN_MAX_RETAINED, harness_ext.stream_base(self._stream))
+            if cutoff > base:
+                workflow.logger.warning(
+                    "continue-as-new with no bridge ack: dropping stream events %d..%d", base, cutoff
+                )
+        if head - CAN_MAX_RETAINED > max(cutoff, base):
+            # The bridge has fallen more than CAN_MAX_RETAINED events behind; those events
+            # survive only if the bridge archived them. Make that visible.
+            workflow.logger.warning(
+                "continue-as-new cap: dropping unacknowledged stream events %d..%d",
+                max(cutoff, base),
+                head - CAN_MAX_RETAINED,
+            )
+        cutoff = max(cutoff, head - CAN_MAX_RETAINED, base)
         self._stream.truncate(min(cutoff, head))
         carried = CarriedState(
             conversation=ModelMessagesTypeAdapter.dump_python(self._history, mode="json"),

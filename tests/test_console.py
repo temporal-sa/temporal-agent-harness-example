@@ -117,6 +117,8 @@ class ConsoleTestBase(unittest.TestCase):
         assert DIST is not None
         console.mount_console_routes(app, console_api, DIST)
         self.client = TestClient(app)
+        # The console is same-origin: its state-changing requests carry this Origin.
+        self.client.headers["Origin"] = "http://testserver"
         self.client.__enter__()
 
     def tearDown(self) -> None:
@@ -306,6 +308,30 @@ class CorsTests(ConsoleTestBase):
         )
         self.assertNotIn("access-control-allow-origin", r.headers)
         self.assertNotEqual(r.status_code, 200)
+
+
+class ReviewFixTests(ConsoleTestBase):
+    def test_cross_site_posts_to_console_routes_are_refused(self) -> None:
+        sid = self.create(A)
+        r = self.client.post(
+            "/console/api/messages",
+            json={"session_id": sid, "message": {"type": "chat", "payload": {"text": "hi"}}},
+            headers={**A, "Origin": FOREIGN_ORIGIN},
+        )
+        self.assertEqual((r.status_code, r.json()["error"]), (403, "forbidden"))
+        r = self.client.post(f"/console/api/sessions/{sid}/close", headers={**A, "Origin": FOREIGN_ORIGIN})
+        self.assertEqual(r.status_code, 403)
+
+    def test_session_list_reads_metas_in_one_round_trip(self) -> None:
+        ids = [self.create(A) for _ in range(3)]
+
+        async def no_single_meta(session: str) -> Any:
+            raise AssertionError("list must not read metas one by one")
+
+        self.store.meta = no_single_meta  # type: ignore[method-assign]
+        r = self.client.get("/console/api/sessions", headers=A)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(sorted(s["workflow_id"] for s in r.json()), sorted(ids))
 
 
 class FlagTests(unittest.TestCase):

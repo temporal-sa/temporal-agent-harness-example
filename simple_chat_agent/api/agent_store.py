@@ -24,6 +24,12 @@ hash (``…:t``) for the same reason: the forward loop rewrites the meta JSON wh
 The archive (``FrameArchive``) is the system of record once Temporal has truncated the stream
 at continue-as-new and Redis has expired: one JSONL object per session per turn, on S3 when
 ``SIMPLE_CHAT_S3_BUCKET`` is set, else on local disk.
+
+Archive retention is not enforced by this code. On S3, set a bucket lifecycle rule that expires
+objects under the archive prefix (``AGENT_ARCHIVE_PREFIX``, default ``agent-frames/``) after the
+product's transcript retention, which must be at least the session TTL
+(``AGENT_SESSION_TTL_SECONDS``, 15 days): S3 applies it with no LIST or DELETE calls from the API.
+The disk backend is for local development (default: the system temp directory) and is not pruned.
 """
 
 from __future__ import annotations
@@ -97,6 +103,9 @@ class SessionMeta:
     acked: int = 0
     archived: str = "0-0"
     worker: dict[str, Any] | None = None
+    # True from a root turn_end until that turn's telemetry is confirmed (or given up on, or
+    # the deadline passed), so an attach doesn't end before the confirmed frames are stored.
+    confirming: bool = False
 
     def to_status(self) -> dict[str, Any]:
         status: dict[str, Any] = {
@@ -258,9 +267,13 @@ class FrameArchive:
         lo = parse_entry_id(after)
         hi = parse_entry_id(before) if before else None
         frames: dict[tuple[int, int], StoredFrame] = {}
+        # Objects are read lazily in order of their first position. Once ``count`` frames are
+        # held, an object starting past the count-th smallest of them can't contribute.
         for first, last, key in await self._objects(session):
             if last <= lo or (hi is not None and first >= hi):
                 continue
+            if count is not None and len(frames) >= count and first > sorted(frames)[count - 1]:
+                break
             for line in (await self._backend.get(key)).decode().splitlines():
                 if not line.strip():
                     continue
@@ -296,6 +309,18 @@ class AgentStore:
     async def set_owner(self, session: str, owner: str, *, root: str | None = None) -> None:
         await self.r.set(self._k(session, "owner"), json.dumps({"owner": owner, "root": root or session}), ex=session_ttl_seconds())
 
+    async def claim_owner(self, session: str, owner: str, *, root: str | None = None) -> bool:
+        """Write the owner record only if there is none (SET NX; same key and value as
+        ``set_owner``). True if this call wrote it."""
+        return bool(
+            await self.r.set(
+                self._k(session, "owner"),
+                json.dumps({"owner": owner, "root": root or session}),
+                ex=session_ttl_seconds(),
+                nx=True,
+            )
+        )
+
     async def owner_of(self, session: str) -> str | None:
         """The session's owner. Reading it extends its life: an active session never
         outlives its ownership record."""
@@ -306,13 +331,30 @@ class AgentStore:
         raw, _ = await pipe.execute()
         return json.loads(raw)["owner"] if raw else None
 
-    async def register_subagent(self, child_workflow_id: str, root_session_id: str) -> None:
+    async def register_subagent(
+        self, child_workflow_id: str, root_session_id: str, *, agent_id: str | None = None
+    ) -> None:
         """Record that ``child_workflow_id`` (a subagent workflow) belongs to the root session
-        ``root_session_id``. A root given as another subagent is resolved to its own root."""
+        ``root_session_id``. A root given as another subagent is resolved to its own root.
+        ``agent_id`` is the subagent's id on the merged stream (``subagent_started.subagent_id``),
+        which ``read_agent`` filters on."""
         root = await self.root_of(root_session_id) or root_session_id
         if child_workflow_id == root:
             return
-        await self.r.set(self._k(child_workflow_id, "root"), root, ex=session_ttl_seconds())
+        ttl = session_ttl_seconds()
+        pipe = self.r.pipeline(transaction=True)
+        pipe.set(self._k(child_workflow_id, "root"), root, ex=ttl)
+        if agent_id:
+            pipe.set(self._subaid_key(child_workflow_id), agent_id, ex=ttl)
+        await pipe.execute()
+
+    def _subaid_key(self, child_workflow_id: str) -> str:
+        # The key the routes already cache this under (agent_routes._subagent_key).
+        return f"{prefix()}:subaid:{{{child_workflow_id}}}"
+
+    async def agent_id_of(self, child_workflow_id: str) -> str | None:
+        """The merged-stream ``agent_id`` of a registered subagent workflow."""
+        return await self.r.get(self._subaid_key(child_workflow_id))
 
     async def root_of(self, workflow_id: str) -> str | None:
         """The root session a workflow belongs to: itself for a root session with an owner
@@ -387,9 +429,15 @@ class AgentStore:
         return [_frame(entry_id, fields) for entry_id, fields in entries]
 
     async def read_backfilled(self, session: str, *, after: str, count: int = 500) -> list[StoredFrame]:
-        """Like ``read``, but frames Redis no longer holds (expired, or Redis lost) come from
-        the archive first. Call it for the first read of an attach; later reads continue past
-        what it returned and can use ``read``."""
+        """Up to ``count`` frames strictly after ``after``, in order, from the archive while
+        ``after`` is older than what Redis holds (Redis expired, lost, or rebuilt from a later
+        position), then from Redis.
+
+        Contract for readers: use it in place of ``read`` for every non-blocking read, passing
+        the entry id of the last frame you got as ``after``, and keep calling while it returns
+        frames. An empty result means you are caught up with Redis; only then block on
+        ``wait``. One call costs one ``XRANGE COUNT 1`` more than ``read`` when Redis is
+        complete; the archive is touched only while ``after`` is behind Redis."""
         first = await self.first_entry_id(session)
         # Redis drops a stream whole (TTL) and never trims it, so a stream that starts at the
         # session's first position is complete. One that starts later was rebuilt after a
@@ -406,6 +454,30 @@ class AgentStore:
             return archived
         tail_after = archived[-1].entry_id if archived else after
         return archived + await self.read(session, after=tail_after, count=count - len(archived))
+
+    async def read_agent(
+        self, session_root: str, agent_id: str, *, after: str, count: int = 500, scan: int = 5000
+    ) -> tuple[list[StoredFrame], str]:
+        """Frames of one agent (``data.agent_id``) from the root session's stream, for serving a
+        subagent's attach. Scans at most ``scan`` frames per call. Returns the matching frames
+        and the entry id to pass as ``after`` next time (the last frame scanned, matching or
+        not), so a caller can page through a long stream without rescanning. Backfills from the
+        archive like ``read_backfilled``."""
+        out: list[StoredFrame] = []
+        cursor = after
+        scanned = 0
+        while len(out) < count and scanned < scan:
+            page = await self.read_backfilled(session_root, after=cursor, count=min(500, scan - scanned))
+            if not page:
+                break
+            for frame in page:
+                cursor = frame.entry_id
+                scanned += 1
+                if frame.data.get("agent_id") == agent_id:
+                    out.append(frame)
+                    if len(out) >= count:
+                        break
+        return out, cursor
 
     async def read_at(self, session: str, resume_offset: int) -> list[StoredFrame]:
         """Every frame stored at one resume position."""
@@ -443,25 +515,37 @@ class AgentStore:
 
     # -- meta --------------------------------------------------------------------
 
-    async def meta(self, session: str) -> SessionMeta:
-        pipe = self.r.pipeline(transaction=True)
+    def _queue_meta(self, pipe: Any, session: str) -> None:
         pipe.get(self._k(session, "m"))
         pipe.smembers(self._k(session, "p"))
         pipe.hgetall(self._k(session, "t"))
-        raw, pending, track = await pipe.execute()
-        d = json.loads(raw) if raw else {}
-        track = track or {}
-        return SessionMeta(
-            head=d.get("head", 0),
-            turn_active=d.get("turn_active", False),
-            current_turn=d.get("current_turn", 0),
-            pending=set(pending or ()),
-            closed=d.get("closed", False),
-            turn_start=d.get("turn_start"),
-            acked=int(track.get("acked") or 0),
-            archived=track.get("archived") or "0-0",
-            worker=json.loads(track["worker"]) if track.get("worker") else None,
-        )
+        pipe.exists(self._k(session, "closed"))
+
+    async def meta(self, session: str) -> SessionMeta:
+        pipe = self.r.pipeline(transaction=True)
+        self._queue_meta(pipe, session)
+        return _meta(*await pipe.execute())
+
+    async def metas(self, sessions: list[str]) -> list[SessionMeta]:
+        """``meta`` for many sessions in one pipeline (one round trip), in the order given.
+        (The routes' ``closed_flags`` consumes it as a sequence; ``metas_by_id`` is the dict
+        form.)"""
+        if not sessions:
+            return []
+        pipe = self.r.pipeline(transaction=False)
+        for session in sessions:
+            self._queue_meta(pipe, session)
+        results = await pipe.execute()
+        return [_meta(*results[i * 4:(i + 1) * 4]) for i in range(len(sessions))]
+
+    async def metas_by_id(self, sessions: list[str]) -> dict[str, SessionMeta]:
+        """``metas`` keyed by session id (one round trip)."""
+        return dict(zip(sessions, await self.metas(sessions)))
+
+    async def mark_closed(self, session: str) -> None:
+        """The session ended. A key of its own (``…:closed``), so the bridge's whole-JSON meta
+        writes can never clear it; ``meta().closed`` is true once either says so."""
+        await self.r.set(self._k(session, "closed"), "1", ex=session_ttl_seconds())
 
     async def save_meta(
         self,
@@ -664,4 +748,21 @@ def _frame(entry_id: str, fields: dict[str, str]) -> StoredFrame:
         data=json.loads(fields["d"]),
         resume_offset=int(ms) - 1,
         entry_id=entry_id,
+    )
+
+
+def _meta(raw: Any, pending: Any, track: Any, closed_key: Any) -> SessionMeta:
+    d = json.loads(raw) if raw else {}
+    track = track or {}
+    return SessionMeta(
+        head=d.get("head", 0),
+        turn_active=d.get("turn_active", False),
+        current_turn=d.get("current_turn", 0),
+        pending=set(pending or ()),
+        closed=bool(d.get("closed", False) or closed_key),
+        turn_start=d.get("turn_start"),
+        acked=int(track.get("acked") or 0),
+        archived=track.get("archived") or "0-0",
+        worker=json.loads(track["worker"]) if track.get("worker") else None,
+        confirming=float(track.get("confirming_until") or 0) > _now_ms() / 1000,
     )

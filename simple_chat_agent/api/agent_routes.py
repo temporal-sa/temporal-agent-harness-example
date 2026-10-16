@@ -30,8 +30,9 @@ import os
 import re
 import time
 import uuid
+from urllib.parse import urlsplit
 from collections.abc import AsyncIterator, Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
@@ -40,7 +41,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from temporalio.client import Client, WorkflowExecutionStatus
+from temporalio.client import (
+    Client,
+    WorkflowExecutionStatus,
+    WorkflowUpdateFailedError,
+    WorkflowUpdateRPCTimeoutOrCancelledError,
+)
 from temporalio.common import (
     SearchAttributeKey,
     SearchAttributePair,
@@ -51,7 +57,12 @@ from temporalio.common import (
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
-from temporal_agent_harness.harness.agent_protocol import AgentConfig, MidTurn
+from temporal_agent_harness.harness.agent_protocol import (
+    TOOL_APPROVAL_UPDATE,
+    AgentConfig,
+    MidTurn,
+    ToolApprovalDecision,
+)
 from temporal_agent_harness.harness.agent_protocol.agent_interface import AcceptedFunction
 
 from simple_chat_agent.agent.approvals import configured_judge_backend
@@ -78,13 +89,15 @@ from simple_chat_agent.agent.contracts import (
 )
 # Key-free: the executor log reader is a plain HTTP helper (no tools runtime, no LLM keys).
 from simple_chat_agent.agent.tools.workspace import ExecutionLogNotFound, ExecutorRequestError, read_execution_log
+from simple_chat_agent.common.attachments import MAX_ATTACHMENT_BYTES
 from simple_chat_agent.api import agent_models
 from simple_chat_agent.api.agent_bridge import Bridge
-from simple_chat_agent.api.agent_store import AgentStore, prefix, session_ttl_seconds
+from simple_chat_agent.api.agent_store import MAX_SEQ, AgentStore, prefix, session_ttl_seconds
 
 log = logging.getLogger(__name__)
 
 KEEPALIVE_SECONDS = 15.0
+READ_PAGE = 500
 NO_STORE = {"Cache-Control": "no-store"}
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
 
@@ -97,7 +110,18 @@ MAX_PARENT_HOPS = 4
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 TITLE_MAX = 200
+# How long a subagent tool approval waits for a worker to take the harness Update.
+CHILD_APPROVAL_TIMEOUT = timedelta(seconds=10)
+# The envelope allows for multipart framing around the largest allowed attachment.
+MAX_UPLOAD_BYTES = MAX_ATTACHMENT_BYTES
+UPLOAD_ENVELOPE_BYTES = 64 * 1024
 SESSIONS_LIST_MAX = 500
+# Rebuilding a lost session list Queries CodingSessions (server-side, rare); at most this often.
+REBUILD_BACKOFF_SECONDS = 600
+REBUILD_QUERY_TIMEOUT = timedelta(seconds=5)
+# Describe-fallback misses (unknown or foreign ids) are remembered this long per caller.
+OWNER_MISS_TTL_SECONDS = 30.0
+OWNER_MISS_CACHE_MAX = 10_000
 
 
 def offered_research_tools() -> list[str]:
@@ -173,15 +197,80 @@ def not_found(message: str = "No such session.") -> HarnessError:
 _HTTP_CODES = {400: "bad_request", 401: "unauthorized", 403: "forbidden", 404: "not_found", 405: "method_not_allowed"}
 
 
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+CSRF_HEADER = "x-requested-with"
+
+
+def _media_type(request: Request) -> str:
+    return (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+
+
+def _content_length(request: Request) -> int:
+    try:
+        return int(request.headers.get("content-length") or 0)
+    except ValueError:
+        return 0
+
+
+def _has_body(request: Request) -> bool:
+    length = request.headers.get("content-length")
+    if length is not None:
+        return length.strip() not in ("", "0")
+    return "transfer-encoding" in request.headers
+
+
+def origin_allowed(request: Request) -> bool:
+    """A state-changing request is ours when it carries the custom header, or its ``Origin``
+    (else ``Referer``) is this host or ``SIMPLE_CHAT_PUBLIC_URL``. Browsers always send
+    ``Origin`` on a cross-site POST, and can't add a custom header without a CORS preflight,
+    which this API never grants."""
+    if request.headers.get(CSRF_HEADER):
+        return True
+    source = request.headers.get("origin")
+    if not source or source == "null":
+        source = None if source == "null" else request.headers.get("referer")
+    if not source:
+        return False
+    parts = urlsplit(source)
+    netloc = parts.netloc.lower()
+    if not netloc:
+        return False
+    if netloc == (request.headers.get("host") or "").lower():
+        return True
+    public = os.environ.get("SIMPLE_CHAT_PUBLIC_URL", "").strip()
+    if public:
+        pub = urlsplit(public)
+        return pub.netloc.lower() == netloc and pub.scheme.lower() == parts.scheme.lower()
+    return False
+
+
 class HarnessErrorRoute(APIRoute):
     """Answers every error raised while handling one of this router's routes with the harness
     error body: FastAPI's own 401 (from the auth dependency) and 422 (request validation), and
-    :class:`HarnessError`. Scoped to this router; the app's other routes are unchanged."""
+    :class:`HarnessError`. Scoped to this router; the app's other routes are unchanged.
+
+    Also the CSRF gate for this router's state-changing routes (:func:`origin_allowed`), and
+    the body type check: JSON everywhere except the multipart upload."""
 
     def get_route_handler(self) -> Callable[[Request], Awaitable[Response]]:
         handler = super().get_route_handler()
 
+        multipart = self.path.endswith("/attachments")
+
         async def wrapped(request: Request) -> Response:
+            if request.method in _UNSAFE_METHODS:
+                # CSRF: the session cookie rides cross-site requests, so a state change needs
+                # proof it came from our own pages (same-origin Origin/Referer) or from a
+                # script (a custom header, which a cross-site page can't send without CORS).
+                if not origin_allowed(request):
+                    return _error(403, "forbidden", "Cross-site request refused.")
+                if _has_body(request):
+                    expected = "multipart/form-data" if multipart else "application/json"
+                    if _media_type(request) != expected:
+                        return _error(415, "unsupported_media_type", f"Send the body as {expected}.")
+                    if multipart and _content_length(request) > MAX_UPLOAD_BYTES + UPLOAD_ENVELOPE_BYTES:
+                        # Refused before the multipart parser spools it.
+                        return _error(413, "too_large", f"Attachments are limited to {MAX_UPLOAD_BYTES} bytes.")
             try:
                 return await handler(request)
             except HarnessError as exc:
@@ -381,39 +470,67 @@ class SessionDirectory:
         base = f"{prefix()}:u:{owner_digest(user_id)}"
         return f"{base}:sessions", f"{base}:records"
 
+    def _rebuilt_key(self, user_id: str) -> str:
+        return f"{prefix()}:u:{owner_digest(user_id)}:rebuilt"
+
+    def _touch(self, pipe: Any, user_id: str) -> None:
+        """Extend both keys' life: an active user's list never expires under them."""
+        ttl = session_ttl_seconds()
+        for key in self._keys(user_id):
+            pipe.expire(key, ttl)
+
     async def put(self, user_id: str, record: dict[str, Any]) -> None:
         index, records = self._keys(user_id)
-        ttl = session_ttl_seconds()
         pipe = self.r.pipeline(transaction=True)
         pipe.zadd(index, {record["session_id"]: float(record["created_at"])})
         pipe.hset(records, record["session_id"], json.dumps(record))
-        pipe.expire(index, ttl)
-        pipe.expire(records, ttl)
+        self._touch(pipe, user_id)
         await pipe.execute()
         await self._send(user_id, "register_session_signal", record)
 
     async def get(self, user_id: str, session_id: str) -> dict[str, Any] | None:
         _index, records = self._keys(user_id)
-        raw = await self.r.hget(records, session_id)
+        pipe = self.r.pipeline(transaction=True)
+        pipe.hget(records, session_id)
+        self._touch(pipe, user_id)
+        raw, *_ = await pipe.execute()
         return json.loads(raw) if raw else None
 
     async def list(self, user_id: str) -> list[dict[str, Any]]:
         index, records = self._keys(user_id)
-        ids = await self.r.zrevrange(index, 0, SESSIONS_LIST_MAX - 1)
+        pipe = self.r.pipeline(transaction=True)
+        pipe.zrevrange(index, 0, SESSIONS_LIST_MAX - 1)
+        self._touch(pipe, user_id)
+        ids, *_ = await pipe.execute()
         if not ids:
-            return []
+            if not await self._rebuild(user_id):
+                return []
+            ids = await self.r.zrevrange(index, 0, SESSIONS_LIST_MAX - 1)
+            if not ids:
+                return []
         raws = await self.r.hmget(records, ids)
         return [json.loads(raw) for raw in raws if raw]
 
+    async def _update_record(self, user_id: str, session_id: str, **fields: Any) -> dict[str, Any] | None:
+        """Change fields of an existing record only (never recreates a removed one), in one
+        atomic step, and extend the keys' life."""
+        _index, records = self._keys(user_id)
+        raw = await self.r.eval(_UPDATE_RECORD, 1, records, session_id, json.dumps(fields), session_ttl_seconds())
+        if not raw:
+            return None
+        index, _ = self._keys(user_id)
+        await self.r.expire(index, session_ttl_seconds())
+        return json.loads(raw)
+
     async def rename(self, user_id: str, session_id: str, title: str) -> dict[str, Any] | None:
-        record = await self.get(user_id, session_id)
+        record = await self._update_record(user_id, session_id, title=title)
         if record is None:
             return None
-        record["title"] = title
-        _index, records = self._keys(user_id)
-        await self.r.hset(records, session_id, json.dumps(record))
         await self._send(user_id, "rename_session_signal", {"session_id": session_id, "title": title})
         return record
+
+    async def mark_closed(self, user_id: str, session_id: str) -> None:
+        await self._update_record(user_id, session_id, closed=True)
 
     async def remove(self, user_id: str, session_id: str) -> None:
         index, records = self._keys(user_id)
@@ -422,6 +539,52 @@ class SessionDirectory:
         pipe.hdel(records, session_id)
         await pipe.execute()
         await self._send(user_id, "remove_session_signal", session_id)
+
+    async def _rebuild(self, user_id: str) -> bool:
+        """The Redis list is gone (expired or Redis lost): rebuild it from the user's
+        ``CodingSessions`` (its ``list_sessions`` Query). A rare, server-side path; at most
+        once per REBUILD_BACKOFF_SECONDS per user, so a user with no sessions costs no Query."""
+        if not self._sync:
+            return False
+        if not await self.r.set(self._rebuilt_key(user_id), "1", nx=True, ex=REBUILD_BACKOFF_SECONDS):
+            return False
+        from simple_chat_agent.agent.sessions import SessionRecord, sessions_workflow_id
+
+        try:
+            assert self._temporal is not None
+            client = await self._temporal()
+            handle = client.get_workflow_handle(sessions_workflow_id(owner_digest(user_id)))
+            found = await handle.query(
+                "list_sessions", result_type=list[SessionRecord], rpc_timeout=REBUILD_QUERY_TIMEOUT
+            )
+        except Exception as exc:  # noqa: BLE001 - no manager yet, or no worker: nothing to rebuild
+            log.info("session directory rebuild for %s skipped: %s", owner_digest(user_id), exc)
+            return False
+        if not found:
+            return False
+        index, records = self._keys(user_id)
+        pipe = self.r.pipeline(transaction=True)
+        for rec in found:
+            if getattr(rec, "archived", False):
+                continue
+            try:
+                created = datetime.fromisoformat(rec.created_at).timestamp() if rec.created_at else 0.0
+            except ValueError:
+                created = 0.0
+            provider, _, model = (rec.model or "").partition(":")
+            record = {
+                "session_id": rec.session_id,
+                "title": rec.title,
+                "created_at": created,
+                "model": rec.model,
+                "model_choice": {"provider": provider, "model": model} if model else {},
+                "rebuilt": True,
+            }
+            pipe.zadd(index, {rec.session_id: created}, nx=True)
+            pipe.hsetnx(records, rec.session_id, json.dumps(record))
+        self._touch(pipe, user_id)
+        await pipe.execute()
+        return True
 
     # -- workflow sync -----------------------------------------------------------------
 
@@ -470,6 +633,18 @@ class SessionDirectory:
             log.warning("session directory %s for %s not recorded in CodingSessions: %s", signal, digest, exc)
 
 
+_UPDATE_RECORD = """
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then return false end
+local record = cjson.decode(raw)
+for k, v in pairs(cjson.decode(ARGV[2])) do record[k] = v end
+local out = cjson.encode(record)
+redis.call('HSET', KEYS[1], ARGV[1], out)
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+return out
+"""
+
+
 # -- ownership ---------------------------------------------------------------------------
 
 
@@ -486,19 +661,42 @@ class Ownership:
     def __init__(self, store: AgentStore, temporal: Callable[[], Awaitable[Client]]) -> None:
         self._store = store
         self._temporal = temporal
+        # (workflow id, caller) -> expiry: Describe-fallback misses, so probing unknown or
+        # foreign ids costs at most one Describe chain per OWNER_MISS_TTL_SECONDS.
+        self._misses: dict[tuple[str, str], float] = {}
+
+    def _missed(self, key: tuple[str, str]) -> bool:
+        expiry = self._misses.get(key)
+        if expiry is None:
+            return False
+        if expiry > time.monotonic():
+            return True
+        del self._misses[key]
+        return False
+
+    def _remember_miss(self, key: tuple[str, str]) -> None:
+        now = time.monotonic()
+        if len(self._misses) >= OWNER_MISS_CACHE_MAX:
+            self._misses = {k: v for k, v in self._misses.items() if v > now}
+            if len(self._misses) >= OWNER_MISS_CACHE_MAX:
+                self._misses.clear()
+        self._misses[key] = now + OWNER_MISS_TTL_SECONDS
 
     async def root_if_owned(self, workflow_id: str, user_id: str) -> str | None:
         """The root session id when ``user_id`` owns ``workflow_id``, else None."""
         if not _ID.fullmatch(workflow_id or ""):
             return None
-        root = workflow_id
-        root_of = getattr(self._store, "root_of", None)
-        if root_of is not None:
-            root = await root_of(workflow_id) or workflow_id
+        root = await self._store.root_of(workflow_id) or workflow_id
         owner = await self._store.owner_of(root)
         if owner is not None:
             return root if hmac.compare_digest(owner, user_id) else None
-        return await self._owner_from_temporal(workflow_id, user_id)
+        key = (workflow_id, user_id)
+        if self._missed(key):
+            return None
+        found = await self._owner_from_temporal(workflow_id, user_id)
+        if found is None:
+            self._remember_miss(key)
+        return found
 
     async def _owner_from_temporal(self, workflow_id: str, user_id: str) -> str | None:
         client = await self._temporal()
@@ -515,9 +713,8 @@ class Ownership:
                 if not owner or not hmac.compare_digest(owner, owner_digest(user_id)):
                     return None
                 await self._store.set_owner(current, user_id)
-                register = getattr(self._store, "register_subagent", None)
-                if register is not None and current != workflow_id:
-                    await register(workflow_id, current)
+                if current != workflow_id:
+                    await self._store.register_subagent(workflow_id, current)
                 return current
             if not desc.parent_id:
                 return None
@@ -526,6 +723,29 @@ class Ownership:
 
 
 # -- the router --------------------------------------------------------------------------
+
+
+async def claim_owner(store: AgentStore, session_id: str, user_id: str) -> bool:
+    """Record ``user_id`` as the session's owner unless someone already is (SET NX). True when
+    this call set it."""
+    return await store.claim_owner(session_id, user_id)
+
+
+def _is_closed(status: WorkflowExecutionStatus | None) -> bool:
+    return status is not None and status not in (
+        WorkflowExecutionStatus.RUNNING,
+        WorkflowExecutionStatus.CONTINUED_AS_NEW,
+    )
+
+
+async def closed_flags(store: AgentStore, session_ids: list[str]) -> list[bool]:
+    """``SessionMeta.closed`` for many sessions in one Redis round trip (the list routes)."""
+    return [m.closed for m in await store.metas(session_ids)]
+
+
+async def mark_meta_closed(store: AgentStore, session_id: str) -> None:
+    await store.mark_closed(session_id)
+
 
 
 SeedFn = Callable[[str, str], Awaitable[Any]]
@@ -593,6 +813,11 @@ def create_agent_router(
             raise not_found()
         return root
 
+    async def mark_closed(session_id: str, uid: str) -> None:
+        """The session's workflow closed (or was asked to): ``GET sessions`` shows it."""
+        await mark_meta_closed(store, session_id)
+        await sessions.mark_closed(uid, session_id)
+
     async def require_root(session_id: str, uid: str) -> str:
         """Routes that act on a whole session take only its root id."""
         root = await require(session_id, uid)
@@ -658,12 +883,20 @@ def create_agent_router(
                 raise HarnessError(422, "invalid_request", "session_id must be 1-64 of [A-Za-z0-9_-].")
             digest = hashlib.sha256(f"{owner_digest(uid)}:{requested_id}".encode()).hexdigest()[:16]
             session_id = f"coding-agent-{digest}"
-            if await owners.root_if_owned(session_id, uid) == session_id:
-                existing = await sessions.get(uid, session_id)
-                if existing is not None:
-                    return JSONResponse(_summary(existing), headers=NO_STORE)
         else:
             session_id = f"coding-agent-{uuid.uuid4().hex[:16]}"
+
+        # Ownership first (a crash after starting the workflow must not orphan it), claimed
+        # atomically: an id another user already holds is theirs (404, like any foreign id).
+        claimed = await claim_owner(store, session_id, uid)
+        if not claimed and await store.owner_of(session_id) != uid:
+            raise not_found()
+        if requested_id is not None or not claimed:
+            # A retry of a create that got partway (or a create after DELETE): if the workflow
+            # exists, answer with it. Never seed a live workspace again.
+            existing = await existing_summary(session_id, uid)
+            if existing is not None:
+                return JSONResponse(existing, headers=NO_STORE)
 
         data = CodingAgentInit(
             owner_id=uid,
@@ -678,22 +911,29 @@ def create_agent_router(
         title = (body.title or "").strip() or (
             agent_models.DEMOS[body.demo] if body.demo else "New session"
         )
-        # Ownership first: a crash after starting the workflow must not orphan it.
-        await store.set_owner(session_id, uid)
         seeded: dict[str, Any] | None = None
         if body.demo:
             # Before the workflow starts, so the first message already sees the repo, and a
-            # failed seed leaves no session behind.
-            try:
-                result = await seed_fn(session_id, body.demo)
-            except Exception as exc:  # noqa: BLE001 - executor refused or unreachable
-                log.warning("seeding %s for %s failed: %s", body.demo, session_id, exc)
-                raise HarnessError(502, "seed_failed", f"Couldn't set up the demo workspace: {exc}") from None
-            seeded = {
-                "fixture": body.demo,
-                "files": len(getattr(result, "files", []) or []),
-                "commit": getattr(result, "commit", ""),
-            }
+            # failed seed leaves no session behind. Once per workspace: a retry after the seed
+            # succeeded but the start failed skips it.
+            marker = f"{prefix()}:seeded:{session_id}"
+            done = await store.r.get(marker)
+            if done:
+                seeded = json.loads(done)
+            else:
+                try:
+                    result = await seed_fn(session_id, body.demo)
+                except Exception:  # noqa: BLE001 - executor refused or unreachable
+                    log.exception("seeding %s for %s failed", body.demo, session_id)
+                    raise HarnessError(
+                        502, "seed_failed", "Couldn't set up the demo workspace. Try again in a moment."
+                    ) from None
+                seeded = {
+                    "fixture": body.demo,
+                    "files": len(getattr(result, "files", []) or []),
+                    "commit": getattr(result, "commit", ""),
+                }
+                await store.r.set(marker, json.dumps(seeded), ex=session_ttl_seconds())
         client = await temporal()
         try:
             await client.start_workflow(
@@ -706,6 +946,10 @@ def create_agent_router(
                 static_summary=title[:200],
             )
         except WorkflowAlreadyStartedError:
+            # A concurrent create of the same caller-chosen id won the start.
+            existing = await existing_summary(session_id, uid)
+            if existing is not None:
+                return JSONResponse(existing, headers=NO_STORE)
             raise HarnessError(409, "session_exists", "That session id is taken.") from None
         record = {
             "session_id": session_id,
@@ -723,11 +967,42 @@ def create_agent_router(
             summary["seed"] = seeded
         return JSONResponse(summary, headers=NO_STORE)
 
+    async def existing_summary(session_id: str, uid: str) -> dict[str, Any] | None:
+        """The summary of an existing session workflow the caller owns (open or closed), or
+        None when there is no such workflow. Describe needs no worker."""
+        try:
+            desc = await (await temporal()).get_workflow_handle(session_id).describe()
+        except RPCError as exc:
+            if exc.status != RPCStatusCode.NOT_FOUND:
+                raise
+            return None
+        owner = desc.typed_search_attributes.get(OWNER_SEARCH_ATTRIBUTE)
+        if desc.workflow_type != AGENT_WORKFLOW_TYPE or not owner or not hmac.compare_digest(owner, owner_digest(uid)):
+            raise HarnessError(409, "session_exists", "That session id is taken.")
+        closed = _is_closed(desc.status)
+        record = await sessions.get(uid, session_id)
+        if record is None:
+            start = getattr(desc, "start_time", None)
+            record = {
+                "session_id": session_id,
+                "title": "New session",
+                "created_at": start.timestamp() if start else time.time(),
+            }
+        if closed:
+            await mark_closed(session_id, uid)
+        summary = _summary(record, closed=closed or bool(record.get("closed")))
+        if desc.status is not None:
+            summary["execution_status"] = desc.status.name
+        return summary
+
     @router.get("/sessions")
     async def list_sessions(uid: str = Depends(user_id)):
         records = await sessions.list(uid)
-        metas = await asyncio.gather(*(store.meta(r["session_id"]) for r in records))
-        return JSONResponse([_summary(r, closed=m.closed) for r, m in zip(records, metas)], headers=NO_STORE)
+        flags = await closed_flags(store, [r["session_id"] for r in records])
+        return JSONResponse(
+            [_summary(r, closed=closed or bool(r.get("closed"))) for r, closed in zip(records, flags)],
+            headers=NO_STORE,
+        )
 
     @router.get("/sessions/{session_id}")
     async def get_session(session_id: str, uid: str = Depends(user_id)):
@@ -735,7 +1010,8 @@ def create_agent_router(
         record = await sessions.get(uid, session_id)
         if record is None:
             raise not_found()
-        return JSONResponse(_summary(record, closed=(await store.meta(session_id)).closed), headers=NO_STORE)
+        closed = bool(record.get("closed")) or (await closed_flags(store, [session_id]))[0]
+        return JSONResponse(_summary(record, closed=closed), headers=NO_STORE)
 
     @router.post("/sessions/{session_id}/title")
     async def rename_session(session_id: str, body: Rename, uid: str = Depends(user_id)):
@@ -756,17 +1032,20 @@ def create_agent_router(
         except RPCError as exc:
             if exc.status != RPCStatusCode.NOT_FOUND:
                 raise
+        await mark_meta_closed(store, session_id)
         await sessions.remove(uid, session_id)
         return JSONResponse({"ok": True, "workflow_id": session_id}, headers=NO_STORE)
 
     @router.post("/sessions/{session_id}/close")
     async def close(session_id: str, uid: str = Depends(user_id)):
-        await require(session_id, uid)
+        root = await require(session_id, uid)
         try:
             await (await temporal()).get_workflow_handle(session_id).signal("close")
         except RPCError as exc:
             if exc.status != RPCStatusCode.NOT_FOUND:
                 raise
+        if root == session_id:
+            await mark_closed(session_id, uid)
         return JSONResponse({"ok": True}, headers=NO_STORE)
 
     # -- uploads and tool output ---------------------------------------------------------
@@ -782,7 +1061,10 @@ def create_agent_router(
             create_user_attachment,
         )
 
-        content = await file.read()
+        # Read one byte past the limit, never the whole (possibly huge) part.
+        content = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise HarnessError(413, "too_large", f"Attachments are limited to {MAX_UPLOAD_BYTES} bytes.")
         try:
             # workflow_id = the session id: read_attachment and import_attachment_to_workspace
             # look attachments up by (owner_id, session_id).
@@ -818,8 +1100,9 @@ def create_agent_router(
             page = await read_log_fn(root, log_ref, stream=stream, offset=offset, limit=limit)
         except ExecutionLogNotFound:
             raise HarnessError(404, "output_expired", "Output no longer retained.") from None
-        except ExecutorRequestError as exc:
-            raise HarnessError(502, "executor_unavailable", str(exc)) from None
+        except ExecutorRequestError:
+            log.exception("reading log %s of %s failed", log_ref, root)
+            raise HarnessError(502, "executor_unavailable", "The sandbox isn't answering; try again shortly.") from None
         return JSONResponse(page, headers=NO_STORE)
 
     # -- the harness transport -----------------------------------------------------------
@@ -843,17 +1126,24 @@ def create_agent_router(
 
     @router.get("/attach")
     async def attach(session_id: str, from_offset: int = 0, uid: str = Depends(user_id)):
-        await require(session_id, uid)
+        root = await require(session_id, uid)
         b = await bridge()
+        # A subagent's frames are already in its root's stream (the harness merge): serve
+        # those, filtered to the subagent, from the root's forwarder. Never a second Temporal
+        # reader for the child.
+        child = session_id if root != session_id else None
         return StreamingResponse(
-            _reading(b, session_id, _frames(store, session_id, from_offset)),
+            _reading(b, root, _frames(store, root, from_offset, child=child)),
             media_type="text/event-stream",
             headers=SSE_HEADERS,
         )
 
     @router.post("/messages")
     async def submit_message(body: SubmitMessage, uid: str = Depends(user_id)):
-        await require(body.session_id, uid)
+        root = await require(body.session_id, uid)
+        if root != body.session_id:
+            # Subagents have no front door; their parent drives them.
+            raise HarnessError(409, "not_supported", "Messages go to the session, not to a subagent.")
         message_id = body.request_id or str(uuid.uuid4())
         handle = (await temporal()).get_workflow_handle(body.session_id)
         try:
@@ -888,7 +1178,10 @@ def create_agent_router(
 
     @router.post("/approve")
     async def approve(body: Approve, uid: str = Depends(user_id)):
-        await require(body.session_id, uid)
+        root = await require(body.session_id, uid)
+        if root != body.session_id:
+            await approve_child(body, root)
+            return JSONResponse({"tool_id": body.tool_id, "accepted": True}, headers=NO_STORE)
         handle = (await temporal()).get_workflow_handle(body.session_id)
         try:
             await handle.signal(
@@ -908,6 +1201,37 @@ def create_agent_router(
         await _wake(await bridge(), body.session_id)
         return JSONResponse({"tool_id": body.tool_id, "accepted": True}, headers=NO_STORE)
 
+    async def approve_child(body: Approve, root: str) -> None:
+        """A subagent's tool approval goes to the child's own harness ``tool_approval`` Update
+        (subagents have no Signal front door). That needs a worker: with none answering in
+        CHILD_APPROVAL_TIMEOUT, 503. No outbox for children in this release."""
+        handle = (await temporal()).get_workflow_handle(body.session_id)
+        try:
+            await handle.execute_update(
+                TOOL_APPROVAL_UPDATE,
+                ToolApprovalDecision(
+                    tool_id=body.tool_id, approved=body.approved, reason=body.reason, remember=body.remember
+                ),
+                id=body.request_id or None,
+                rpc_timeout=CHILD_APPROVAL_TIMEOUT,
+            )
+        except WorkflowUpdateRPCTimeoutOrCancelledError:
+            raise HarnessError(
+                503, "worker_unavailable", "The subagent isn't running right now; try the approval again shortly."
+            ) from None
+        except WorkflowUpdateFailedError as exc:
+            log.info("subagent approval %s on %s refused: %s", body.tool_id, body.session_id, exc.cause)
+            raise HarnessError(409, "tool_approval_error", "That approval is unknown or already decided.") from None
+        except RPCError as exc:
+            if exc.status == RPCStatusCode.NOT_FOUND:
+                raise not_found("The subagent has ended.") from None
+            if exc.status in (RPCStatusCode.DEADLINE_EXCEEDED, RPCStatusCode.CANCELLED, RPCStatusCode.UNAVAILABLE):
+                raise HarnessError(
+                    503, "worker_unavailable", "The subagent isn't running right now; try the approval again shortly."
+                ) from None
+            raise
+        await _wake(await bridge(), root)
+
     @router.post("/callback-result")
     async def callback_result(body: CallbackResult, uid: str = Depends(user_id)):
         await require(body.session_id, uid)
@@ -921,17 +1245,21 @@ def create_agent_router(
 
     @router.get("/workflow-status/{session_id}")
     async def workflow_status(session_id: str, uid: str = Depends(user_id)):
-        await require(session_id, uid)
+        root = await require(session_id, uid)
         try:
             desc = await (await temporal()).get_workflow_handle(session_id).describe()
         except RPCError as exc:
             if exc.status != RPCStatusCode.NOT_FOUND:
                 raise
+            if root == session_id:
+                await mark_closed(session_id, uid)
             return JSONResponse(
                 {"workflow_id": session_id, "execution_status": "NOT_FOUND", "closed": True}, headers=NO_STORE
             )
         status = desc.status or WorkflowExecutionStatus.RUNNING
-        closed = status not in (WorkflowExecutionStatus.RUNNING, WorkflowExecutionStatus.CONTINUED_AS_NEW)
+        closed = _is_closed(status)
+        if closed and root == session_id:
+            await mark_closed(session_id, uid)
         return JSONResponse(
             {"workflow_id": session_id, "execution_status": status.name, "closed": closed},
             headers=NO_STORE,
@@ -971,7 +1299,10 @@ class AgentApi:
 
     async def bridge(self) -> Bridge:
         if self._bridge is None:
-            self._bridge = Bridge(await self.temporal(), self.store)
+            client = await self.temporal()  # takes the lock itself; not re-entrant
+            async with self._lock:
+                if self._bridge is None:
+                    self._bridge = Bridge(client, self.store)
         return self._bridge
 
     def router(self, *, app_store: Callable[[], Any] | None = None) -> APIRouter:
@@ -1014,20 +1345,65 @@ async def _reading(bridge: Any, session_id: str, frames: AsyncIterator[bytes]) -
             yield chunk
 
 
-async def _frames(store: AgentStore, session_id: str, from_offset: int) -> AsyncIterator[bytes]:
-    """Replay frames after ``from_offset`` from Redis, then tail until the agent is idle and
+def _belongs(agent_id: Any, subagent: str) -> bool:
+    """A frame from the subagent itself or from one of its descendants (agent ids extend
+    their parent's with ``-<segment>``)."""
+    return isinstance(agent_id, str) and (agent_id == subagent or agent_id.startswith(subagent + "-"))
+
+
+def _subagent_key(child: str) -> str:
+    """The Redis key of a subagent's merged-stream agent id. The store owns it now
+    (``AgentStore.agent_id_of`` / ``register_subagent``); kept because
+    tests/test_agent_bridge.py pins the two to the same key."""
+    return f"{prefix()}:subaid:{{{child}}}"
+
+
+async def _subagent_agent_id(store: AgentStore, root: str, child: str) -> str | None:
+    """The merged-stream ``agent_id`` of subagent workflow ``child``: the store's registry
+    (filled by the bridge from ``subagent_started``), else a scan of the root's stored frames
+    for that ``subagent_started``. None while the subagent hasn't started yet; ``_frames``
+    then picks it up from the stream as it arrives."""
+    known = await store.agent_id_of(child)
+    if known:
+        return known
+    after = "0-0"
+    while True:
+        frames = await store.read_backfilled(root, after=after, count=500)
+        if not frames:
+            return None
+        for frame in frames:
+            if frame.event == "subagent_started" and frame.data.get("workflow_id") == child:
+                agent_id = frame.data.get("subagent_id")
+                if agent_id:
+                    # Remembered in the store's registry, so the next attach skips the scan.
+                    await store.register_subagent(child, root, agent_id=agent_id)
+                    return agent_id
+        after = frames[-1].entry_id
+
+
+async def _frames(
+    store: AgentStore, session_id: str, from_offset: int, *, child: str | None = None
+) -> AsyncIterator[bytes]:
+    """Replay frames from ``from_offset`` from Redis, then tail until the agent is idle and
     every frame is delivered (client transport.ts ``attach``: "Ends when the agent is idle and
     caught up").
 
-    ``from_offset`` is the client's last ``resume_offset``; frames at that position were
-    already delivered, so replay starts after it. While a turn is open (including while no
-    worker is running) the stream stays open with keep-alive comments rather than ending,
-    since the client treats an attach that ends mid-turn as a dropped connection.
+    ``from_offset`` is the client's last ``resume_offset``. Replay INCLUDES the frames at that
+    position: several frames share one offset (subagent frames, and telemetry such as the
+    confirmed ``x_usage`` appended at the newest frame's position after ``turn_end``), and
+    the client deduplicates what it already has (root frames by ``agent_id|event_offset``,
+    others by content). While a turn is open (including while no worker is running), or while
+    the bridge is still confirming a finished turn's telemetry (``meta.confirming``), the
+    stream stays open with keep-alive comments rather than ending, since the client treats an
+    attach that ends mid-turn as a dropped connection.
+
+    With ``child`` (a subagent workflow id), ``session_id`` is its root and only frames from
+    that subagent (and its descendants) are sent, with their root ``resume_offset``s.
     """
-    after = "0-0" if from_offset <= 0 else f"{from_offset + 1}-{2**64 - 1}"
+    after = "0-0" if from_offset <= 0 else f"{from_offset}-{MAX_SEQ}"
+    subagent = await _subagent_agent_id(store, session_id, child) if child else None
     loop = asyncio.get_running_loop()
     last_sent = loop.time()
-    first = True
     while True:
         # Meta first, frames second. The bridge appends a frame before it saves the meta that
         # frame produces, so an idle meta read here guarantees the read below already sees the
@@ -1036,20 +1412,24 @@ async def _frames(store: AgentStore, session_id: str, from_offset: int) -> Async
         # dropped connection (client session.ts: "a stream that ends with a turn still open
         # was cut off").
         meta = await store.meta(session_id)
-        # The first read backfills from the turn archive when Redis no longer holds the old
-        # frames (expired, or Redis lost); later reads continue past it from Redis.
-        backfilled = getattr(store, "read_backfilled", None) if first else None
-        frames = await (backfilled or store.read)(session_id, after=after)
-        first = False
+        # Every non-blocking read goes through read_backfilled (store contract): from the
+        # turn archive while ``after`` is behind what Redis holds (Redis expired, lost or
+        # rebuilt), then from Redis. Only an empty result means caught up; only then block.
+        frames = await store.read_backfilled(session_id, after=after, count=READ_PAGE)
         if not frames:
-            if not meta.turn_active and not meta.pending:
+            if not meta.turn_active and not meta.pending and not meta.confirming:
                 return
             frames = await store.wait(session_id, after=after, block_ms=1000)
         for frame in frames:
+            after = frame.entry_id
+            if child is not None:
+                if frame.event == "subagent_started" and frame.data.get("workflow_id") == child:
+                    subagent = frame.data.get("subagent_id") or subagent
+                if subagent is None or not _belongs(frame.data.get("agent_id"), subagent):
+                    continue
             payload = {**frame.data, "resume_offset": frame.resume_offset}
             yield f"event: {frame.event}\ndata: {json.dumps(payload)}\n\n".encode()
-            after = frame.entry_id
             last_sent = loop.time()
-        if not frames and loop.time() - last_sent > KEEPALIVE_SECONDS:
+        if loop.time() - last_sent > KEEPALIVE_SECONDS:
             yield b": keep-alive\n\n"
             last_sent = loop.time()

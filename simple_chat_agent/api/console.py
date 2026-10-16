@@ -48,6 +48,7 @@ from simple_chat_agent.api.agent_routes import (
     SessionDirectory,
     _summary,
     agent_environment,
+    closed_flags,
     not_found,
 )
 from simple_chat_agent.api.agent_store import AgentStore
@@ -147,10 +148,11 @@ def create_console_router(
         # Oldest first, as the harness session manager lists them: the console's fallback
         # pick on boot is the *last* live session in the list.
         records = sorted(await directory.list(uid), key=lambda r: float(r.get("created_at") or 0))
-        metas = await asyncio.gather(*(store.meta(r["session_id"]) for r in records))
+        # One Redis round trip for every session's closed flag (not one pipeline each).
+        flags = await closed_flags(store, [r["session_id"] for r in records])
         sessions = []
-        for record, meta in zip(records, metas):
-            summary = _summary(record, closed=meta.closed)
+        for record, closed in zip(records, flags):
+            summary = _summary(record, closed=closed or bool(record.get("closed")))
             # The console skips a ?s= / remembered session with no first-message preview when
             # a newer one exists (ui bootSession.chooseBootSession). We don't keep the first
             # message, so the title stands in; the console shows it in the same place.

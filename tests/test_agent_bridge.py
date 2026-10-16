@@ -66,7 +66,9 @@ class FakeHandle:
         self.t.signals.append((self.id, name, arg))
 
     async def describe(self) -> Any:
+        self.t.describes += 1
         return SimpleNamespace(status=WorkflowExecutionStatus.RUNNING, run_id="r1", task_queue="tq",
+                               history_length=self.t.history_length,
                                raw_description=SimpleNamespace(pending_activities=[], HasField=lambda _f: False))
 
 
@@ -75,6 +77,8 @@ class FakeTemporal:
 
     def __init__(self) -> None:
         self.signals: list[tuple[str, str, Any]] = []
+        self.describes = 0
+        self.history_length = 10
 
     def get_workflow_handle(self, wid: str) -> FakeHandle:
         return FakeHandle(self, wid)
@@ -98,6 +102,11 @@ class Script:
         self.entries = entries
         self.calls: list[int] = []
         self.block: asyncio.Event | None = None  # hold the stream open after the last entry
+
+    @property
+    def queries(self) -> int:
+        """Each real ``AgentClient.attach`` issues two Queries (status, stream offset)."""
+        return 2 * len(self.calls)
 
     def client(self, *_a: Any) -> Any:
         script = self
@@ -157,6 +166,7 @@ class _RedisCase(unittest.IsolatedAsyncioTestCase):
         self.store = AgentStore(self.r, archive=self.archive)
         self.temporal = FakeTemporal()
         self.bridges: list[Bridge] = []
+        await self.store.set_owner("s", "alice")
         # Telemetry jobs need real history; covered by tests/test_agent_telemetry.py.
         p = mock.patch.object(agent_bridge.telemetry, "run_job", mock.AsyncMock(return_value=[]))
         p.start()
@@ -263,7 +273,6 @@ class ForwarderTests(_RedisCase):
         return b
 
     async def test_turn_is_stored_folded_registered_archived_and_acked_once(self) -> None:
-        await self.store.set_owner("s", "alice")
         script = Script(turn_script())
         await self.forward(script)
         frames = await self.store.read_from("s", 0)
@@ -422,10 +431,252 @@ class WakeAndStandbyTests(_RedisCase):
         await self.store.acquire_lease("s", "replica-a")
         b = self.bridge()
         b.ensure("s")
-        task = b._tasks["s"]
-        await asyncio.wait_for(task, timeout=2)
+        await asyncio.sleep(0.2)
         self.assertNotIn("s", b._tasks)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FixPassTests(_RedisCase):
+    """P2 deep review fix pass: one regression test per item."""
+
+    async def test_m1_backfill_pages_past_500_with_redis_gone_or_newer(self) -> None:
+        frames = []
+        for ro in range(1, 1201):
+            await self.store.append("s", "reply_delta", {"text": str(ro)}, ro, 0)
+        all_frames = await self.store.read_from("s", 0)
+        for i in range(0, 1100, 100):  # eleven archived turns, the last 100 frames only in Redis
+            await self.archive.put("s", all_frames[i:i + 100])
+
+        async def drain(after: str = "0-0") -> list[str]:
+            got: list[str] = []
+            while True:
+                page = await self.store.read_backfilled("s", after=after, count=500)
+                if not page:
+                    return got
+                got += [f.data["text"] for f in page]
+                after = page[-1].entry_id
+
+        # Redis rebuilt from a later position: archive first, then Redis, nothing skipped.
+        for f in all_frames[:1100]:
+            await self.r.xdel(self.store._k("s", "f"), f.entry_id)
+        self.assertEqual(await drain(), [str(i) for i in range(1, 1201)])
+        # Redis stream gone: everything the archive holds, past the 500 mark.
+        await self.r.delete(self.store._k("s", "f"))
+        self.assertEqual(await drain(), [str(i) for i in range(1, 1101)])
+
+    async def test_m1_archive_reads_objects_lazily(self) -> None:
+        for ro in range(1, 301):
+            await self.store.append("s", "e", {"n": ro}, ro, 0)
+        frames = await self.store.read_from("s", 0)
+        for i in range(0, 300, 50):
+            await self.archive.put("s", frames[i:i + 50])
+        backend = self.archive._backend
+        with mock.patch.object(backend, "get", wraps=backend.get) as get:
+            got = await self.archive.read("s", count=60)
+        self.assertEqual(len(got), 60)
+        self.assertEqual(get.await_count, 2)  # not all six objects
+
+    async def test_m3_idle_forwarder_stops_without_a_reader(self) -> None:
+        script = Script(turn_script(with_child=False))
+        b = self.bridge()
+        with mock.patch.object(agent_bridge, "AgentClient", script.client):
+            b.ensure("s")
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                if "s" not in b._tasks and script.calls:
+                    break
+        self.assertNotIn("s", b._tasks)
+        self.assertEqual(script.queries, 2)  # one attach, then stop
+        self.assertIsNone(await self.store.lease_holder("s"))
+
+    async def test_m3_idle_with_a_reader_uses_describe_not_queries(self) -> None:
+        script = Script(turn_script(with_child=False))
+        b = self.bridge()
+        with mock.patch.object(agent_bridge, "AgentClient", script.client), \
+                mock.patch.object(agent_bridge, "IDLE_WATCH_SECONDS", 0.05), \
+                mock.patch.object(agent_bridge, "IDLE_WATCH_MAX_SECONDS", 0.1):
+            async with b.reading("s"):
+                await asyncio.sleep(1.5)
+                self.assertEqual(script.queries, 2)  # idle: no re-attach, so no Queries
+                self.assertGreater(self.temporal.describes, 3)
+                self.temporal.history_length += 5  # work started elsewhere
+                for _ in range(40):
+                    await asyncio.sleep(0.05)
+                    if len(script.calls) > 1:
+                        break
+                self.assertEqual(script.queries, 4)
+
+    async def test_m5_ack_waits_for_the_archive_and_runs_serially(self) -> None:
+        b = self.bridge()
+        await self.store.acquire_lease("s", b.holder)
+        fwd = _Forwarder(b, "s")
+        with mock.patch.object(agent_bridge, "AgentClient", Script(turn_script(False)).client), \
+                mock.patch.object(self.archive, "put", mock.AsyncMock(side_effect=OSError("disk full"))):
+            with self.assertLogs("simple_chat_agent.api.agent_bridge", "WARNING") as logs:
+                await fwd._forward_once()
+                await fwd._settle()
+                await fwd._settle()
+        self.assertIn("2 in a row", "\n".join(logs.output))
+        self.assertEqual([x for x in self.temporal.signals if x[1] == "stream_acked"], [])
+        self.assertEqual((await self.store.meta("s")).acked, 0)
+        # The archive recovers: both runs at once still archive once and ack once.
+        with mock.patch.object(self.archive, "put", wraps=self.archive.put) as put:
+            await asyncio.gather(fwd._archive_and_ack(), fwd._archive_and_ack())
+        self.assertEqual(put.await_count, 1)
+        self.assertEqual([x[2].offset for x in self.temporal.signals if x[1] == "stream_acked"], [7])
+
+    async def test_b1_confirming_from_turn_end_until_confirmed(self) -> None:
+        release = asyncio.Event()
+        seen: list[bool] = []
+
+        async def slow_job(*_a: Any) -> list:
+            seen.append((await self.store.meta("s")).confirming)
+            await release.wait()
+            return []
+
+        b = self.bridge()
+        await self.store.acquire_lease("s", b.holder)
+        fwd = _Forwarder(b, "s")
+        with mock.patch.object(agent_bridge.telemetry, "run_job", slow_job), \
+                mock.patch.object(agent_bridge, "AgentClient", Script(turn_script(False)).client):
+            await fwd._forward_once()
+            meta = await self.store.meta("s")
+            self.assertFalse(meta.turn_active)
+            self.assertTrue(meta.confirming)
+            release.set()
+            await fwd._settle()
+        self.assertTrue(seen[-1])
+        self.assertFalse((await self.store.meta("s")).confirming)
+
+    async def test_b1_confirming_is_bounded(self) -> None:
+        async def never(*_a: Any) -> list:
+            await asyncio.Event().wait()
+            return []
+
+        b = self.bridge()
+        await self.store.acquire_lease("s", b.holder)
+        fwd = _Forwarder(b, "s")
+        with mock.patch.object(agent_bridge.telemetry, "run_job", never), \
+                mock.patch.object(agent_bridge, "CONFIRM_TIMEOUT_SECONDS", 0.3), \
+                mock.patch.object(agent_bridge, "AgentClient", Script(turn_script(False)).client):
+            await fwd._forward_once()
+            await asyncio.sleep(0.6)
+            await fwd._settle()
+        self.assertFalse((await self.store.meta("s")).confirming)
+        self.assertEqual(len([x for x in self.temporal.signals if x[1] == "stream_acked"]), 1)
+
+    async def test_minor1_subagent_ids_act_on_the_root(self) -> None:
+        await self.store.register_subagent("child-wf-1", "s", agent_id=CHILD)
+        script = Script(turn_script(with_child=False))
+        script.block = asyncio.Event()
+        b = self.bridge()
+        with mock.patch.object(agent_bridge, "AgentClient", script.client):
+            b.ensure("child-wf-1")
+            b.ensure("nobody")  # no ownership record: ignored
+            for _ in range(40):
+                await asyncio.sleep(0.05)
+                if b.is_forwarding("s"):
+                    break
+            self.assertTrue(b.is_forwarding("s"))
+            self.assertEqual(set(b._tasks), {"s"})
+            self.assertEqual(await b.root("child-wf-1"), "s")
+            script.block.set()
+        self.assertEqual(await self.store.agent_id_of("child-wf-1"), CHILD)
+
+    async def test_minor1_read_agent_filters_the_root_stream(self) -> None:
+        b = self.bridge()
+        await self.store.acquire_lease("s", b.holder)
+        with mock.patch.object(agent_bridge, "AgentClient", Script(turn_script()).client):
+            await _Forwarder(b, "s")._forward_once()
+        frames, cursor = await self.store.read_agent("s", CHILD, after="0-0", count=2)
+        self.assertEqual([f.event for f in frames], ["turn_started", "reply_delta"])
+        rest, _ = await self.store.read_agent("s", CHILD, after=cursor)
+        self.assertEqual([f.event for f in rest], ["turn_end"])
+        self.assertEqual(await self.store.agent_id_of("child-wf-1"), CHILD)
+
+    async def test_minor9_identical_child_frames_both_survive_takeover(self) -> None:
+        same = item(ReplyDelta(text="ok"), agent=CHILD, turn="ct", ts=5000.0)
+        entries = turn_script()
+        entries = entries[:9] + [(same, 7), (same, 7)] + entries[9:]
+        await self.forward_partial(entries, 10)  # the first copy stored, then the holder dies
+        await self.r.delete(self.store._k("s", "lease"))
+        b = self.bridge()
+        await self.store.acquire_lease("s", b.holder)
+        with mock.patch.object(agent_bridge, "AgentClient", Script(entries).client):
+            await _Forwarder(b, "s")._forward_once()
+        stored = [f for f in await self.store.read_from("s", 0) if not f.event.startswith("x_")]
+        self.assertEqual(len(stored), len(entries))
+        self.assertEqual(len([f for f in stored if f.data.get("text") == "ok"]), 2)
+
+    async def forward_partial(self, entries: list, n: int) -> None:
+        b = self.bridge()
+        await self.store.acquire_lease("s", b.holder)
+        with mock.patch.object(agent_bridge, "AgentClient", Script(entries[:n]).client):
+            await _Forwarder(b, "s")._forward_once()
+
+    async def test_minor10_no_worker_checks_while_awaiting_a_human(self) -> None:
+        b = self.bridge()
+        fwd = _Forwarder(b, "s")
+        fwd.turn_active = True
+        fwd.last_frame_at = time.monotonic() - 100
+        fwd.tel.awaiting["root"] = {"tool-1"}
+        check = mock.AsyncMock()
+        with mock.patch.object(agent_bridge.telemetry, "check_health", check), \
+                mock.patch.object(agent_bridge, "WORKER_SILENCE_SECONDS", 0.0):
+            task = asyncio.create_task(fwd._watch_workers())
+            await asyncio.sleep(2.5)
+            self.assertEqual(check.await_count, 0)
+            # Approval resolved but still silent: checks resume, backing off.
+            fwd.tel.awaiting.clear()
+            check.return_value = SimpleNamespace(state="ok", reason="", pollers=1, tool_retries=[])
+            with mock.patch.object(agent_bridge, "WORKER_CHECK_EVERY_SECONDS", 1.0):
+                await asyncio.sleep(4.5)
+            await agent_bridge._stop(task)
+        self.assertLessEqual(check.await_count, 3)  # ~t+1, +2 (x2), not every second
+        self.assertGreaterEqual(check.await_count, 1)
+
+
+class StoreAdditionsTests(_RedisCase):
+    """Fix pass additions for Eng F's guarded fallbacks."""
+
+    async def test_mark_closed_survives_a_bridge_meta_write(self) -> None:
+        stale = await self.store.meta("s")  # the bridge's in-memory copy, not closed
+        await self.store.mark_closed("s")
+        await self.store.save_meta("s", stale)  # the bridge rewrites the meta JSON
+        self.assertTrue((await self.store.meta("s")).closed)
+
+    async def test_claim_owner_is_set_nx(self) -> None:
+        self.assertTrue(await self.store.claim_owner("new", "alice"))
+        self.assertFalse(await self.store.claim_owner("new", "bob"))
+        self.assertEqual(await self.store.owner_of("new"), "alice")
+        self.assertEqual(await self.store.root_of("new"), "new")
+
+    async def test_metas_in_one_pipeline(self) -> None:
+        meta = SessionMeta(turn_active=True, current_turn=3)
+        await self.store.save_meta("a", meta, pending_added="m1")
+        await self.store.mark_closed("b")
+        in_order = await self.store.metas(["a", "b", "missing"])
+        self.assertEqual([m.closed for m in in_order], [False, True, False])
+        got = await self.store.metas_by_id(["a", "b", "missing"])
+        self.assertEqual(list(got), ["a", "b", "missing"])
+        self.assertTrue(got["a"].turn_active)
+        self.assertEqual(got["a"].pending, {"m1"})
+        self.assertTrue(got["b"].closed)
+        self.assertEqual(await self.store.metas([]), [])
+        with mock.patch.object(self.r, "pipeline", wraps=self.r.pipeline) as pipeline:
+            await self.store.metas(["a", "b", "c", "d"])
+        self.assertEqual(pipeline.call_count, 1)
+
+    async def test_subagent_agent_id_uses_the_routes_cache_key(self) -> None:
+        from simple_chat_agent.api.agent_routes import _subagent_key
+
+        await self.store.register_subagent("kid", "s", agent_id="root-k1")
+        self.assertEqual(await self.r.get(_subagent_key("kid")), "root-k1")
+        self.assertEqual(await self.store.agent_id_of("kid"), "root-k1")
+
+    def test_confirming_field_name(self) -> None:
+        self.assertIn("confirming", SessionMeta.__dataclass_fields__)
+        self.assertIs(SessionMeta().confirming, False)

@@ -102,7 +102,8 @@ class FrontDoorTests(unittest.IsolatedAsyncioTestCase):
         await self.server_task
 
     def h(self, user: str) -> dict:
-        return {"X-Test-User": user}
+        # X-Requested-With satisfies the API's CSRF gate on state-changing routes.
+        return {"X-Test-User": user, "X-Requested-With": "test"}
 
     async def test_workers_down_sends_land_and_apply_once(self) -> None:
         # No worker is running. Create a session and send a message.

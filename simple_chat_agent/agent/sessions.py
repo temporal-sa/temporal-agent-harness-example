@@ -2,9 +2,10 @@
 
 Holds the user's session list, titles and settings. It never starts or parents sessions:
 the API starts each CodingAgent directly, so new sessions always run on the current worker
-version, and records it here with an Update. The API mirrors the list into Redis, so
-browsers never Query this workflow. It continues as new on Temporal's suggestion, on a
-deployment version change, or on the idle timer.
+version, and records it here with a Signal (signal-with-start, so it lands while workers are
+down). The API mirrors the list into Redis, so browsers never Query this workflow. It
+continues as new on Temporal's suggestion, on a deployment version change (checked at least
+hourly by the idle timer), or on the operator's `compact` Update.
 """
 
 from __future__ import annotations

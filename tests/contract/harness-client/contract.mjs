@@ -24,8 +24,12 @@ if (!base) {
   process.exit(2);
 }
 const LOGIN = process.env.CONTRACT_LOGIN ?? "";
+// The API's CSRF gate admits a state-changing request with a same-origin Origin or this
+// custom header; Node's fetch sends no Origin, so the script identifies itself as a script
+// (a browser on our own origin passes on Origin instead).
+const SCRIPT = { "X-Requested-With": "harness-contract" };
 // Set in main(): the dev app's test header, or the real app's session cookie.
-let USER = { "X-Test-User": "alice" };
+let USER = { "X-Test-User": "alice", ...SCRIPT };
 const TIMEOUT_MS = Number(process.env.CONTRACT_TIMEOUT_MS ?? 240_000);
 
 const summary = { ok: false, checks: {}, session_id: null };
@@ -89,7 +93,7 @@ async function expectHttpError(what, promise, status, code) {
 
 async function main() {
   summary.mode = LOGIN ? "real-app-local-login" : "dev-app";
-  if (LOGIN) USER = await login();
+  if (LOGIN) USER = { ...(await login()), ...SCRIPT };
 
   // 1. Create and list the session through HttpTransport (the harness CreateSessionRequest).
   const transport = new HttpTransport({ baseUrl: `${base}/api/agent/`, headers: USER });
@@ -114,6 +118,12 @@ async function main() {
   const anonymous = new HttpTransport({ baseUrl: `${base}/api/agent/` });
   await expectHttpError("unauthenticated_401", anonymous.listSessions(), 401, "unauthorized");
   await expectHttpError("unknown_session_404", transport.agentStatus("coding-agent-0000000000000000"), 404, "not_found");
+  // Without the header (or a same-origin Origin), a state change is refused as cross-site.
+  const noHeader = new HttpTransport({
+    baseUrl: `${base}/api/agent/`,
+    headers: Object.fromEntries(Object.entries(USER).filter(([k]) => k !== "X-Requested-With"))
+  });
+  await expectHttpError("csrf_403", noHeader.closeSession(sessionId), 403, "forbidden");
   await expectHttpError(
     "unknown_agent_422",
     transport.createSession({ agent_workflow_type: "NoSuchAgent" }),

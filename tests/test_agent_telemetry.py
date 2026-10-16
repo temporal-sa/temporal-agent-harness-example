@@ -122,7 +122,7 @@ class HistoryParsingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(models[0].status, "completed")
         self.assertEqual(models[0].attempt, 1)
         self.assertTrue(models[0].identity)
-        self.assertFalse(models[0].retried_after_worker_loss)
+        self.assertEqual(models[0].cause, None)
         response = (await DataConverter.default.decode([models[0].result]))[0]
         self.assertEqual(t.usage_from_response(response)["cache_write_tokens"], 4470)
         tools = [r for r in records if r.kind == "tool"]
@@ -263,7 +263,8 @@ class ConfirmationTests(unittest.IsolatedAsyncioTestCase):
         rec = {d["kind"]: d for e, d in frames if e == t.X_RECOVERY}
         model = rec["model_call"]
         self.assertEqual(model["kept"], {"model_calls": 1, "tool_calls": 1, "tokens_in": 1000, "tokens_out": 50})
-        self.assertEqual(model["repeated"], {"model_calls": 1, "tool_calls": 0, "tokens_estimate": 1100 + 100})
+        # M8: the re-sent prompt only (no guessed output), and never part of "kept".
+        self.assertEqual(model["repeated"], {"model_calls": 1, "tool_calls": 0, "resent_input_tokens_estimate": 1100})
         self.assertEqual((model["lost_worker"], model["resumed_on"], model["cause"]), ("w-a", "w-b", "heartbeat_timeout"))
         self.assertTrue(model["confirmed"])
         self.assertFalse(model["retracted"])
@@ -316,6 +317,106 @@ class ConfirmationTests(unittest.IsolatedAsyncioTestCase):
             frames = await t.confirm_recovery(None, tel, turn, call)  # type: ignore[arg-type]
         self.assertEqual(len(frames), 1)
         self.assertTrue(frames[0][1]["confirmed"])
+
+
+class HonestyTests(unittest.IsolatedAsyncioTestCase):
+    """Fix pass item 6 (minor 8): only real worker losses are shown as recoveries."""
+
+    def turn(self, tel: t.Telemetry) -> t.Turn:
+        turn = t.Turn(agent_id="root", workflow_id="s", turn_id="t1", turn_number=1, started_ts=0.0,
+                      ended_ts=99.0, is_root=True)
+        tel.turns[turn.key] = turn
+        return turn
+
+    def test_worker_lost_rule(self) -> None:
+        self.assertTrue(t.worker_lost("heartbeat_timeout", None, None))
+        self.assertFalse(t.worker_lost("start_to_close_timeout", "w-a", "w-a"))
+        self.assertFalse(t.worker_lost("start_to_close_timeout", None, "w-a"))
+        self.assertTrue(t.worker_lost("start_to_close_timeout", "w-a", "w-b"))
+        self.assertTrue(t.worker_lost("application_error:X", "w-a", "w-b"))
+
+    async def _confirm(self, tel: t.Telemetry, records: list[t.ActivityRecord]) -> list[dict]:
+        with mock.patch.object(t, "HistoryReader", lambda client: FakeReader(records)):
+            frames = await t.confirm_turn(None, tel, self.turn(tel))  # type: ignore[arg-type]
+        return [d for e, d in frames if e == t.X_RECOVERY]
+
+    async def test_start_to_close_on_the_same_worker_is_a_slow_call_not_a_crash(self) -> None:
+        tel = t.Telemetry("s")
+        tel.note_pending("s", "1", 1, "w-b")  # the failed attempt ran where attempt 2 did
+        slow = Failure(timeout_failure_info=TimeoutFailureInfo(timeout_type=TimeoutType.TIMEOUT_TYPE_START_TO_CLOSE))
+        recovery = await self._confirm(tel, [record(1, MODEL, attempt=2, closed=3, failure=slow, result=response(10, 1))])
+        self.assertEqual(recovery, [])  # no live marker, nothing to show
+        tel = t.Telemetry("s")
+        turn = self.turn(tel)
+        turn.calls = [t.Call(index=0, message_id="m", model="c", started_pos=1, retries=1)]
+        with mock.patch.object(t, "HistoryReader", lambda client: FakeReader(
+                [record(1, MODEL, attempt=2, closed=3, failure=slow, result=response(10, 1))])):
+            frames = await t.confirm_turn(None, tel, turn)  # type: ignore[arg-type]
+        rec = [d for e, d in frames if e == t.X_RECOVERY][0]
+        self.assertTrue(rec["retracted"])  # the live marker is withdrawn
+        self.assertEqual(rec["cause"], "timeout")
+
+    async def test_start_to_close_after_a_worker_change_is_a_loss(self) -> None:
+        tel = t.Telemetry("s")
+        tel.note_pending("s", "1", 1, "w-a")
+        slow = Failure(timeout_failure_info=TimeoutFailureInfo(timeout_type=TimeoutType.TIMEOUT_TYPE_START_TO_CLOSE))
+        rec = (await self._confirm(tel, [record(1, MODEL, attempt=2, closed=3, failure=slow, result=response(10, 1))]))[0]
+        self.assertFalse(rec["retracted"])
+        self.assertEqual(rec["cause"], "start_to_close_timeout")
+        self.assertEqual(rec["lost_worker"], "w-a")
+
+    async def test_live_detection_skips_a_same_worker_timeout(self) -> None:
+        tel = t.Telemetry("s")
+        turn = self.turn(tel)
+        call = t.Call(index=0, message_id="m", model="c", started_pos=1, retries=1)
+        tel.note_pending("s", "7", 1, "w-a")
+        pa = PendingActivityInfo(activity_id="7", activity_type={"name": MODEL}, attempt=2,
+                                 state=PendingActivityState.PENDING_ACTIVITY_STATE_STARTED,
+                                 last_worker_identity="w-a",
+                                 last_failure=Failure(timeout_failure_info=TimeoutFailureInfo(
+                                     timeout_type=TimeoutType.TIMEOUT_TYPE_START_TO_CLOSE)))
+        client = FakeClient(DescribeWorkflowExecutionResponse(pending_activities=[pa]), [])
+        self.assertEqual(await t.detect_recovery(client, tel, turn, call), [])  # type: ignore[arg-type]
+
+    def test_tool_errors_are_not_kept_work(self) -> None:
+        tel = t.Telemetry("s")
+        for kind, data in [ev("turn_started"), ev("model_interaction_started"),
+                           ev("model_interaction_ended", usage={"input_tokens": 5, "output_tokens": 1}),
+                           ev("tool_end", tool_id="a", tool_name="x", tool_output="ok"),
+                           ev("tool_error", tool_id="b", tool_name="x", message="boom"),
+                           ev("model_interaction_started")]:
+            tel.observe(kind, data, 1, is_root=True)
+        turn = tel.turns[("root", "t1")]
+        self.assertEqual(tel.live_kept(turn, turn.calls[1])["tool_calls"], 1)
+
+    def test_kept_excludes_the_repeated_call(self) -> None:
+        records = [record(1, MODEL, closed=2), record(3, MODEL, attempt=2, closed=5, failure=heartbeat_failure())]
+        usages = {1: {"input_tokens": 100, "output_tokens": 10}, 3: {"input_tokens": 999, "output_tokens": 99}}
+        kept = t._kept_from_history(records, records[1], usages)
+        self.assertEqual((kept["model_calls"], kept["tokens_in"], kept["tokens_out"]), (1, 100, 10))
+
+
+class AwaitingAndBoundsTests(unittest.TestCase):
+    def test_pending_approval_and_callback_are_tracked(self) -> None:
+        """Fix pass item 8: the worker watch skips silence while a human or client is due."""
+        tel = t.Telemetry("s")
+        tel.observe(*ev("turn_started"), 1, is_root=True)
+        tel.observe(*ev("tool_approval_requested", tool_id="a", tool_name="x", tool_input={}), 2, is_root=True)
+        self.assertTrue(tel.awaiting_human)
+        tel.observe(*ev("tool_approval_resolved", tool_id="a", tool_name="x", approved=True), 3, is_root=True)
+        self.assertFalse(tel.awaiting_human)
+        tel.observe(*ev("callback_requested", tool_id="c", tool_name="y", tool_input={}, output_schema={}), 4, is_root=True)
+        self.assertTrue(tel.awaiting_human)
+        tel.observe(*ev("turn_end"), 5, is_root=True)
+        self.assertFalse(tel.awaiting_human)
+
+    def test_identities_are_bounded(self) -> None:
+        """Fix pass item 9 (minor 15)."""
+        tel = t.Telemetry("s")
+        with mock.patch.object(t, "IDENTITY_CAP", 3):
+            for i in range(5):
+                tel.note_pending("s", str(i), 1, f"w{i}")
+        self.assertEqual(list(tel.identities), [("s", "2", 1), ("s", "3", 1), ("s", "4", 1)])
 
 
 class FakeService:

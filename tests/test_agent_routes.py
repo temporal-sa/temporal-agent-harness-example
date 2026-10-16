@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import tempfile
 import unittest
 import uuid
+from pathlib import Path
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -79,7 +81,11 @@ class FakeHandle:
         pairs = [SearchAttributePair(OWNER_SEARCH_ATTRIBUTE, wf.owner)] if wf.owner is not None else []
         sa = TypedSearchAttributes(pairs)
         return SimpleNamespace(
-            workflow_type=wf.workflow_type, parent_id=wf.parent_id, typed_search_attributes=sa, status=wf.status
+            workflow_type=wf.workflow_type,
+            parent_id=wf.parent_id,
+            typed_search_attributes=sa,
+            status=wf.status,
+            start_time=None,
         )
 
     async def signal(self, name: str, arg: Any = None) -> None:
@@ -89,7 +95,15 @@ class FakeHandle:
 
     async def execute_update(self, name: str, arg: Any, **kwargs: Any) -> Any:
         self.client.updates.append((self.id, name, arg))
+        if self.client.update_error is not None:
+            raise self.client.update_error
         return []
+
+    async def query(self, name: str, **kwargs: Any) -> Any:
+        self.client.queries.append((self.id, name))
+        if self.id not in self.client.query_results:
+            raise not_found()
+        return self.client.query_results[self.id]
 
 
 class FakeTemporal:
@@ -100,12 +114,19 @@ class FakeTemporal:
         self.updates: list[tuple[str, str, Any]] = []
         self.describes: list[str] = []
         self.events: list[str] = []
+        self.update_error: Exception | None = None
+        self.queries: list[tuple[str, str]] = []
+        self.query_results: dict[str, Any] = {}
+        self.start_error: Exception | None = None
 
     def get_workflow_handle(self, workflow_id: str) -> FakeHandle:
         return FakeHandle(self, workflow_id)
 
     async def start_workflow(self, workflow: str, arg: Any = None, *, args: Any = None, id: str, **kwargs: Any) -> FakeHandle:
         self.events.append(f"start:{id}")
+        if self.start_error is not None and workflow == AGENT_WORKFLOW_TYPE:
+            error, self.start_error = self.start_error, None
+            raise error
         self.starts.append({"workflow": workflow, "id": id, "arg": arg, "args": args, **kwargs})
         exists = id in self.workflows
         if exists and kwargs.get("id_conflict_policy") != WorkflowIDConflictPolicy.USE_EXISTING:
@@ -186,7 +207,11 @@ class AgentRoutesTestBase(unittest.TestCase):
                 raise self.seed_error
             return SimpleNamespace(files=["a.py", "b.py"], commit="abc123")
 
+        self.read_log_error: Exception | None = None
+
         async def read_log(workspace_id: str, execution_id: str, **kwargs: Any) -> dict[str, Any]:
+            if self.read_log_error is not None:
+                raise self.read_log_error
             try:
                 return self.logs[(workspace_id, execution_id)]
             except KeyError:
@@ -225,6 +250,8 @@ class AgentRoutesTestBase(unittest.TestCase):
             raise HTTPException(status_code=401, detail="nope")
 
         self.client = TestClient(app)
+        # Our pages are same-origin: every state-changing request carries this Origin.
+        self.client.headers["Origin"] = "http://testserver"
         self.client.__enter__()
 
     def tearDown(self) -> None:
@@ -405,7 +432,7 @@ class ErrorBodyTests(AgentRoutesTestBase):
                 self.assertEqual(r.json()["error"], code)
                 self.assertIsInstance(r.json()["message"], str)
         self.assertEqual(self.temporal.starts, [])
-        r = self.client.post("/api/agent/sessions", content=b"not json", headers=A)
+        r = self.client.post("/api/agent/sessions", content=b"not json", headers={**A, "Content-Type": "application/json"})
         self.assertEqual(r.json()["error"], "invalid_request")
 
 
@@ -546,7 +573,8 @@ class BridgeIntegrationTests(AgentRoutesTestBase):
         self.store.read_backfilled = recording  # type: ignore[method-assign]
         r = self.client.get("/api/agent/attach", params={"session_id": sid, "from_offset": 3}, headers=A)
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(calls, [(sid, f"4-{2**64 - 1}")])
+        # Inclusive of the cursor position (B1): entry ids are resume_offset + 1.
+        self.assertEqual(calls, [(sid, f"3-{2**64 - 1}")])
 
     def test_status_passes_worker_through(self) -> None:
         from simple_chat_agent.api.agent_store import SessionMeta
@@ -858,6 +886,365 @@ class MainAppWiringTests(unittest.TestCase):
                 headers={"x-temporal-auth-subject": "sub-1", "x-temporal-auth-email": "a@example.com"},
             )
             self.assertEqual(r.status_code, 200, r.text)
+
+
+class ReviewFixTests(AgentRoutesTestBase):
+    """P2 deep review fix pass: one regression test (or more) per finding."""
+
+    sync_directory = True
+
+    def append(self, session: str, event: str, data: dict[str, Any], offset: int, seq: int) -> None:
+        self.run_async(self.store.append(session, event, data, offset, seq))
+
+    def events(self, response: Any) -> list[tuple[str, dict[str, Any]]]:
+        out = []
+        for block in response.text.split("\n\n"):
+            lines = dict(line.split(": ", 1) for line in block.splitlines() if ": " in line and not line.startswith(":"))
+            if "event" in lines:
+                out.append((lines["event"], json.loads(lines["data"])))
+        return out
+
+    # B1 -----------------------------------------------------------------------------
+
+    def test_b1_reattach_from_cursor_gets_telemetry_at_that_position(self) -> None:
+        sid = self.create()["workflow_id"]
+        self.append(sid, "turn_started", {"agent_id": "aaaaaa", "turn_number": 1}, 0, 0)
+        self.append(sid, "turn_end", {"agent_id": "aaaaaa", "turn_number": 1}, 1, 0)
+        r = self.client.get("/api/agent/attach", params={"session_id": sid}, headers=A)
+        last = self.events(r)[-1][1]["resume_offset"]
+        self.assertEqual(last, 1)
+        # The bridge confirms the turn's usage after turn_end, at the newest frame's position.
+        self.append(sid, "x_usage", {"agent_id": "aaaaaa", "confirmed": True}, 1, 1)
+        r = self.client.get("/api/agent/attach", params={"session_id": sid, "from_offset": last}, headers=A)
+        names = [e for e, _ in self.events(r)]
+        self.assertIn("x_usage", names)
+        self.assertEqual(names, ["turn_end", "x_usage"])  # inclusive of the cursor, nothing older
+
+    def test_b1_attach_stays_open_while_confirming(self) -> None:
+        sid = self.create()["workflow_id"]
+        calls = 0
+        original = self.store.meta
+
+        async def meta(session: str) -> Any:
+            nonlocal calls
+            calls += 1
+            m = await original(session)
+            if calls == 1:
+                m.confirming = True  # type: ignore[attr-defined]
+            return m
+
+        self.store.meta = meta  # type: ignore[method-assign]
+        self.client.get("/api/agent/attach", params={"session_id": sid}, headers=A)
+        self.assertGreaterEqual(calls, 2)  # didn't end on the first, still-confirming read
+
+    # M1 (store contract) ------------------------------------------------------------
+
+    def use_disk_archive(self) -> Any:
+        from simple_chat_agent.api.agent_store import FrameArchive, _DiskArchive
+
+        archive = FrameArchive(_DiskArchive(Path(self.tmp.name) / "archive"), "test-frames")
+        self.store.archive = archive
+        return archive
+
+    def archived(self, session: str, archive: Any, positions: range, per_object: int = 250) -> None:
+        from simple_chat_agent.api.agent_store import StoredFrame
+
+        frames = [StoredFrame("text_delta", {"agent_id": "aaaaaa", "n": i}, i, f"{i + 1}-0") for i in positions]
+        for i in range(0, len(frames), per_object):
+            self.run_async(archive.put(session, frames[i : i + per_object]))
+
+    def test_m1_attach_pages_through_more_than_500_archived_frames(self) -> None:
+        sid = self.create()["workflow_id"]
+        archive = self.use_disk_archive()
+        self.archived(sid, archive, range(1200))  # Redis holds no stream at all
+        r = self.client.get("/api/agent/attach", params={"session_id": sid}, headers=A)
+        ns = [d["n"] for _, d in self.events(r)]
+        self.assertEqual(ns, list(range(1200)))
+
+    def test_m1_archive_then_rebuilt_redis_stream(self) -> None:
+        sid = self.create()["workflow_id"]
+        archive = self.use_disk_archive()
+        self.archived(sid, archive, range(700))
+        for i in range(700, 800):  # Redis was rebuilt from a later position
+            self.append(sid, "text_delta", {"agent_id": "aaaaaa", "n": i}, i, 0)
+        r = self.client.get("/api/agent/attach", params={"session_id": sid, "from_offset": 99}, headers=A)
+        ns = [d["n"] for _, d in self.events(r)]
+        self.assertEqual(ns, list(range(99, 800)))  # inclusive of the cursor (B1)
+
+    def test_minor1_subagent_id_found_by_scan_is_registered(self) -> None:
+        root = self.create()["workflow_id"]
+        child = f"{root}-reviewer-1"
+        self.temporal.workflows[child] = FakeWorkflow("ReviewerAgent", parent_id=root)
+        self.append(root, "subagent_started", {"agent_id": "aaaaaa", "subagent_id": "aaaaaa-eeeeee", "workflow_id": child}, 0, 0)
+        self.client.get("/api/agent/attach", params={"session_id": child}, headers=A)
+        self.assertEqual(self.run_async(self.store.agent_id_of(child)), "aaaaaa-eeeeee")
+
+    # M2 -----------------------------------------------------------------------------
+
+    def ttl(self, key: str) -> int:
+        return self.run_async(self.redis.ttl(key))
+
+    def test_m2_list_get_rename_refresh_the_ttl(self) -> None:
+        sid = self.create()["workflow_id"]
+        index, records = self.directory._keys("alice")
+        for action in (
+            lambda: self.client.get("/api/agent/sessions", headers=A),
+            lambda: self.client.get(f"/api/agent/sessions/{sid}", headers=A),
+            lambda: self.client.post(f"/api/agent/sessions/{sid}/title", json={"title": "t"}, headers=A),
+        ):
+            self.run_async(self.redis.expire(index, 100))
+            self.run_async(self.redis.expire(records, 100))
+            self.assertEqual(action().status_code, 200)
+            self.assertGreater(self.ttl(index), 1000)
+            self.assertGreater(self.ttl(records), 1000)
+
+    def test_m2_rename_never_recreates_a_removed_record(self) -> None:
+        sid = self.create()["workflow_id"]
+        self.run_async(self.directory.remove("alice", sid))
+        self.assertIsNone(self.run_async(self.directory.rename("alice", sid, "ghost")))
+        _index, records = self.directory._keys("alice")
+        self.assertFalse(self.run_async(self.redis.hexists(records, sid)))
+
+    def test_m2_lost_list_is_rebuilt_from_coding_sessions(self) -> None:
+        from simple_chat_agent.agent.sessions import SessionRecord
+
+        manager = f"coding-sessions-{owner_digest('alice')}"
+        self.temporal.query_results[manager] = [
+            SessionRecord(session_id="coding-agent-a", title="older", model="openai:gpt-5.5", created_at="2026-10-01T00:00:00+00:00"),
+            SessionRecord(session_id="coding-agent-b", title="newer", model="", created_at="2026-10-02T00:00:00+00:00"),
+        ]
+        listed = self.client.get("/api/agent/sessions", headers=A).json()
+        self.assertEqual([s["workflow_id"] for s in listed], ["coding-agent-b", "coding-agent-a"])
+        self.assertEqual(listed[1]["model"], {"provider": "openai", "model": "gpt-5.5"})
+        self.assertEqual(self.temporal.queries, [(manager, "list_sessions")])
+        # A user with nothing to rebuild costs one Query per backoff window, not one per list.
+        self.client.get("/api/agent/sessions", headers=B)
+        self.client.get("/api/agent/sessions", headers=B)
+        self.assertEqual(len([q for q in self.temporal.queries if q[0] != manager]), 1)
+
+    # M4 -----------------------------------------------------------------------------
+
+    def harness_create(self, sid: str, headers: dict[str, str] = A, **data: Any) -> Any:
+        body = {"agent_workflow_type": AGENT_WORKFLOW_TYPE, "session_id": sid, "data": data}
+        return self.client.post("/api/agent/sessions", json=body, headers=headers)
+
+    def test_m4_retry_and_create_after_delete_never_reseed(self) -> None:
+        first = self.harness_create("demo-1", demo="refund_service").json()
+        wid = first["workflow_id"]
+        again = self.harness_create("demo-1", demo="refund_service")
+        self.assertEqual((again.status_code, again.json()["workflow_id"]), (200, wid))
+        self.client.delete(f"/api/agent/sessions/{wid}", headers=A)
+        self.temporal.workflows[wid].status = WorkflowExecutionStatus.COMPLETED
+        after = self.harness_create("demo-1", demo="refund_service")
+        self.assertEqual(after.status_code, 200, after.text)
+        self.assertEqual(after.json()["workflow_id"], wid)
+        self.assertTrue(after.json()["closed"])
+        self.assertEqual(self.seeds, [(wid, "refund_service")])
+        self.assertEqual(len([s for s in self.temporal.starts if s["id"] == wid]), 1)
+
+    def test_m4_retry_after_start_failure_does_not_reseed(self) -> None:
+        self.temporal.start_error = RPCError("unavailable", RPCStatusCode.UNAVAILABLE, b"")
+        with self.assertRaises(RPCError):
+            self.harness_create("demo-2", demo="refund_service")
+        r = self.harness_create("demo-2", demo="refund_service")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(len(self.seeds), 1)
+        self.assertEqual(r.json()["seed"]["fixture"], "refund_service")
+
+    # Minor 1 ------------------------------------------------------------------------
+
+    def test_minor1_subagent_attach_serves_the_root_stream_filtered(self) -> None:
+        root = self.create()["workflow_id"]
+        child = f"{root}-explorer-1"
+        self.temporal.workflows[child] = FakeWorkflow("ExplorerAgent", parent_id=root)
+        self.append(root, "turn_started", {"agent_id": "aaaaaa"}, 0, 0)
+        self.append(root, "subagent_started", {"agent_id": "aaaaaa", "subagent_id": "aaaaaa-bbbbbb", "workflow_id": child}, 1, 0)
+        self.append(root, "turn_started", {"agent_id": "aaaaaa-bbbbbb", "n": 1}, 1, 1)
+        self.append(root, "text_delta", {"agent_id": "aaaaaa-cccccc", "n": 2}, 1, 2)  # a sibling
+        self.append(root, "text_delta", {"agent_id": "aaaaaa-bbbbbb-dddddd", "n": 3}, 2, 0)  # its child
+        self.append(root, "turn_end", {"agent_id": "aaaaaa"}, 3, 0)
+        r = self.client.get("/api/agent/attach", params={"session_id": child}, headers=A)
+        got = [(e, d.get("n"), d["resume_offset"]) for e, d in self.events(r)]
+        self.assertEqual(got, [("turn_started", 1, 1), ("text_delta", 3, 2)])
+        # One reader: the root's forwarder, never the child's.
+        self.assertEqual(self.bridge.read, [root])
+        self.assertNotIn(child, self.bridge.ensured)
+
+    # Minor 2 ------------------------------------------------------------------------
+
+    def test_minor2_messages_to_a_subagent_are_refused(self) -> None:
+        root = self.create()["workflow_id"]
+        child = f"{root}-explorer-1"
+        self.temporal.workflows[child] = FakeWorkflow("ExplorerAgent", parent_id=root)
+        r = self.client.post(
+            "/api/agent/messages", json={"session_id": child, "message": {"type": "investigate", "payload": {}}}, headers=A
+        )
+        self.assertEqual((r.status_code, r.json()["error"]), (409, "not_supported"))
+        self.assertEqual(self.temporal.signals, [])
+        self.assertEqual(self.run_async(self.store.meta(child)).pending, set())
+
+    def test_minor2_subagent_approvals_use_the_childs_update(self) -> None:
+        from temporal_agent_harness.harness.agent_protocol import ToolApprovalDecision
+        from temporalio.client import WorkflowUpdateRPCTimeoutOrCancelledError
+
+        root = self.create()["workflow_id"]
+        child = f"{root}-explorer-1"
+        self.temporal.workflows[child] = FakeWorkflow("ExplorerAgent", parent_id=root)
+        body = {"session_id": child, "tool_id": "t1", "approved": True, "reason": "ok"}
+        r = self.client.post("/api/agent/approve", json=body, headers=A)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(
+            self.temporal.updates,
+            [(child, "tool_approval", ToolApprovalDecision(tool_id="t1", approved=True, reason="ok", remember=False))],
+        )
+        self.assertEqual(self.temporal.signals, [])  # no enqueue_approval to a child
+        self.assertEqual(self.bridge.woken, [root])
+        self.temporal.update_error = WorkflowUpdateRPCTimeoutOrCancelledError()
+        r = self.client.post("/api/agent/approve", json=body, headers=A)
+        self.assertEqual((r.status_code, r.json()["error"]), (503, "worker_unavailable"))
+
+    # Minor 4 ------------------------------------------------------------------------
+
+    def test_minor4_closed_reaches_the_session_list(self) -> None:
+        closed_one = self.create()["workflow_id"]
+        ended = self.create()["workflow_id"]
+        self.client.post(f"/api/agent/sessions/{closed_one}/close", headers=A)
+        self.temporal.workflows[ended].status = WorkflowExecutionStatus.TERMINATED
+        self.client.get(f"/api/agent/workflow-status/{ended}", headers=A)
+        listed = {s["workflow_id"]: s["closed"] for s in self.client.get("/api/agent/sessions", headers=A).json()}
+        self.assertEqual(listed, {closed_one: True, ended: True})
+        self.assertTrue(self.run_async(self.store.meta(closed_one)).closed)
+        self.assertTrue(self.run_async(self.store.meta(ended)).closed)
+        deleted = self.create()["workflow_id"]
+        self.client.delete(f"/api/agent/sessions/{deleted}", headers=A)
+        self.assertTrue(self.run_async(self.store.meta(deleted)).closed)
+
+    # Minor 5 (CSRF) -----------------------------------------------------------------
+
+    def test_minor5_cross_site_requests_are_refused(self) -> None:
+        sid = self.create()["workflow_id"]
+        evil = {**A, "Origin": "https://evil.example"}
+        cases = [
+            ("POST", "/messages", {"json": {"session_id": sid, "message": {"type": "chat", "payload": {}}}}),
+            ("POST", "/approve", {"json": {"session_id": sid, "tool_id": "t", "approved": True}}),
+            ("POST", f"/sessions/{sid}/close", {}),
+            ("DELETE", f"/sessions/{sid}", {}),
+            ("POST", "/sessions", {"json": {}}),
+            ("POST", f"/sessions/{sid}/attachments", {"files": {"file": ("a.txt", b"x", "text/plain")}}),
+        ]
+        for method, path, kwargs in cases:
+            with self.subTest(path=path):
+                r = self.client.request(method, f"/api/agent{path}", headers=evil, **kwargs)
+                self.assertEqual((r.status_code, r.json()["error"]), (403, "forbidden"))
+        # No Origin and no Referer (a non-browser client without the header): refused too.
+        r = self.client.post(f"/api/agent/sessions/{sid}/close", headers={**A, "Origin": ""})
+        self.assertEqual(r.status_code, 403)
+        # The classic cross-site form: text/plain "JSON" from another site.
+        form = self.client.post(
+            "/api/agent/messages",
+            content=b'{"session_id":"x","message":{}}',
+            headers={**A, "Origin": "null", "Content-Type": "text/plain"},
+        )
+        self.assertEqual(form.status_code, 403)
+        self.assertEqual(self.temporal.signals, [])
+        self.assertIn(sid, [s["workflow_id"] for s in self.client.get("/api/agent/sessions", headers=A).json()])
+
+    def test_minor5_same_origin_referer_header_and_public_url_pass(self) -> None:
+        sid = self.create()["workflow_id"]
+        for headers in (
+            {"Origin": "", "Referer": "http://testserver/app"},
+            {"Origin": "", "X-Requested-With": "harness-client"},
+        ):
+            r = self.client.post(f"/api/agent/sessions/{sid}/close", headers={**A, **headers})
+            self.assertEqual(r.status_code, 200, (headers, r.text))
+        with mock.patch.dict(os.environ, {"SIMPLE_CHAT_PUBLIC_URL": "https://agent.example.com"}):
+            r = self.client.post(f"/api/agent/sessions/{sid}/close", headers={**A, "Origin": "https://agent.example.com"})
+            self.assertEqual(r.status_code, 200)
+            r = self.client.post(f"/api/agent/sessions/{sid}/close", headers={**A, "Origin": "http://agent.example.com"})
+            self.assertEqual(r.status_code, 403)
+        # GETs are not gated.
+        self.assertEqual(self.client.get("/api/agent/sessions", headers={**A, "Origin": "https://evil.example"}).status_code, 200)
+
+    def test_minor5_json_routes_need_a_json_content_type(self) -> None:
+        sid = self.create()["workflow_id"]
+        for path, body in (
+            ("/sessions", b"{}"),
+            ("/messages", json.dumps({"session_id": sid, "message": {"type": "chat", "payload": {}}}).encode()),
+        ):
+            r = self.client.post(f"/api/agent{path}", content=body, headers={**A, "Content-Type": "text/plain"})
+            self.assertEqual((r.status_code, r.json()["error"]), (415, "unsupported_media_type"), path)
+
+    # Minor 6 ------------------------------------------------------------------------
+
+    def test_minor6_upload_size_is_bounded(self) -> None:
+        sid = self.create()["workflow_id"]
+        with mock.patch.object(agent_routes, "MAX_UPLOAD_BYTES", 10):
+            r = self.client.post(
+                f"/api/agent/sessions/{sid}/attachments", files={"file": ("a.txt", b"x" * 11, "text/plain")}, headers=A
+            )
+            self.assertEqual((r.status_code, r.json()["error"]), (413, "too_large"))
+        with mock.patch.object(agent_routes, "UPLOAD_ENVELOPE_BYTES", 0), mock.patch.object(agent_routes, "MAX_UPLOAD_BYTES", 10):
+            # Refused from Content-Length alone, before the multipart parser runs.
+            r = self.client.post(
+                f"/api/agent/sessions/{sid}/attachments", files={"file": ("a.txt", b"x", "text/plain")}, headers=A
+            )
+            self.assertEqual(r.status_code, 413)
+
+    # Minor 7 ------------------------------------------------------------------------
+
+    def test_minor7_owner_claim_is_nx(self) -> None:
+        taken = f"coding-agent-{'f' * 16}"
+        self.run_async(self.store.set_owner(taken, "bob"))
+        self.assertFalse(self.run_async(agent_routes.claim_owner(self.store, taken, "alice")))
+        self.assertEqual(self.run_async(self.store.owner_of(taken)), "bob")
+        with mock.patch.object(agent_routes.uuid, "uuid4", return_value=SimpleNamespace(hex="f" * 32)):
+            r = self.client.post("/api/agent/sessions", json={}, headers=A)
+        self.assertEqual((r.status_code, r.json()["error"]), (404, "not_found"))
+        self.assertEqual(self.run_async(self.store.owner_of(taken)), "bob")
+        self.assertNotIn(taken, [s["id"] for s in self.temporal.starts])
+
+    # Minor 11 -----------------------------------------------------------------------
+
+    def test_minor11_describe_misses_are_cached_briefly(self) -> None:
+        unknown = f"coding-agent-{uuid.uuid4().hex[:16]}"
+        for _ in range(3):
+            self.assertEqual(self.client.get(f"/api/agent/status/{unknown}", headers=A).status_code, 404)
+        self.assertEqual(self.temporal.describes.count(unknown), 1)
+        later = agent_routes.time.monotonic() + agent_routes.OWNER_MISS_TTL_SECONDS + 1
+        with mock.patch.object(agent_routes.time, "monotonic", return_value=later):
+            self.client.get(f"/api/agent/status/{unknown}", headers=A)
+        self.assertEqual(self.temporal.describes.count(unknown), 2)
+
+    # Minor 12 -----------------------------------------------------------------------
+
+    def test_minor12_internal_errors_are_not_echoed(self) -> None:
+        from simple_chat_agent.agent.tools.workspace import ExecutorRequestError
+
+        self.seed_error = RuntimeError("token=s3cret at 10.0.0.5")
+        with self.assertLogs(agent_routes.log, "ERROR"):
+            r = self.client.post("/api/agent/sessions", json={"demo": "refund_service"}, headers=A)
+        self.assertEqual(r.json()["error"], "seed_failed")
+        self.assertNotIn("s3cret", r.text)
+        self.seed_error = None
+        sid = self.create()["workflow_id"]
+
+        self.read_log_error = ExecutorRequestError("http://10.0.0.5:8083 said token=s3cret")
+        with self.assertLogs(agent_routes.log, "ERROR"):
+            r = self.client.get(f"/api/agent/sessions/{sid}/logs/boom", headers=A)
+        self.assertEqual(r.json()["error"], "executor_unavailable")
+        self.assertNotIn("s3cret", r.text)
+
+    # Minor 13 -----------------------------------------------------------------------
+
+    def test_minor13_list_reads_all_metas_in_one_round_trip(self) -> None:
+        ids = [self.create()["workflow_id"] for _ in range(3)]
+
+        async def no_single_meta(session: str) -> Any:
+            raise AssertionError("list must not read metas one by one")
+
+        self.store.meta = no_single_meta  # type: ignore[method-assign]
+        listed = self.client.get("/api/agent/sessions", headers=A).json()
+        self.assertEqual(sorted(s["workflow_id"] for s in listed), sorted(ids))
 
 
 if __name__ == "__main__":
