@@ -435,6 +435,8 @@ export interface CodingSession {
   /** When one model call ran (from the stream's timestamps), by its agent, message and its
    *  position among that message's model_interaction parts (0-based). */
   modelCallTiming(agentId: string, messageId: string, index: number): ModelCallTiming | undefined;
+  /** When a tool call started and ended (ms since epoch), from the stream's timestamps. */
+  toolTiming(toolId: string): { startedAt: number | null; endedAt: number | null } | undefined;
   /** A page of a command's stored output (S7), by the `log_ref` in its result. */
   readLog(logRef: string, options?: { offset?: number; stream?: "stdout" | "stderr" | "both" }): Promise<LogPage>;
   /** Upload a file to the session; mention it in the next message so the agent reads it. */

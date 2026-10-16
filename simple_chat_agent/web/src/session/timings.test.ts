@@ -28,3 +28,16 @@ describe("model call timing", () => {
     expect(folder.update([{ event: "model_interaction_started", data: { agent_id: "root" } }, { event: "x_usage", data: null }]).size).toBe(0);
   });
 });
+
+describe("tool timing", () => {
+  it("records each tool call's start and end", () => {
+    const folder = new TimingFolder();
+    folder.update([
+      { event: "tool_start", data: { agent_id: "root", message_id: "m1", tool_id: "t1", timestamp: 10 } },
+      { event: "tool_end", data: { agent_id: "root", message_id: "m1", tool_id: "t1", timestamp: 31.5 } },
+      { event: "tool_start", data: { agent_id: "root", message_id: "m1", tool_id: "t2", timestamp: 40 } },
+    ]);
+    expect(folder.tools.get("t1")).toEqual({ startedAt: 10_000, endedAt: 31_500 });
+    expect(folder.tools.get("t2")).toEqual({ startedAt: 40_000, endedAt: null });
+  });
+});

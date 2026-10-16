@@ -132,7 +132,7 @@ function ChatTurn({ message, recoveries }: { message: Message; recoveries: TurnR
   const { session } = useTranscript();
   const output = isObj(message.output) ? message.output : null;
   const live = message.status === "running" || message.status === "accepted";
-  const items = buildItems(message, { live, interrupted: output?.interrupted === true, recoveries });
+  const items = buildItems(message, { live, interrupted: output?.interrupted === true, recoveries, toolTiming: session.toolTiming });
   const hasText = items.some((i) => i.kind === "text");
   const finalText = typeof output?.text === "string" ? output.text : "";
   return (

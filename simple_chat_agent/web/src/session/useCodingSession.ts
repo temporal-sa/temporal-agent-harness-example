@@ -302,6 +302,7 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
     alwaysApproved: always,
 
     modelCallTiming: (agentId, messageId, index) => timings.get(timingKey(agentId, messageId))?.[index],
+    toolTiming: (toolId) => activeTimings.tools.get(toolId),
     readLog: (logRef, options) => readLog(sessionId, logRef, options),
     attach: (file) => uploadAttachment(sessionId, file),
 

@@ -63,3 +63,39 @@ describe("buildItems", () => {
     expect(items.filter((i) => i.kind === "text").map((i) => (i.kind === "text" ? i.streaming : null))).toEqual([false, true]);
   });
 });
+
+describe("recovery divider placement (PRD U6, Frame 3)", () => {
+  const rec = (over: Partial<TurnRecovery["recoveries"][number]> = {}, lostAt: number | null = 2_000): TurnRecovery =>
+    ({
+      turnId: "t1",
+      lostAt,
+      recoveries: [{ kind: "command_reattached", toolName: "workspace.run_command", lostAt, ...over }],
+    }) as unknown as TurnRecovery;
+
+  it("goes right after the row of the tool that was running when the Worker was lost", () => {
+    const first = tool("run_command", { toolId: "cmd-1", output: "$ pytest -q tests/test_refund.py\nexit 1 · 0.3s" });
+    const second = tool("run_command", { toolId: "cmd-2", output: "$ pytest -q\nexit 0 · 21.4s · reattached (attempt 2)" });
+    const commit = tool("git_commit", { toolId: "c" });
+    const times: Record<string, { startedAt: number; endedAt: number }> = {
+      "cmd-1": { startedAt: 100, endedAt: 400 },
+      "cmd-2": { startedAt: 1_000, endedAt: 25_000 },
+      c: { startedAt: 26_000, endedAt: 27_000 },
+    };
+    const parts = [call(), first, call(), tool("edit_file", { toolId: "e" }), second, call(), text("All 27 pass."), commit, call(), text("Committed.")];
+    const items = buildItems({ id: "m", parts }, { live: false, interrupted: false, recoveries: [rec()], toolTiming: (id) => times[id] });
+    const at = items.findIndex((i) => i.kind === "recovery");
+    expect(items[at - 1]).toMatchObject({ kind: "tool", part: { toolId: "cmd-2" } });
+    expect(items.slice(at + 1).some((i) => i.kind === "tool" && i.part.toolId === "c")).toBe(true);
+  });
+
+  it("without times, finds the reattached command; with nothing to anchor on, stays at the end", () => {
+    const a = tool("run_command", { toolId: "a", output: "$ x\nexit 1 · 1s" });
+    const b = tool("run_command", { toolId: "b", output: "$ y\nexit 0 · 9s · reattached (attempt 2)" });
+    const items = buildItems({ id: "m", parts: [call(), a, b, call(), text("done")] }, { live: false, interrupted: false, recoveries: [rec({}, null)] });
+    expect(items[items.findIndex((i) => i.kind === "recovery") - 1]).toMatchObject({ part: { toolId: "b" } });
+
+    const unknown = rec({ kind: "tool_call", toolName: "workspace.search_code" }, null);
+    const plain = buildItems({ id: "m", parts: [call(), a, call(), text("done")] }, { live: false, interrupted: false, recoveries: [unknown] });
+    expect(plain.map((i) => i.kind)).toEqual(["tool", "recovery", "text"]);
+  });
+});

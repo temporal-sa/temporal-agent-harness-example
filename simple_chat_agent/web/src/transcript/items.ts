@@ -53,6 +53,8 @@ export interface BuildOptions {
   interrupted: boolean;
   /** Recoveries in this message's turn (root agent). */
   recoveries?: readonly TurnRecovery[];
+  /** When each tool call ran, to find the row that was running when a Worker was lost. */
+  toolTiming?(toolId: string): { startedAt: number | null; endedAt: number | null } | undefined;
 }
 
 export function buildItems(message: Pick<Message, "id" | "parts">, options: BuildOptions): Item[] {
@@ -107,10 +109,16 @@ export function buildItems(message: Pick<Message, "id" | "parts">, options: Buil
   const tail = items[items.length - 1];
   if (options.live && tail?.kind === "text") tail.streaming = true;
 
-  // Recovery dividers: where the first lost attempt was, else before the final reply text.
+  // Recovery dividers go where the Worker was lost (PRD U6, wireframe Frame 3): right after
+  // the row of the tool that was running then; else where the first lost model attempt was;
+  // else before the final reply text.
   for (const recovery of options.recoveries ?? []) {
     const divider: Item = { kind: "recovery", key: `${message.id}:recovery:${recovery.turnId ?? ""}`, recovery };
-    if (firstLostAt >= 0) {
+    const toolId = lostToolId(recovery, message.parts, options.toolTiming);
+    const row = toolId ? items.findIndex((it) => (it.kind === "tool" && it.part.toolId === toolId) || (it.kind === "group" && it.parts.some((p) => p.toolId === toolId))) : -1;
+    if (row >= 0) {
+      items.splice(row + 1, 0, divider);
+    } else if (firstLostAt >= 0) {
       items.splice(firstLostAt, 0, divider);
     } else {
       let at = items.length;
@@ -119,6 +127,46 @@ export function buildItems(message: Pick<Message, "id" | "parts">, options: Buil
     }
   }
   return items;
+}
+
+/** "workspace.run_command" (an activity type) → "run_command" (the tool's name). */
+const bareToolName = (name: string) => name.slice(name.lastIndexOf(".") + 1);
+
+/**
+ * The tool call that was running when the Worker was lost: among the turn's calls of the
+ * recovery's tool, the one whose run spans the loss time (or, without times, the only one).
+ * Null when a recovery names no tool (a model call) or nothing matches.
+ */
+export function lostToolId(
+  recovery: TurnRecovery,
+  parts: Message["parts"],
+  timing?: (toolId: string) => { startedAt: number | null; endedAt: number | null } | undefined,
+): string | null {
+  const tools = (recovery.recoveries ?? []).filter((r) => r.toolName && r.kind !== "model_call");
+  if (tools.length === 0) return null;
+  const names = new Set(tools.map((r) => bareToolName(r.toolName!)));
+  const candidates = parts.filter((p): p is ToolPart => p.type === "tool" && names.has(p.toolName));
+  if (candidates.length === 0) return null;
+  const lostAt = recovery.lostAt ?? tools.find((r) => r.lostAt !== null)?.lostAt ?? null;
+  if (lostAt !== null && timing) {
+    const spanning = candidates.filter((p) => {
+      const t = timing(p.toolId);
+      return t?.startedAt != null && t.startedAt <= lostAt && (t.endedAt == null || t.endedAt >= lostAt);
+    });
+    if (spanning.length > 0) return spanning[spanning.length - 1]!.toolId;
+    // Started before the loss and the latest such: the run that was cut off.
+    const before = candidates.filter((p) => {
+      const t = timing(p.toolId);
+      return t?.startedAt != null && t.startedAt <= lostAt;
+    });
+    if (before.length > 0) return before[before.length - 1]!.toolId;
+  }
+  // A command that kept running and was reattached says so in its result.
+  if (tools.some((r) => r.kind === "command_reattached")) {
+    const reattached = candidates.filter((p) => / · reattached\b/.test(p.output ?? ""));
+    if (reattached.length > 0) return reattached[reattached.length - 1]!.toolId;
+  }
+  return candidates.length === 1 ? candidates[0]!.toolId : null;
 }
 
 function pushContent(items: Item[], parts: Message["parts"], key: string, live: boolean): void {
