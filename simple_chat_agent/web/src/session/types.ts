@@ -111,41 +111,12 @@ export interface AgentCatalog {
 }
 
 // -- observable state (simple_chat_agent/agent/state.py) ------------------------------------
-// Hand-written until Eng F's generated types land in web/src/generated/; then these become
-// re-exports of the generated ones.
+// Generated from the agent's JSON Schema by Eng F's `npm run gen` (web/src/generated).
 
-export type PlanStatus = "pending" | "in_progress" | "done" | "skipped";
-export interface PlanItem {
-  text: string;
-  status: PlanStatus;
-}
-export interface PlanState {
-  goal: string;
-  items: PlanItem[];
-}
-
-export type FileStatus = "added" | "modified" | "deleted" | "renamed";
-export interface ChangedFile {
-  path: string;
-  status: FileStatus;
-  added: number;
-  removed: number;
-  tool_id: string;
-}
-export interface Commit {
-  hash: string;
-  message: string;
-}
-export interface ChangesState {
-  files: ChangedFile[];
-  commits: Commit[];
-}
-
-export interface WorkspaceState {
-  last_command: string;
-  last_exit_code: number | null;
-  commands_run: number;
-}
+import type { ChangedFile, ChangesState, Commit, PlanItem, PlanState, WorkspaceState } from "../generated";
+export type { ChangedFile, ChangesState, Commit, PlanItem, PlanState, WorkspaceState };
+export type PlanStatus = PlanItem["status"];
+export type FileStatus = ChangedFile["status"];
 
 // -- connection and status ------------------------------------------------------------------
 
