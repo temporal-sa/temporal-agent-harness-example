@@ -344,6 +344,35 @@ class CriteriaAndPostures(unittest.TestCase):
             )
         )
 
+    def test_sanitize_keeps_allowed_names_from_a_carried_policy(self) -> None:
+        """N3: a policy carried across continue-as-new from a build where git_commit was
+        workspace_edit keeps the user's other "always allow" rules; only git_commit goes."""
+        carried = ToolApprovalPolicy.auto_mode(
+            pre_approved_tools=["git_commit", "write_file", *approvals.SUBAGENT_TOOL_NAMES],
+            pre_approve_inherently_safe=True,
+        )
+        cleaned = approvals.sanitize_caller_policy(carried, "catalog")
+        assert cleaned is not None
+        self.assertEqual(cleaned.auto_approve_tools, {"write_file", *approvals.SUBAGENT_TOOL_NAMES})
+        self.assertNotIn("git_commit", cleaned.auto_approve_tools)
+        # Posture-derived fields are untouched.
+        self.assertTrue(cleaned.auto_mode_enabled)
+        self.assertTrue(cleaned.auto_approve_inherently_safe)
+        self.assertFalse(cleaned.dangerously_skip_all_approvals)
+        # git_commit now reaches the gate (the judge, which escalates it in the catalog).
+        self.assertFalse(cleaned.auto_approves("git_commit", inherently_safe=False))
+        self.assertTrue(cleaned.consults_auto_mode("git_commit", inherently_safe=False))
+        self.assertTrue(cleaned.auto_approves("write_file", inherently_safe=False))
+        # trust_safe-shaped carried policy: same treatment, auto mode stays off.
+        trust = ToolApprovalPolicy.allow_tools(["git_commit", "edit_file"], also_inherently_safe=True)
+        cleaned_trust = approvals.sanitize_caller_policy(trust, "catalog")
+        assert cleaned_trust is not None
+        self.assertEqual(cleaned_trust.auto_approve_tools, {"edit_file"})
+        self.assertFalse(cleaned_trust.auto_mode_enabled)
+        self.assertTrue(cleaned_trust.auto_approve_inherently_safe)
+        # Locally nothing is removed.
+        self.assertIs(approvals.sanitize_caller_policy(carried, "local"), carried)
+
     def test_sanitize_caller_policy(self) -> None:
         sanitize = approvals.sanitize_caller_policy
         skip_all = ToolApprovalPolicy.dangerously_skip_all()
@@ -352,8 +381,14 @@ class CriteriaAndPostures(unittest.TestCase):
         unknown = ToolApprovalPolicy.allow_tools(["some_mcp_tool"])
         ok_edit = ToolApprovalPolicy.allow_tools(["edit_file", "write_file"], also_inherently_safe=True)
         ok_sub = ToolApprovalPolicy.auto_mode(pre_approved_tools=approvals.SUBAGENT_TOOL_NAMES)
-        for bad in (skip_all, risky, commit, unknown):
-            self.assertIsNone(sanitize(bad, "catalog"), bad)
+        self.assertIsNone(sanitize(skip_all, "catalog"))
+        # Disallowed names are removed; everything else is kept.
+        self.assertEqual(sanitize(risky, "catalog").auto_approve_tools, {"edit_file"})  # type: ignore[union-attr]
+        for bad in (commit, unknown):
+            cleaned = sanitize(bad, "catalog")
+            assert cleaned is not None
+            self.assertEqual(cleaned.auto_approve_tools, frozenset())
+            self.assertFalse(cleaned.auto_approves("git_commit", inherently_safe=False))
         for good in (
             ok_edit,
             ok_sub,
@@ -361,7 +396,7 @@ class CriteriaAndPostures(unittest.TestCase):
             ToolApprovalPolicy.allow_inherently_safe(),
         ):
             self.assertIs(sanitize(good, "catalog"), good)
-        for any_policy in (skip_all, risky, commit, ok_edit):
+        for any_policy in (skip_all, risky, commit, unknown, ok_edit):
             self.assertIs(sanitize(any_policy, "local"), any_policy)
         self.assertIsNone(sanitize(None, "catalog"))
         with self.assertRaises(ValueError):

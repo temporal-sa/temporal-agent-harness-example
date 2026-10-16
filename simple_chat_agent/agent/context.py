@@ -15,16 +15,18 @@ Algorithm (ported from ``agent_harness/sliding_window_context_manager.py``):
    dropped, except in the last unit, which is the request being sent now.
 3. Sliding window: above ``window`` messages, the oldest units are dropped down to
    ``window * window_low_water`` messages (hysteresis, so we don't edit the prefix and lose
-   the prompt cache on every request).
+   the prompt cache on every request). While a tool round is pending (the latest response
+   made tool calls) the window waits, up to ``2 x window``, so the edit lands at a user-turn
+   boundary and the pending round keeps its thinking block.
 4. Token budget: above the budget, the oldest units are dropped down to
    ``budget * token_low_water``; then the largest tool results become a JSON stub
    ``{"truncated": true, "original_chars": n, "preview": ...}``; then the largest text (model
    text, user prompts, tool-call arguments) is truncated.
 5. When messages were dropped, a compaction marker is appended to the head request. The
    marker carries the cumulative count, so re-applying the processor is a no-op.
-6. When anything was edited, Anthropic thinking blocks are removed: their signatures bind the
-   exact prefix that produced them, and accounts created on or after 2026-08-31 get a 400 for
-   replaying a block after an edit. Other providers' reasoning is left alone (OpenAI function
+6. When anything was edited, Anthropic thinking blocks are removed from every response,
+   including the latest: their signatures bind the exact prefix that produced them, and
+   accounts created on or after 2026-08-31 get a 400 for replaying a block after an edit. Other providers' reasoning is left alone (OpenAI function
    calls reference their reasoning item; Gemini signatures live on the call part itself).
 
 Always kept: the head request, the last unit (the current request), the unit holding the
@@ -91,6 +93,7 @@ DEFAULT_RESERVE_OUTPUT = 16_000  # model_registry.settings_for sets max_tokens=1
 DEFAULT_WINDOW = 40
 MAX_FILL = 0.85  # PRD A17: never fill more than 85% of the window (estimated)
 WINDOW_LOW_WATER = 0.5
+WINDOW_HARD_FACTOR = 2  # window limit while a tool round is pending
 TOKEN_LOW_WATER = 0.8
 PREVIEW_CHARS = 1_000
 MIN_TRUNCATE_CHARS = 512  # smaller items are left alone; a stub would not save anything
@@ -590,7 +593,15 @@ def fit_with(messages: Sequence[ModelMessage], budget: ContextBudget) -> list[Mo
     def message_count() -> int:
         return len(head) + sum(len(u) for i, u in enumerate(units) if alive[i])
 
-    if message_count() > budget.window:
+    # Anthropic guidance: don't compact in the middle of a tool round (the response whose tool
+    # calls are being answered should go back with its thinking intact). The window is a soft
+    # limit, so while a round is pending it waits for the next user turn, up to
+    # WINDOW_HARD_FACTOR x window. The token budget (step 3) is never deferred.
+    mid_round = bool(units) and any(
+        isinstance(p, ToolCallPart) and not isinstance(p, NativeToolCallPart) for p in units[-1][0].parts
+    )
+    limit = budget.window * (WINDOW_HARD_FACTOR if mid_round else 1)
+    if message_count() > limit:
         low = max(2, math.floor(budget.window * WINDOW_LOW_WATER))
         drop_oldest_until(lambda: message_count() <= low)
 
@@ -690,7 +701,13 @@ def fit_with(messages: Sequence[ModelMessage], budget: ContextBudget) -> list[Mo
         head = [_replace_parts(first, parts), *head[1:]]
     output = [*head, *output]
 
-    # 5. Edited history invalidates Anthropic thinking signatures: remove those blocks.
+    # 5. Edited history invalidates Anthropic thinking signatures: remove those blocks from
+    # every response, including the latest one. Each block's signature binds everything before
+    # it, so after an edit even the pending tool round's block is "bound to a different
+    # conversation": keeping it is a 400 under enforcement (verified live on Claude Sonnet 5.5
+    # with prefix_mismatch_behavior="error"), while a tool round without its thinking is
+    # accepted. To keep that block in the common case, the window edit is deferred while a tool
+    # round is pending (step 2).
     return [_strip_thinking(m) for m in output]
 
 

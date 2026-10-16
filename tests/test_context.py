@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace as dataclasses_replace
 import json
 import random
 import unittest
@@ -275,6 +276,63 @@ class WindowAndMarkerTests(InvariantMixin):
         self.assertTrue(any(isinstance(p, ThinkingPart) for m in untouched for p in m.parts))
         edited = fit_with(history, ContextBudget(max_input_tokens=1_000_000, window=10))
         self.assertFalse(any(isinstance(p, ThinkingPart) for m in edited for p in m.parts))
+
+    def _tool_loop(self, n_rounds: int, *, end_with_user_prompt: bool = False) -> list[ModelMessage]:
+        """A single long tool loop: every response thinks and calls one tool."""
+        rng = random.Random(99)
+        counter = [0]
+        history: list[ModelMessage] = [first_request()]
+        for _ in range(n_rounds):
+            resp = response(rng, 1, counter, thinking=True)
+            history += [resp, returns_for(rng, resp, max_chars=50)]
+        if end_with_user_prompt:
+            history += [
+                response(rng, 0, counter, thinking=True),
+                ModelRequest(parts=[UserPromptPart("next turn")], instructions="instructions", timestamp=T0),
+            ]
+        return history
+
+    def test_window_waits_while_a_tool_round_is_pending(self) -> None:
+        # 31 messages > window 20, but < 2 x window: the pending round keeps its thinking.
+        history = self._tool_loop(15)
+        budget = ContextBudget(max_input_tokens=1_000_000, window=20)
+        fitted = fit_with(history, budget)
+        self.assertEqual(fitted, history)
+        self.assertTrue(any(isinstance(p, ThinkingPart) for p in fitted[-2].parts))
+        self.assertEqual(fit_with(fitted, budget), fitted)
+
+    def test_window_applies_at_the_next_user_turn(self) -> None:
+        history = self._tool_loop(15, end_with_user_prompt=True)
+        fitted = fit_with(history, ContextBudget(max_input_tokens=1_000_000, window=20))
+        self.assert_invariants(fitted)
+        self.assertLessEqual(len(fitted), 20)
+        self.assertTrue(str(fitted[0].parts[-1].content).startswith(COMPACTION_MARKER_PREFIX))
+
+    def test_window_hard_limit_mid_round(self) -> None:
+        history = self._tool_loop(25)  # 51 messages > 2 x 20
+        fitted = fit_with(history, ContextBudget(max_input_tokens=1_000_000, window=20))
+        self.assert_invariants(fitted)
+        self.assertLessEqual(len(fitted), 20)
+
+    def test_edit_mid_tool_round_strips_thinking_from_the_pending_round_too(self) -> None:
+        # Regression for the review finding. After any edit, the pending round's thinking block is
+        # bound to a prefix that no longer exists. Live on Claude Sonnet 5.5 (adaptive thinking,
+        # prefix_mismatch_behavior="error"), keeping it gives a 400 "The block is bound to a
+        # different conversation ... Content before this block was rewritten"; sending the round
+        # without its thinking gives a 200. So nothing with an Anthropic signature survives an edit.
+        history = self._tool_loop(25)
+        fitted = fit_with(history, ContextBudget(max_input_tokens=1_000_000, window=20))
+        self.assertIsInstance(fitted[-2], ModelResponse)
+        self.assertEqual(call_ids(fitted[-2]), call_ids(history[-2]))  # the pending round is intact
+        self.assertFalse(any(isinstance(p, ThinkingPart) for m in fitted for p in m.parts))
+        # The token budget also edits mid-round and strips the same way.
+        big = [*history[:-1], ModelRequest(
+            parts=[dataclasses_replace(p, content="r" * 400_000) for p in history[-1].parts],
+            instructions="instructions", timestamp=T0,
+        )]
+        fitted = fit_with(big, ContextBudget(max_input_tokens=50_000, reserve_output_tokens=2_000, safety_margin=1_000, window=1_000))
+        self.assert_invariants(fitted)
+        self.assertFalse(any(isinstance(p, ThinkingPart) for m in fitted for p in m.parts))
 
     def test_other_providers_keep_reasoning(self) -> None:
         history = random_history(5, steps=30, max_chars=50)

@@ -331,21 +331,30 @@ def catalog_may_preallow(tool_name: str) -> bool:
 def sanitize_caller_policy(
     policy: ToolApprovalPolicy | None, environment: Environment
 ) -> ToolApprovalPolicy | None:
-    """Vet a caller-supplied ``AgentConfig.approval_policy`` (P1 review, minor 2).
+    """Vet a caller-supplied ``AgentConfig.approval_policy`` (P1 review, minor 2; N3).
 
-    Locally it is returned unchanged. In the catalog it is rejected (``None``: fall back to
-    the posture default) when it skips all approvals, or when its allow-list names any tool
-    outside the ``workspace_edit`` class and :data:`SUBAGENT_TOOL_NAMES`. Auto mode and the
-    inherently-safe switch are allowed; they cannot widen what the evaluator may approve.
+    Locally it is returned unchanged. In the catalog:
+
+    * a policy that skips all approvals is rejected (``None``: fall back to the posture
+      default);
+    * otherwise only the disallowed names are REMOVED from its allow-list, keeping every
+      other field and every permitted name. A policy carried across continue-as-new from an
+      older build can hold names that are no longer allowed (``git_commit`` used to be
+      ``workspace_edit``), and the user's other "always allow" rules must survive that.
+
+    Permitted names are the ``workspace_edit`` class and :data:`SUBAGENT_TOOL_NAMES`. Auto
+    mode and the inherently-safe switch are kept; they cannot widen what the evaluator may
+    approve. Returns the same object when nothing had to change.
     """
     _check_environment(environment)
     if policy is None or environment == "local":
         return policy
     if policy.dangerously_skip_all_approvals:
         return None
-    if not all(catalog_may_preallow(name) for name in policy.auto_approve_tools):
-        return None
-    return policy
+    kept = frozenset(name for name in policy.auto_approve_tools if catalog_may_preallow(name))
+    if kept == policy.auto_approve_tools:
+        return policy
+    return policy.with_changes(auto_approve_tools=kept)
 
 
 # ---------------------------------------------------------------------------

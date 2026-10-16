@@ -85,7 +85,7 @@ class CodingAgentInit(BaseModel):
     # Research tools this session may offer, decided once by whoever starts the session
     # (from its configured backends) and carried as data, so replay never depends on a
     # worker's environment.
-    research_tools: list[str] = Field(default_factory=list)
+    research_tools: list[str] = Field(default_factory=lambda: ["fetch_url"])
     workspace_id: str = ""
     depth: int = 0
     system_prompt: str | None = None

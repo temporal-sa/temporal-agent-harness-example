@@ -200,7 +200,9 @@ class CodingAgent:
                 loop.result()
                 return
             if self._ready_to_continue_as_new():
-                await self._continue_as_new(config, data)
+                # self._data, not the run argument: it holds changes made during this run
+                # (e.g. the posture the user switched to).
+                await self._continue_as_new(config, self._data)
 
     def _wants_continue_as_new(self) -> bool:
         info = workflow.info()

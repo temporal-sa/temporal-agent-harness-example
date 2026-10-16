@@ -242,6 +242,59 @@ class SandboxEnvTests(unittest.TestCase):
         self.assertEqual(ex._sandbox_env()["GIT_AUTHOR_NAME"], "Coding Agent")
 
 
+class BusyMessageTests(unittest.TestCase):
+    def test_message_matches_what_holds_the_workspace(self) -> None:
+        # N7.
+        def job(state: str, execution_id: str) -> Any:
+            j = ex._Job(workspace_key="k", execution_id=execution_id, fingerprint="f")
+            j.state = state  # type: ignore[assignment]
+            return j
+
+        cases = [
+            ([], "Another file change is in progress"),
+            ([job("queued", "q1")], "1 command is queued in the workspace"),
+            ([job("queued", "q1"), job("queued", "q2")], "2 commands are queued"),
+            ([job("running", "r"), job("queued", "q1")], "A command is running in the workspace and 1 more is queued"),
+        ]
+        for jobs, expected in cases:
+            with self.subTest(expected), patch.object(ex, "_jobs", {("k", j.execution_id): j for j in jobs}):
+                message = ex._busy_message("k")
+                self.assertIn(expected, message)
+                self.assertIn("nothing was written", message)
+        with patch.object(ex, "_jobs", {("other", "r"): job("running", "r")}):
+            self.assertIn("Another file change", ex._busy_message("k"))
+
+
+class GitHardeningUnitTests(unittest.TestCase):
+    def test_git_version_self_test(self) -> None:
+        import subprocess as sp
+
+        for output, ok in (("git version 2.39.5\n", False), ("git version 2.40.0\n", True),
+                           ("git version 2.47.3\n", True), ("garbage", False)):
+            with self.subTest(output), patch.object(ex.shutil, "which", return_value="/usr/bin/git"), \
+                    patch.object(ex.subprocess, "run", return_value=sp.CompletedProcess([], 0, output, "")):
+                error = ex._git_version_self_test()
+                self.assertEqual(error is None, ok, error)
+        with patch.object(ex.shutil, "which", return_value=None):
+            self.assertIn("not installed", ex._git_version_self_test() or "")
+
+    def test_overrides_use_git_config_count_not_dash_c(self) -> None:
+        prelude = ws.GIT_PRELUDE
+        self.assertNotIn(" -c ", prelude)
+        self.assertIn(f"GIT_CONFIG_COUNT={len(ws.GIT_CONFIG_OVERRIDES)}", prelude)
+        keys = dict(ws.GIT_CONFIG_OVERRIDES)
+        for key, value in (("maintenance.auto", "false"), ("gc.auto", "0"), ("core.fsmonitor", "false"),
+                           ("core.hooksPath", "/dev/null"), ("commit.gpgsign", "false")):
+            self.assertEqual(keys[key], value)
+        for command in (ws.git_status_command(), ws.git_diff_command(None, False), ws.git_commit_command(True)):
+            self.assertTrue(command.startswith(prelude))
+            self.assertIn("safe_git_preflight", command)
+
+    def test_sandbox_env_keeps_xdg_config_out_of_the_workspace(self) -> None:
+        # N5.
+        self.assertFalse(ex._sandbox_env()["XDG_CONFIG_HOME"].startswith("/workspace"))
+
+
 class ToolDeclarationTests(unittest.TestCase):
     def test_exports(self) -> None:
         names = [tool.__name__ for tool in ws.WORKSPACE_TOOLS]
@@ -286,29 +339,55 @@ def _stub_sandbox_command(request: ex.ExecuteRequest, workspace_dir: Path) -> li
             "bash", "--noprofile", "--norc", "-o", "pipefail", "-c", script]
 
 
-# B1: a repo that plants filter drivers every way the reviewer found (and one more):
-# $HOME/.gitconfig + .gitattributes, .git/config + .gitattributes, .git/config +
-# .git/info/attributes, and a long-running `process` filter. Each one appends its name to
-# .git/PWNED when git runs it.
-PLANT_GIT_FILTERS = r"""
+# B1 scenarios. Each planted program appends a word to .git/PWNED when git runs it.
+GIT_BASE_REPO = r"""
 set -e
 git init -q -b main
-git config -f .gitconfig filter.home.clean 'sh -c "echo home >> .git/PWNED; cat"'
+for f in a b c d; do echo 1 > $f.txt; done
+git add -A
+git commit -q --no-verify -m init
+for f in a b c d; do echo 2 > $f.txt; done
+"""
+# Repo config filters chosen by .gitattributes and by .git/info/attributes, including a
+# long-running `process` filter.
+PLANT_REPO_FILTERS = r"""
 git config filter.repo.clean 'sh -c "echo repo >> .git/PWNED; cat"'
 git config filter.info.clean 'sh -c "echo info >> .git/PWNED; cat"'
 git config filter.proc.process 'sh -c "echo proc >> .git/PWNED; cat"'
-printf 'a.txt filter=home\nb.txt filter=repo\n' > .gitattributes
+printf 'b.txt filter=repo\n' > .gitattributes
 mkdir -p .git/info
 printf 'c.txt filter=info\nd.txt filter=proc\n' > .git/info/attributes
-for f in a b c d; do echo 1 > $f.txt; done
-HOME=/nonexistent git add -A >/dev/null 2>&1 || true
-HOME=/nonexistent git -c filter.proc.process= commit -q --no-verify -m init >/dev/null 2>&1 || true
-sleep 1
-for f in a b c d; do echo 2 > $f.txt; done
-rm -f .git/PWNED
 """
-# Plain git in the sandbox (HOME is the workspace): proves the planted filters are live.
-CONTROL_GIT = "git status --porcelain >/dev/null 2>&1; git diff >/dev/null 2>&1; cat .git/PWNED; rm -f .git/PWNED"
+# N1: a driver name containing "=" (defeated `-c filter.<name>.clean=` overrides).
+PLANT_EQUALS_FILTER = r"""
+git config 'filter.a=b.clean' 'sh -c "echo equals >> .git/PWNED; cat"'
+mkdir -p .git/info
+printf '* filter=a=b\n' > .git/info/attributes
+"""
+# N2: a gc hook, run by `git commit` -> `git maintenance run --auto` -> gc.
+PLANT_GC_HOOK = r"""
+git config gc.auto 1
+git config gc.recentObjectsHook 'sh -c "echo gc >> .git/PWNED"'
+"""
+PLANT_INCLUDES = r"""
+printf '[filter "inc"]\n\tclean = "sh -c \\"echo inc >> .git/PWNED; cat\\""\n' > evil.cfg
+git config include.path ../evil.cfg
+git config 'includeIf.gitdir:/.path' ../evil.cfg
+"""
+# $HOME/.gitconfig (HOME is /workspace in the sandbox) + .gitattributes.
+PLANT_HOME_FILTER = r"""
+git config -f .gitconfig filter.home.clean 'sh -c "echo home >> .git/PWNED; cat"'
+printf 'a.txt filter=home\n' > .gitattributes
+"""
+# N5: git's XDG global config under the workspace.
+PLANT_XDG_FILTER = r"""
+mkdir -p .config/git
+git config -f .config/git/config filter.xdg.clean 'sh -c "echo xdg >> .git/PWNED; cat"'
+printf 'a.txt filter=xdg\n' > .config/git/attributes
+"""
+# Runs every applicable clean filter deterministically (no index state involved).
+HASH_ALL = "for f in a b c d; do git hash-object --path=$f.txt $f.txt >/dev/null 2>&1; done; true"
+PWNED = "cat .git/PWNED 2>/dev/null; rm -f .git/PWNED; true"
 
 
 class _ExecutorEnv:
@@ -915,33 +994,128 @@ class ExecToolsTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
         nothing = await self.call(ws.git_commit, "noop", "ws-1", False)
         self.assertFalse(nothing.committed)
 
-    @unittest.skipUnless(__import__("shutil").which("git"), "git not installed")
-    async def test_git_tools_never_run_workspace_filter_drivers(self) -> None:
-        # B1 regression: status/diff/commit are approved without a shell review, so they
-        # must not run filters planted via .gitconfig, .git/config, .gitattributes or
-        # .git/info/attributes.
-        # The server thread owns the executor; run setup through it like any client.
-        result, _ = await ws._stream_execute(
-            {"workspace_id": "ws-1", "execution_id": f"plant:{uuid.uuid4().hex}",
-             "command": PLANT_GIT_FILTERS, "cwd": "/workspace", "timeout_seconds": 60, "network": False}
-        )
-        self.assertEqual(result["exit_code"], 0, result)
-        control, _ = await ws._stream_execute(
-            {"workspace_id": "ws-1", "execution_id": f"control:{uuid.uuid4().hex}",
-             "command": CONTROL_GIT, "cwd": "/workspace", "timeout_seconds": 60, "network": False}
-        )
-        self.assertTrue({"home", "repo", "info", "proc"} <= set(control["stdout"].split()), control)
 
-        status = await self.call(ws.git_status, "ws-1")
-        self.assertIsNone(status.error, status)
-        self.assertEqual(sorted(e.path for e in status.entries), ["a.txt", "b.txt", "c.txt", "d.txt"])
-        diff = await self.call(ws.git_diff, "ws-1", None, False)
-        self.assertIsNone(diff.error, diff)
-        self.assertEqual(len(diff.files), 4)
-        commit = await self.call(ws.git_commit, "Update", "ws-1", True)
-        self.assertTrue(commit.committed, commit)
-        pwned = self.ws_dir / ".git" / "PWNED"
-        self.assertFalse(pwned.exists(), pwned.read_text() if pwned.exists() else "")
+
+class _GitSafetyScenarios:
+    """B1 regression scenarios, run in-process (bwrap stubbed) and live (Docker).
+
+    Subclasses provide ``sh`` (a run_command-style /execute in the scenario's workspace,
+    returning the executor result) and ``tool`` (call a git tool's activity body).
+    """
+
+    wid: str
+
+    async def sh(self, command: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def tool(self, tool: Any, *args: Any) -> Any:
+        raise NotImplementedError
+
+    async def setup_repo(self, *scripts: str) -> None:
+        result = await self.sh("\n".join((GIT_BASE_REPO, *scripts)))
+        self.assertEqual(result["exit_code"], 0, result)  # type: ignore[attr-defined]
+
+    async def pwned(self) -> list[str]:
+        return (await self.sh(PWNED))["stdout"].split()
+
+    async def assert_git_tools_refuse(self, *keys: str) -> None:
+        calls = ((ws.git_status, (self.wid,)), (ws.git_diff, (self.wid, None, False)),
+                 (ws.git_commit, ("Update", self.wid, True)))
+        for tool, args in calls:
+            with self.assertRaises(ApplicationError) as caught:  # type: ignore[attr-defined]
+                await self.tool(tool, *args)
+            error = caught.exception
+            self.assertEqual(error.type, "GitConfigRefused", error)  # type: ignore[attr-defined]
+            self.assertTrue(error.non_retryable)  # type: ignore[attr-defined]
+            for key in keys:
+                self.assertIn(key, str(error))  # type: ignore[attr-defined]
+        self.assertEqual(await self.pwned(), [])  # type: ignore[attr-defined]
+
+    async def assert_git_tools_work(self) -> None:
+        status = await self.tool(ws.git_status, self.wid)
+        self.assertIsNone(status.error, status)  # type: ignore[attr-defined]
+        self.assertFalse(status.clean)  # type: ignore[attr-defined]
+        diff = await self.tool(ws.git_diff, self.wid, None, False)
+        self.assertIsNone(diff.error, diff)  # type: ignore[attr-defined]
+        commit = await self.tool(ws.git_commit, "Update", self.wid, True)
+        self.assertTrue(commit.committed, commit)  # type: ignore[attr-defined]
+
+    async def test_repo_config_filters_are_refused(self) -> None:
+        await self.setup_repo(PLANT_REPO_FILTERS)
+        await self.sh(HASH_ALL)
+        self.assertEqual(sorted(await self.pwned()), ["info", "proc", "repo"])  # live vectors
+        await self.assert_git_tools_refuse(
+            "filter.repo.clean", "filter.info.clean", "filter.proc.process",
+            ".git/info/attributes is not empty",
+        )
+
+    async def test_filter_name_containing_equals_is_refused(self) -> None:
+        # N1.
+        await self.setup_repo(PLANT_EQUALS_FILTER)
+        await self.sh(HASH_ALL)
+        self.assertIn("equals", await self.pwned())
+        await self.assert_git_tools_refuse("filter.a=b.clean", ".git/info/attributes")
+
+    async def test_gc_hook_is_refused_on_commit(self) -> None:
+        # N2.
+        await self.setup_repo(PLANT_GC_HOOK)
+        await self.assert_git_tools_refuse("gc.auto", "gc.recentobjectshook")
+
+    async def test_include_and_include_if_are_refused(self) -> None:
+        await self.setup_repo(PLANT_INCLUDES)
+        await self.assert_git_tools_refuse("include.path", "includeif.gitdir:/.path")
+
+    async def test_home_gitconfig_filter_is_ignored(self) -> None:
+        await self.setup_repo(PLANT_HOME_FILTER)
+        await self.sh(HASH_ALL)
+        self.assertEqual(await self.pwned(), ["home"])  # plain git (HOME=/workspace) runs it
+        await self.assert_git_tools_work()
+        self.assertEqual(await self.pwned(), [])  # type: ignore[attr-defined]
+
+    async def test_xdg_config_under_the_workspace_is_ignored(self) -> None:
+        # N5: neither run_command's plain git nor the git tools read
+        # /workspace/.config/git, because XDG_CONFIG_HOME is not under the workspace.
+        await self.setup_repo(PLANT_XDG_FILTER)
+        await self.sh("export XDG_CONFIG_HOME=$PWD/.config; " + HASH_ALL)
+        self.assertEqual(await self.pwned(), ["xdg"])  # the vector itself is live
+        await self.sh(HASH_ALL)
+        self.assertEqual(await self.pwned(), [])  # type: ignore[attr-defined]
+        await self.assert_git_tools_work()
+        self.assertEqual(await self.pwned(), [])  # type: ignore[attr-defined]
+
+    async def test_fresh_init_repo_works(self) -> None:
+        await self.setup_repo("git config user.name Someone")
+        await self.assert_git_tools_work()
+
+    async def test_cloned_repo_works(self) -> None:
+        upstream = await self.sh(
+            "set -e; up=$(mktemp -d); git -C $up init -q -b main; "
+            "echo 1 > $up/a.txt; git -C $up add -A; git -C $up commit -q -m up; "
+            "git clone -q $up . ; echo 2 > a.txt; git config --local --list --name-only"
+        )
+        self.assertEqual(upstream["exit_code"], 0, upstream)  # type: ignore[attr-defined]
+        self.assertIn("remote.origin.url", upstream["stdout"])  # type: ignore[attr-defined]
+        self.assertIn("branch.main.merge", upstream["stdout"])  # type: ignore[attr-defined]
+        await self.assert_git_tools_work()
+
+
+@unittest.skipUnless(__import__("shutil").which("git"), "git not installed")
+class GitSafetyInProcessTests(_GitSafetyScenarios, _ToolServerEnv, unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.start_server(self)
+        self.wid = "ws-1"
+        self.workspace()
+
+    async def sh(self, command: str) -> dict[str, Any]:
+        result, _ = await ws._stream_execute(
+            {"workspace_id": self.wid, "execution_id": f"sh:{uuid.uuid4().hex}", "command": command,
+             "cwd": "/workspace", "timeout_seconds": 60, "network": False}
+        )
+        return result
+
+    async def tool(self, tool: Any, *args: Any) -> Any:
+        environment = self.env(activity_id=uuid.uuid4().hex)
+        return await environment.run(_activity_body(tool), *args, _tool_ctx("t"))
 
 
 class FileToolsTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
@@ -991,6 +1165,8 @@ class FileToolsTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
             (ws.write_file, (".git/info/attributes", "* filter=x\n", "ws-1")),
             (ws.write_file, (".gitconfig", "[filter \"x\"]\n", "ws-1")),
             (ws.edit_file, (".git/HEAD", "main", "evil", "ws-1")),
+            (ws.write_file, (".config/git/config", "[filter \"x\"]\n", "ws-1")),
+            (ws.write_file, (".Config/Git/attributes", "* filter=x\n", "ws-1")),
         ]
         for tool, args in refused:
             with self.subTest(args[0]):
@@ -1020,6 +1196,7 @@ class FileToolsTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
         await self.call(ws.write_file, ".github/workflows/ci.yml", "on: push\n", "ws-1")
         await self.call(ws.write_file, "src/.gitconfig", "x\n", "ws-1")
         await self.call(ws.write_file, ".gitignore", "*.pyc\n", "ws-1")
+        await self.call(ws.write_file, ".config/app.toml", "x = 1\n", "ws-1")
 
     async def test_write_behind_a_running_command_fails_fast_and_does_not_land(self) -> None:
         # Minor 7: the outcome is truthful: a definite, non-retryable "busy" and no write.
@@ -1040,6 +1217,24 @@ class FileToolsTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
         result = await self.call(ws.write_file, "late.txt", "x", "ws-1")
         self.assertTrue(result.created)
 
+    async def test_zero_busy_timeout_writes_when_the_workspace_is_free(self) -> None:
+        # N6: busy_timeout=0 means "only if free right now", not "always busy".
+        with patch.object(ws, "MUTATION_BUSY_TIMEOUT_SECONDS", 0):
+            result = await self.call(ws.write_file, "now.txt", "x", "ws-1")
+            self.assertTrue(result.created)
+            edited = await self.call(ws.edit_file, "now.txt", "x", "y", "ws-1")
+            self.assertEqual(edited.added_lines, 1)
+            running = asyncio.ensure_future(ws._stream_execute(
+                {"workspace_id": "ws-1", "execution_id": "busy:0", "command": "sleep 1",
+                 "cwd": "/workspace", "timeout_seconds": 60, "network": False}
+            ))
+            await asyncio.sleep(0.3)
+            with self.assertRaises(ApplicationError) as caught:
+                await self.call(ws.write_file, "later.txt", "x", "ws-1")
+            self.assertEqual(caught.exception.type, "Workspace_workspace_busy")
+            self.assertIn("A command is running", str(caught.exception))
+            await running
+
     async def test_list_files_flat_and_recursive(self) -> None:
         (self.ws_dir / "src").mkdir()
         (self.ws_dir / "src" / "a.py").write_text("x")
@@ -1056,10 +1251,13 @@ class FileToolsTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
 # -- Live executor (Docker) ------------------------------------------------------------------
 
 
-@unittest.skipUnless(
+_LIVE = unittest.skipUnless(
     os.environ.get("WORKSPACE_EXECUTOR_LIVE_URL"),
     "set WORKSPACE_EXECUTOR_LIVE_URL (and WORKSPACE_EXECUTOR_TOKEN) to run against a live executor",
 )
+
+
+@_LIVE
 class LiveExecutorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         env = patch.dict("os.environ", {"WORKSPACE_EXECUTOR_URL": os.environ["WORKSPACE_EXECUTOR_LIVE_URL"]})
@@ -1104,21 +1302,6 @@ class LiveExecutorTests(unittest.IsolatedAsyncioTestCase):
         )
         return await environment.run(agent.tool_activity(tool), *args, _tool_ctx("live"))
 
-    async def test_git_tools_never_run_workspace_filter_drivers(self) -> None:
-        planted, _ = await ws._stream_execute(self.body(PLANT_GIT_FILTERS, f"live:{uuid.uuid4().hex[:12]}"))
-        self.assertEqual(planted["exit_code"], 0, planted)
-        control, _ = await ws._stream_execute(self.body(CONTROL_GIT, f"live:{uuid.uuid4().hex[:12]}"))
-        self.assertTrue({"home", "repo", "info", "proc"} <= set(control["stdout"].split()), control)
-
-        status = await self._tool(ws.git_status, self.workspace_id)
-        self.assertIsNone(status.error, status)
-        diff = await self._tool(ws.git_diff, self.workspace_id, None, False)
-        self.assertEqual(len(diff.files), 4, diff)
-        commit = await self._tool(ws.git_commit, "Update", self.workspace_id, True)
-        self.assertTrue(commit.committed, commit)
-        pwned, _ = await ws._stream_execute(self.body("cat .git/PWNED 2>/dev/null; true", f"live:{uuid.uuid4().hex[:12]}"))
-        self.assertEqual(pwned["stdout"], "")
-
     async def test_plain_git_commit_from_a_command_has_an_identity(self) -> None:
         result, _ = await ws._stream_execute(self.body(
             "git init -q -b main && echo x > a.txt && git add a.txt && git commit -q -m first "
@@ -1152,6 +1335,22 @@ class LiveExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["stdout"], first_result["stdout"])
         count, _ = await ws._stream_execute(self.body("wc -l < runs.txt", f"live:{uuid.uuid4().hex[:12]}"))
         self.assertEqual(count["stdout"].strip(), "1")
+
+
+@_LIVE
+class LiveGitSafetyTests(_GitSafetyScenarios, LiveExecutorTests):
+    """The B1 scenarios in real Bubblewrap (git 2.47 in the image)."""
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.wid = self.workspace_id
+
+    async def sh(self, command: str) -> dict[str, Any]:
+        result, _ = await ws._stream_execute(self.body(command, f"live:{uuid.uuid4().hex[:12]}"))
+        return result
+
+    async def tool(self, tool: Any, *args: Any) -> Any:
+        return await self._tool(tool, *args)
 
 
 if __name__ == "__main__":

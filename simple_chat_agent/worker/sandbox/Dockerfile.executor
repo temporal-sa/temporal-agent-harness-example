@@ -7,8 +7,10 @@
 # The executor needs only fastapi, uvicorn and pydantic, plus the sandbox tools below. It
 # must never hold model-provider or integration keys (PRD §5 rule 6); its startup self-test
 # refuses to report healthy if it sees any.
-FROM python:3.12-slim
-# git must be >= 2.40: the git tools rely on --attr-source (Debian trixie ships 2.47).
+# Pinned: Python 3.12.15 on Debian trixie, whose git (2.47) meets the git tools' >= 2.40
+# requirement (--attr-source). The executor's startup self-test fails /healthz on an older
+# git. Bump the tag and digest together.
+FROM python:3.12.15-slim-trixie@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \

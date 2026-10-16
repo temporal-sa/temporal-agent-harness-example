@@ -39,12 +39,21 @@ from simple_chat_agent.agent.contracts import (
     Posture,
 )
 from simple_chat_agent.agent.approvals import configured_judge_backend
-from simple_chat_agent.agent.tools.research import research_tools_available
+
 from simple_chat_agent.agent.model_registry import is_allowed
 from simple_chat_agent.api.agent_bridge import Bridge
 from simple_chat_agent.api.agent_store import AgentStore
 
 KEEPALIVE_SECONDS = 15.0
+
+
+def offered_research_tools() -> list[str]:
+    """Research tools new sessions offer, from a non-secret flag (the API holds no search or
+    LLM keys). Default: fetch_url only; set AGENT_RESEARCH_TOOLS=fetch_url,search_web where
+    the workers have a search backend configured."""
+    raw = os.environ.get("AGENT_RESEARCH_TOOLS", "fetch_url")
+    allowed = {"fetch_url", "search_web"}
+    return [name for name in (n.strip() for n in raw.split(",")) if name in allowed]
 
 
 def agent_environment() -> str:
@@ -109,7 +118,7 @@ def create_agent_router(
             posture=body.posture,
             environment=agent_environment(),
             judge=configured_judge_backend(),
-            research_tools=[t.__name__ for t in research_tools_available()],
+            research_tools=offered_research_tools(),
         )
         if body.posture == "never_ask" and data.environment == "catalog":
             return _error(422, "posture_not_allowed", "\"Never ask\" isn't available here.")

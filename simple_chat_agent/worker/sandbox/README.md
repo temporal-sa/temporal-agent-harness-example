@@ -25,16 +25,17 @@ A job is keyed by `(workspace, execution_id)`, and it outlives the HTTP stream t
 
 - A job takes its workspace's `exec` lock first, then a global slot (`WORKSPACE_EXECUTOR_MAX_CONCURRENT`, default 4). Calls queued behind a long command in one session hold no slots, so they can't starve other sessions.
 - File mutations take `exec`, then `files` (exclusive), so they wait for a running command; reads don't.
-- A mutation may pass `busy_timeout_seconds`. If the command is still running after that time, it fails with `409 workspace_busy` and nothing is written. The worker's `write_file`/`edit_file` pass 10 s, so the result is either "written" or "busy, not written", never a client timeout for a write that lands later.
+- A mutation may pass `busy_timeout_seconds`. If the workspace is still busy after that time, it fails with `409 workspace_busy` and nothing is written. The message says whether a command is running or only queued. If the workspace is free, the lock is taken immediately, so `0` means "only if free right now". The worker's `write_file`/`edit_file` pass 10 s, so the result is either "written" or "busy, not written", never a client timeout for a write that lands later.
 
 ### Git safety
 
-- `/files/*` refuses to change anything under `.git/` and a root-level `.gitconfig` (`403 protected_path`, compared case-insensitively). Those files can make a later git call run programs: hooks, config, `info/attributes`, filters.
-- The git tools (`git_status`, `git_diff`, `git_commit`) run git with no global or system config (`HOME=/tmp`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`).
-  - Attributes come from an empty tree (`--attr-source`, which needs git >= 2.40), and `core.attributesFile=/dev/null`.
-  - Every filter driver in the repo config is overridden to nothing.
-  - Hooks, fsmonitor, signing, external diff and textconv are off.
-- Every sandboxed command gets a git identity: `GIT_AUTHOR_*` and `GIT_COMMITTER_*`, "Coding Agent" / `agent@coding-agent.invalid` by default. Override them with `WORKSPACE_EXECUTOR_GIT_NAME` and `WORKSPACE_EXECUTOR_GIT_EMAIL`. A plain `git commit` from `run_command` works in a fresh repo.
+- `/files/*` refuses to change git control data (`403 protected_path`, compared case-insensitively): anything under `.git/`, a root-level `.gitconfig`, and anything under `.config/git/`. The sandbox `HOME` is `/workspace`, so the last two are git's global config locations.
+- Sandboxed commands run with `XDG_CONFIG_HOME=/tmp/.config`, a per-command tmpfs, so `/workspace/.config/git/{config,attributes}` never act as global git config.
+- The worker's git tools (`git_status`, `git_diff`, `git_commit`) **fail closed**. Before any git call, a preflight checks the repo-local config and `config.worktree`, both read without following includes. Any key outside a small allowlist refuses the call with a non-retryable `GitConfigRefused` that names the keys: `include.*`/`includeIf.*`, filters, diff drivers, gc hooks, and so on. A non-empty `.git/info/attributes` refuses too.
+  - The allowlist covers what `git init` and `git clone` write (core layout flags, `remote.*.url`/`fetch`, `branch.*.remote`/`merge`/`rebase`), plus identity and line-ending settings. Each key is justified in `simple_chat_agent/agent/tools/workspace.py`.
+  - Git also runs with no global or system config or attributes, attributes from an empty tree (`--attr-source`), and overrides passed through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` (never `-c key=value`). The overrides turn off hooks, fsmonitor, signing, auto-gc and maintenance.
+- The executor requires git 2.40 or later: a startup self-test makes `/healthz` fail on an older git. The Dockerfile pins the base image by tag and digest.
+- Every sandboxed command gets a git identity: `GIT_AUTHOR_*` and `GIT_COMMITTER_*`, "Coding Agent" / `agent@coding-agent.invalid` by default. Override them with `WORKSPACE_EXECUTOR_GIT_NAME` and `WORKSPACE_EXECUTOR_GIT_EMAIL`.
 
 ### State cleanup
 

@@ -94,37 +94,136 @@ LIST_SKIP_DIRS = frozenset(
      ".ruff_cache", ".cache", ".tox", "dist", "build"}
 )
 # The git tools are approved as read-only (status, diff) or without a shell review
-# (commit), so no git call they make may run a program the workspace chose (B1). Git runs
-# programs from: hooks, fsmonitor, signing, pagers, external diff and textconv drivers,
-# and filter drivers (clean/smudge/process) selected by gitattributes. This prelude
-# defines `safe_git`, which every git tool uses instead of `git`:
+# (commit), so no git call they make may run a program the workspace chose (B1). Git can
+# run programs from many config keys (filters, diff drivers, hooks, fsmonitor, signing,
+# gc/maintenance hooks, pagers, ...) and more appear in new git versions, so instead of
+# denylisting them the git tools fail closed:
 #
-# - HOME=/tmp, GIT_CONFIG_GLOBAL=/dev/null, GIT_CONFIG_NOSYSTEM=1: no global or system
-#   config, so a workspace `.gitconfig` (the sandbox HOME is /workspace) is never read.
-# - --attr-source=<empty tree>, core.attributesFile=/dev/null, GIT_ATTR_NOSYSTEM=1: no
-#   attributes from the worktree, a global file or the system. (git >= 2.40.)
-# - `.git/info/attributes` cannot be switched off, so every filter driver defined in the
-#   repo config is overridden to nothing; a filter with no command is not run.
-# - Hooks, fsmonitor, signing and pagers are disabled; diffs pass --no-ext-diff and
-#   --no-textconv; submodules (which have their own config) are ignored.
+# 1. Preflight (`safe_git_preflight`, run once per tool call, under the workspace lock):
+#    the repo-local config (`git config --local`, which does not follow includes) and
+#    `config.worktree` may contain only GIT_CONFIG_ALLOWLIST keys; any other key,
+#    including include.* / includeIf.*, refuses the call and names the keys. A non-empty
+#    `.git/info/attributes` (which nothing can switch off) also refuses.
+# 2. Environment: no global or system config or attributes (HOME and XDG_CONFIG_HOME under
+#    /tmp, GIT_CONFIG_GLOBAL=/dev/null, GIT_CONFIG_NOSYSTEM=1, GIT_ATTR_NOSYSTEM=1), no
+#    repository discovery above the workspace.
+# 3. Overrides via GIT_CONFIG_COUNT/KEY_n/VALUE_n (never `-c k=v`, whose `=` splitting
+#    a crafted name can abuse): hooks, fsmonitor, signing, auto-gc/maintenance off.
+# 4. Attributes read from an empty tree (--attr-source, git >= 2.40), so a worktree
+#    `.gitattributes` can name no driver; diffs also pass --no-ext-diff --no-textconv.
 #
-# The executor also refuses /files writes under `.git/` and to a root `.gitconfig`.
-GIT_PRELUDE = r"""export HOME=/tmp XDG_CONFIG_HOME=/tmp/.config GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1
-safe_git() {
-  local overrides=() key name keys
-  keys=$(command git config --name-only --get-regexp '^filter\.' 2>/dev/null) || true
+# The executor also refuses /files writes under `.git/`, `.config/git/` and to a root
+# `.gitconfig`, and checks git >= 2.40 at startup.
+#
+# Why each allowlisted key is safe (none names a program, path to execute, or include):
+#   core.repositoryformatversion, core.bare, core.logallrefupdates: written by `git init`;
+#     repository layout flags.
+#   core.filemode, core.ignorecase, core.precomposeunicode, core.symlinks: written by
+#     `git init` per platform; filesystem capability flags.
+#   core.autocrlf, core.eol, core.safecrlf: built-in line-ending conversion, no program.
+#   user.name, user.email: commit identity strings.
+#   remote.<name>.url, remote.<name>.fetch: written by `git clone`. Only fetch/push use
+#     them, and the git tools never fetch or push.
+#   branch.<name>.remote, .merge, .rebase: written by clone/checkout; upstream tracking.
+#   init.defaultbranch: a branch name.
+#   extensions.objectformat, extensions.refstorage: repository-format choices (sha256,
+#     reftable) git refuses to open a repo without. extensions.worktreeconfig: enables
+#     config.worktree, which the preflight checks too. Other extensions (partialclone,
+#     which can trigger fetches) are refused.
+GIT_CONFIG_ALLOWLIST = (
+    "core.repositoryformatversion",
+    "core.bare",
+    "core.logallrefupdates",
+    "core.filemode",
+    "core.ignorecase",
+    "core.precomposeunicode",
+    "core.symlinks",
+    "core.autocrlf",
+    "core.eol",
+    "core.safecrlf",
+    "user.name",
+    "user.email",
+    "remote.*.url",
+    "remote.*.fetch",
+    "branch.*.remote",
+    "branch.*.merge",
+    "branch.*.rebase",
+    "init.defaultbranch",
+    "extensions.objectformat",
+    "extensions.refstorage",
+    "extensions.worktreeconfig",
+)
+GIT_CONFIG_OVERRIDES = (
+    ("core.hooksPath", "/dev/null"),
+    ("core.fsmonitor", "false"),
+    ("core.attributesFile", "/dev/null"),
+    ("core.pager", "cat"),
+    ("core.quotePath", "false"),
+    ("commit.gpgsign", "false"),
+    ("tag.gpgsign", "false"),
+    ("maintenance.auto", "false"),
+    ("gc.auto", "0"),
+    ("gc.autoDetach", "false"),
+    ("color.ui", "false"),
+    ("diff.ignoreSubmodules", "all"),
+    ("status.submoduleSummary", "false"),
+)
+GIT_REFUSED_EXIT = 97
+GIT_REFUSED_MARKER = "@@safe-git-refused@@"
+
+
+def _git_prelude() -> str:
+    patterns = "|".join(GIT_CONFIG_ALLOWLIST)
+    overrides = [f"export GIT_CONFIG_COUNT={len(GIT_CONFIG_OVERRIDES)}"]
+    for index, (key, value) in enumerate(GIT_CONFIG_OVERRIDES):
+        overrides.append(
+            f"export GIT_CONFIG_KEY_{index}={shlex.quote(key)} "
+            f"GIT_CONFIG_VALUE_{index}={shlex.quote(value)}"
+        )
+    return "\n".join(
+        [
+            "export HOME=/tmp XDG_CONFIG_HOME=/tmp/.config GIT_CONFIG_GLOBAL=/dev/null "
+            "GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1 GIT_CEILING_DIRECTORIES=/ GIT_PAGER=cat",
+            "unset GIT_DIR GIT_WORK_TREE GIT_CONFIG GIT_CONFIG_PARAMETERS",
+            *overrides,
+            r"""safe_git_refuse() {
+  printf '%s\n' "__MARKER__" "$@" >&2
+  exit __EXIT__
+}
+safe_git_preflight() {
+  command git rev-parse --git-dir >/dev/null 2>&1 || return 0  # not a repo: git says so
+  local keys key bad=() path
+  keys=$(command git config --local --no-includes --list --name-only 2>/dev/null) \
+    || safe_git_refuse "(the repo config could not be read)"
+  path=$(command git rev-parse --git-path config.worktree)
+  if [ -e "$path" ]; then
+    keys+=$'\n'"$(command git config --file "$path" --no-includes --list --name-only 2>/dev/null \
+      || echo '(config.worktree could not be read)')"
+  fi
   while IFS= read -r key; do
     [ -n "$key" ] || continue
-    name=${key#filter.}; name=${name%.*}
-    overrides+=(-c "filter.$name.clean=" -c "filter.$name.smudge=" -c "filter.$name.process=" -c "filter.$name.required=false")
+    case "$key" in
+      __PATTERNS__) ;;
+      *) bad+=("$key") ;;
+    esac
   done <<< "$keys"
-  command git --no-pager --attr-source="$(command git hash-object -t tree /dev/null)" \
-    -c core.attributesFile=/dev/null -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-    -c commit.gpgsign=false -c tag.gpgsign=false -c core.quotePath=false -c color.ui=false \
-    -c diff.ignoreSubmodules=all -c status.submoduleSummary=false \
-    "${overrides[@]}" "$@"
+  path=$(command git rev-parse --git-path info/attributes)
+  if [ -e "$path" ] && grep -q '[^[:space:]]' "$path" 2>/dev/null; then
+    bad+=("(.git/info/attributes is not empty)")
+  fi
+  [ ${#bad[@]} -eq 0 ] || safe_git_refuse "${bad[@]}"
 }
-"""
+safe_git() {
+  command git --no-pager --attr-source="$(command git hash-object -t tree /dev/null)" "$@"
+}
+safe_git_preflight""".replace("__MARKER__", GIT_REFUSED_MARKER)
+            .replace("__EXIT__", str(GIT_REFUSED_EXIT))
+            .replace("__PATTERNS__", patterns),
+        ]
+    )
+
+
+GIT_PRELUDE = _git_prelude()
 GIT = "safe_git"
 _SEPARATOR = "@@@workspace-tool-separator-7f3a@@@"
 
@@ -1204,7 +1303,28 @@ def parse_git_status(stdout: str) -> GitStatusResult:
     return GitStatusResult(branch=branch, entries=entries, clean=not entries, truncated=truncated)
 
 
+def _raise_if_git_refused(result: dict[str, Any]) -> None:
+    """Turn the preflight's refusal into a non-retryable error naming the keys."""
+    stderr = str(result.get("stderr") or "")
+    if result.get("exit_code") != GIT_REFUSED_EXIT or GIT_REFUSED_MARKER not in stderr:
+        return
+    items = [
+        line.strip()
+        for line in stderr.split(GIT_REFUSED_MARKER, 1)[1].splitlines()
+        if line.strip()
+    ]
+    shown = ", ".join(items[:20]) + (f" (+{len(items) - 20} more)" if len(items) > 20 else "")
+    raise ApplicationError(
+        "The repo config contains settings the agent's git tools won't run with: "
+        f"{shown}. Inspect them with run_command (for example `git config --local --list`).",
+        {"keys": items[:100]},
+        type="GitConfigRefused",
+        non_retryable=True,
+    )
+
+
 def _git_error(result: dict[str, Any]) -> str | None:
+    _raise_if_git_refused(result)
     if result.get("exit_code") == 0:
         return None
     stderr = str(result.get("stderr") or "").strip()
@@ -1344,6 +1464,7 @@ async def git_commit(
     result = await _exec_collect(
         workspace_id, "git_commit", git_commit_command(add_all), stdin=message.strip() + "\n"
     )
+    _raise_if_git_refused(result)
     return parse_git_commit(result)
 
 

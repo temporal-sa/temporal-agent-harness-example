@@ -125,7 +125,9 @@ def settings_for(choice: ModelChoice, *, session_id: str) -> ModelSettings:
         # rejected `enabled` form.
         return AnthropicModelSettings(
             max_tokens=16_000,
-            anthropic_thinking={"type": "adaptive"},
+            # "summarized": Claude 5.x omits thinking text unless asked; the product view
+            # shows the summary (measured: 0 vs ~1.8k chars of thinking on the same prompt).
+            anthropic_thinking={"type": "adaptive", "display": "summarized"},
             anthropic_effort=effort,
             anthropic_cache_instructions=True,
             anthropic_cache_tool_definitions=True,

@@ -553,20 +553,42 @@ async def files_rename(
     )
 
 
+def _busy_message(workspace_key: str) -> str:
+    states = [job.state for (key, _), job in list(_jobs.items()) if key == workspace_key]
+    running, queued = states.count("running"), states.count("queued")
+    if running:
+        what = "A command is running in the workspace"
+        if queued:
+            what += f" and {queued} more {'is' if queued == 1 else 'are'} queued"
+    elif queued:
+        what = f"{queued} command{'s are' if queued > 1 else ' is'} queued in the workspace"
+    else:
+        what = "Another file change is in progress in the workspace"
+    return (
+        f"{what}; nothing was written. File changes wait for commands; retry when they "
+        "finish."
+    )
+
+
 def _refuse_protected(*paths: str) -> None:
     """Refuse mutations of git's control files (B1).
 
-    Anything under ``.git`` (config, hooks, info/attributes) and a root-level
-    ``.gitconfig`` (the sandbox's ``$HOME/.gitconfig``) can make a later git call run
-    workspace-chosen programs. Compared case-insensitively, because a macOS-hosted
+    Anything under ``.git`` (config, hooks, info/attributes), a root-level
+    ``.gitconfig`` and ``.config/git/`` (the sandbox HOME is /workspace, so these are
+    git's global config locations) can make a later git call run workspace-chosen
+    programs. Compared case-insensitively, because a macOS-hosted
     executor sits on a case-insensitive filesystem.
     """
     for path in paths:
         parts = _split_path(path, allow_root=True)
         if not parts:
             continue
-        first = parts[0].casefold()
-        if first == ".git" or (len(parts) == 1 and first == ".gitconfig"):
+        folded = [part.casefold() for part in parts]
+        if (
+            folded[0] == ".git"
+            or folded == [".gitconfig"]
+            or folded[:2] == [".config", "git"]
+        ):
             raise _FileOpError(
                 "protected_path",
                 f"{_display(parts)} is git control data and can't be changed with "
@@ -604,7 +626,9 @@ async def _run_file_op(
     async def locked() -> dict[str, Any]:
         # Lock scheme: see _WorkspaceLocks.
         if mutates:
-            if busy_timeout is None:
+            if busy_timeout is None or not locks.exec.locked():
+                # Uncontended: taken without suspending, so busy_timeout=0 means
+                # "only if free right now", not "always busy".
                 await locks.exec.acquire()
             else:
                 try:
@@ -613,9 +637,7 @@ async def _run_file_op(
                     # Nothing was written: the caller gets a definite outcome
                     # instead of a client timeout while the write lands later.
                     raise _FileOpError(
-                        "workspace_busy",
-                        "A command is running in the workspace; file changes wait "
-                        "for it. Retry when it finishes.",
+                        "workspace_busy", _busy_message(workspace_key)
                     ) from None
             try:
                 async with locks.files.exclusive():
@@ -1150,7 +1172,9 @@ def main() -> None:
     with suppress(OSError):
         _sweep_state()
     _last_state_gc_at = time.monotonic()
-    _self_test_error = _credential_boundary_self_test() or _sandbox_self_test()
+    _self_test_error = (
+        _credential_boundary_self_test() or _sandbox_self_test() or _git_version_self_test()
+    )
     if _self_test_error is not None:
         print(_self_test_error, flush=True)
     uvicorn.run(
@@ -1664,6 +1688,9 @@ def _sandbox_env() -> dict[str, str]:
     return {
         "PATH": "/workspace/.venv/bin:/usr/local/bin:/usr/bin:/bin",
         "HOME": "/workspace",
+        # Not under HOME: /workspace/.config/git/{config,attributes} would otherwise act as
+        # git's global config for every command. /tmp is a per-command tmpfs.
+        "XDG_CONFIG_HOME": "/tmp/.config",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "PIP_CACHE_DIR": "/workspace/.cache/pip",
@@ -1777,6 +1804,37 @@ def _sandbox_self_test() -> str | None:
         "Bubblewrap self-test failed"
         f" with exit code {completed.returncode}: {detail or 'no stderr'}"
     )
+
+
+MIN_GIT_VERSION = (2, 40)
+
+
+def _git_version_self_test() -> str | None:
+    """The worker's git tools need git >= 2.40 (--attr-source); /healthz fails otherwise."""
+    git = shutil.which("git")
+    if git is None:
+        return "git is not installed in the executor image."
+    try:
+        completed = subprocess.run(
+            [git, "--version"], capture_output=True, text=True, timeout=10, check=False,
+            env=_launcher_env(),
+        )
+    except Exception as err:  # noqa: BLE001
+        return f"git --version failed: {err}"
+    version = _parse_git_version(completed.stdout)
+    if version is None:
+        return f"Could not read the git version from {completed.stdout.strip()!r}."
+    if version < MIN_GIT_VERSION:
+        return (
+            f"git {'.'.join(map(str, version))} is too old; the git tools need "
+            f"{'.'.join(map(str, MIN_GIT_VERSION))} or later."
+        )
+    return None
+
+
+def _parse_git_version(text: str) -> tuple[int, int] | None:
+    match = re.search(r"git version (\d+)\.(\d+)", text)
+    return (int(match.group(1)), int(match.group(2))) if match else None
 
 
 def _credential_boundary_self_test() -> str | None:
