@@ -10,6 +10,14 @@ export interface Ack {
   detail: string;
 }
 /**
+ * The tools that were always allowed and now ask again (as the posture says).
+ */
+export interface AlwaysAllowedForgotten {
+  ok: boolean;
+  detail: string;
+  forgotten: string[];
+}
+/**
  * Everything a run hands to the next one when it continues as new.
  *
  * The conversation is opaque JSON here so this module stays free of Pydantic AI; the
@@ -120,10 +128,255 @@ export interface Commit {
   message: string;
 }
 /**
+ * A file the user attached to a chat message (uploaded first with
+ * ``POST /api/agent/sessions/{id}/attachments``, which returns its id).
+ */
+export interface ChatAttachment {
+  attachment_id: string;
+  name?: string;
+  size?: number | null;
+  content_type?: string | null;
+}
+/**
  * A user message to the coding agent.
  */
 export interface ChatMessage {
   text: string;
+  /**
+   * @maxItems 20
+   */
+  attachments?:
+    | []
+    | [ChatAttachment]
+    | [ChatAttachment, ChatAttachment]
+    | [ChatAttachment, ChatAttachment, ChatAttachment]
+    | [ChatAttachment, ChatAttachment, ChatAttachment, ChatAttachment]
+    | [ChatAttachment, ChatAttachment, ChatAttachment, ChatAttachment, ChatAttachment]
+    | [
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment
+      ]
+    | [
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment
+      ]
+    | [
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment
+      ]
+    | [
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment
+      ]
+    | [
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment
+      ]
+    | [
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment
+      ]
+    | [
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment
+      ]
+    | [
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment
+      ]
+    | [
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment
+      ]
+    | [
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment
+      ]
+    | [
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment
+      ]
+    | [
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment
+      ]
+    | [
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment
+      ]
+    | [
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment
+      ]
+    | [
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment,
+        ChatAttachment
+      ];
 }
 /**
  * The agent's final answer for a turn.
@@ -168,6 +421,10 @@ export interface Findings {
   answer: string;
   evidence: Evidence[];
 }
+/**
+ * Forget the "always allow" approvals given in this session (no fields).
+ */
+export interface ForgetAlwaysAllowed {}
 /**
  * Stop the current turn. Pending approvals in the turn are declined.
  */

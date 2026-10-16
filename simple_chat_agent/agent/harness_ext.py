@@ -35,7 +35,7 @@ from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import RunContext
 from temporalio import activity, workflow
-from temporalio.contrib.workflow_streams import WorkflowStream
+from temporalio.contrib.workflow_streams import PollInput, PollResult, WorkflowStream
 from temporalio.exceptions import ApplicationError
 
 from temporal_agent_harness.ai_sdks.pydantic_ai_harness import (
@@ -726,6 +726,92 @@ def close_with_note(
         # requests in a row; the stop note replaces it.
         return [*messages[:-1], ModelRequest(parts=[*last.parts, UserPromptPart(content=user_note)])]
     return messages
+
+
+# How long a closing subagent waits for its stream's readers to catch up before it completes.
+STREAM_DRAIN_TIMEOUT = timedelta(seconds=10)
+
+
+class DrainableStream(WorkflowStream):
+    """A WorkflowStream that remembers how far its readers have read, so the workflow can wait
+    for them before it completes.
+
+    A completed workflow's stream can't be polled (``workflow_streams`` raises "workflow
+    execution already completed"; the harness merge then drops the cursor). A subagent completes
+    as soon as its parent stops it, which can be a second after its last turn. A reader whose
+    poll was still behind (the bridge's merged attach) then lost the end of that turn, and the
+    harness merge reported ``subagent_stream_unavailable``. Overrides
+    ``WorkflowStream._on_poll`` (temporalio contrib, pinned by tests/test_harness_ext.py) to
+    record each poll's ``from_offset`` (the next offset that reader wants).
+
+    Construct it directly in ``@workflow.init`` like WorkflowStream (its frame check accepts
+    this ``__init__``)."""
+
+    def __init__(self, prior_state: Any = None) -> None:
+        super().__init__(prior_state=prior_state)
+        self.read_through = 0
+
+    # Typed: Temporal decodes the update's argument from these hints.
+    async def _on_poll(self, payload: PollInput) -> PollResult:
+        self.read_through = max(self.read_through, payload.from_offset)
+        return await super()._on_poll(payload)
+
+
+async def drain_stream(stream: DrainableStream, *, timeout: timedelta = STREAM_DRAIN_TIMEOUT) -> bool:
+    """Before the workflow completes: wait (bounded) until a reader has asked for the offset
+    after the last event, then release in-flight polls with what they haven't read and let
+    them finish. True if a reader caught up within ``timeout``."""
+    caught_up = stream.read_through >= stream_head(stream)
+    if not caught_up:
+        try:
+            await workflow.wait_condition(
+                lambda: stream.read_through >= stream_head(stream), timeout=timeout
+            )
+            caught_up = True
+        except asyncio.TimeoutError:
+            pass  # nobody is reading (no attach open): nothing to lose
+    stream.detach_pollers()
+    await workflow.wait_condition(workflow.all_handlers_finished)
+    return caught_up
+
+
+def install_merge_fixes() -> None:
+    """Fix the harness stream merge (``stream_merge/merge.py`` ``_Merge``, 0.7.0) giving up on a
+    subagent that is still delivering. Idempotent; the API calls it once at import.
+
+    A cursor's pull sets its ``head`` before the engine reaps the finished task. While the
+    merged stream's consumer is slow (the bridge writes each frame to Redis), a child's pull can
+    finish, its head be emitted, and the finished task stay unreaped. If the parent is then held
+    at that child's ``subagent_reply_received``, ``_drive`` finds no pull "in flight" (it skips
+    finished tasks), so it gives the child up at once and publishes
+    ``subagent_stream_unavailable``, losing the rest of the child's turn. Reaping such a task
+    before new pulls start (as ``_collect_completed_pulls`` would) keeps the child pulling."""
+    from temporal_agent_harness.harness.stream_merge import merge as _merge
+
+    cls = _merge._Merge
+    if getattr(cls, "_simple_chat_reaps_emitted_pulls", False):
+        return
+    original = cls._ensure_pulls
+
+    def _ensure_pulls(self: Any) -> None:
+        for c in self._cursors.values():
+            task = c.pull_task
+            if (
+                task is not None
+                and task.done()
+                and not task.cancelled()
+                and task.exception() is None
+                and c.error is None
+                and not c.exhausted
+                and c.head is None
+            ):
+                # That pull's event was already emitted: the stream made progress.
+                c.pull_task = None
+                self._stall_deadlines.pop(c.workflow_id, None)
+        original(self)
+
+    cls._ensure_pulls = _ensure_pulls
+    cls._simple_chat_reaps_emitted_pulls = True
 
 
 def stream_head(stream: WorkflowStream) -> int:

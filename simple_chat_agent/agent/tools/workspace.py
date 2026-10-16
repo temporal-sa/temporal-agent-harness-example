@@ -1700,4 +1700,21 @@ async def wait_seconds(seconds: int) -> str:
     return f"Waited {seconds} seconds."
 
 
-TEST_TOOLS = (wait_seconds,)
+# One attempt: an approved gated_echo call runs at most once (a lost worker fails the call
+# instead of running it again), so a test can count applications per approval.
+GATED_ECHO_CONFIG = ActivityConfig(
+    start_to_close_timeout=timedelta(seconds=30),
+    retry_policy=RetryPolicy(maximum_attempts=1),
+)
+
+
+@agent.activity_tool_defn(activity_config=GATED_ECHO_CONFIG)
+async def gated_echo(text: str) -> dict[str, Any]:
+    """Echo `text` back (testing only). Every call needs its own approval, except under the
+    never-ask posture; it may be called several times in one turn, with the same or
+    different text."""
+    info = activity.info()
+    return {"text": text, "activity_id": info.activity_id, "attempt": info.attempt}
+
+
+TEST_TOOLS = (wait_seconds, gated_echo)

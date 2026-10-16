@@ -756,6 +756,43 @@ class RejectionAndRootIdTests(_RedisCase):
         self.assertTrue(all(f.data.get("agent_id") for f in x), [(f.event, f.data.get("agent_id")) for f in x])
 
 
+class SubagentMarkerTests(_RedisCase):
+    """A replay that mounts a subagent whose workflow has completed gets a synthetic
+    ``subagent_stream_unavailable`` from the harness merge. Not news when that subagent's turn is
+    already stored in full; real news when its turn was cut short."""
+
+    @staticmethod
+    def marker() -> AgentEvent:
+        from temporal_agent_harness.harness.agent_protocol.events import SubagentStreamUnavailable
+
+        return AgentEvent(agent_id=CHILD, turn_id="", turn_number=0, message_id=None, timestamp=0.0,
+                          event=SubagentStreamUnavailable(subagent_id=CHILD, workflow_id="child-wf-1", reason="gone"))
+
+    async def forward(self, entries: list) -> None:
+        await self.r.delete(self.store._k("s", "lease"))
+        b = self.bridge()
+        self.assertTrue(await self.store.acquire_lease("s", b.holder))
+        with mock.patch.object(agent_bridge, "AgentClient", Script(entries).client):
+            await _Forwarder(b, "s")._forward_once()
+
+    async def test_takeover_replay_marker_for_a_stored_subagent_turn_is_dropped(self) -> None:
+        entries = turn_script()
+        await self.forward(entries[:-1])  # A stored the child's whole turn; the root turn is open
+        # B replays the turn; the child's workflow has completed, so the merge can't mount it.
+        replay = entries[:7] + [(self.marker(), 7), entries[-1]]
+        await self.forward(replay)
+        frames = await self.store.read_from("s", 0)
+        self.assertEqual([f for f in frames if f.event == "subagent_stream_unavailable"], [])
+        self.assertFalse((await self.store.meta("s")).turn_active)
+
+    async def test_marker_for_a_cut_short_subagent_turn_is_kept(self) -> None:
+        entries = turn_script()
+        cut = entries[:9] + [(self.marker(), 7), entries[-1]]  # child turn_started, a delta, no turn_end
+        await self.forward(cut)
+        frames = await self.store.read_from("s", 0)
+        self.assertEqual(len([f for f in frames if f.event == "subagent_stream_unavailable"]), 1)
+
+
 class RunIdTests(_RedisCase):
     """Current run ids (root and subagents) for Temporal UI deep links: from Describe, never a
     Query, following continue-as-new."""

@@ -102,10 +102,26 @@ class CodingAgentInit(BaseModel):
     test_history_event_cap: int | None = None
 
 
+MAX_CHAT_ATTACHMENTS = 20
+
+
+class ChatAttachment(BaseModel):
+    """A file the user attached to a chat message (uploaded first with
+    ``POST /api/agent/sessions/{id}/attachments``, which returns its id)."""
+
+    attachment_id: str = Field(min_length=1, max_length=200)
+    name: str = Field(default="", max_length=500)
+    size: int | None = Field(default=None, ge=0)
+    content_type: str | None = Field(default=None, max_length=200)
+
+
 class ChatMessage(BaseModel):
     """A user message to the coding agent."""
 
     text: str
+    # Defaulted: messages from before attachments existed (and carried, deferred ones) still
+    # validate.
+    attachments: list[ChatAttachment] = Field(default_factory=list, max_length=MAX_CHAT_ATTACHMENTS)
 
 
 class ChatReply(BaseModel):
@@ -150,6 +166,16 @@ class Ack(BaseModel):
 
     ok: bool = True
     detail: str = ""
+
+
+class ForgetAlwaysAllowed(BaseModel):
+    """Forget the "always allow" approvals given in this session (no fields)."""
+
+
+class AlwaysAllowedForgotten(Ack):
+    """The tools that were always allowed and now ask again (as the posture says)."""
+
+    forgotten: list[str] = Field(default_factory=list)
 
 
 class StreamAck(BaseModel):

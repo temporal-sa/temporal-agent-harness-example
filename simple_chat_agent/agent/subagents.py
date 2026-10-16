@@ -10,7 +10,6 @@ model, and usage charged to the parent session.
 from __future__ import annotations
 
 from temporalio import workflow
-from temporalio.contrib.workflow_streams import WorkflowStream
 
 with workflow.unsafe.imports_passed_through():
     from pydantic import BaseModel, Field
@@ -66,14 +65,22 @@ class _ReadOnlyAgent:
 
     instructions: str = ""
 
-    def _setup(self, config: AgentConfig, data: SubagentInit, stream: WorkflowStream) -> None:
+    def _setup(self, config: AgentConfig, data: SubagentInit, stream: harness_ext.DrainableStream) -> None:
         self._data = data
+        self._stream = stream
         self._runner = AgentWorkflowRunner(
             config,
             stream=stream,
             approval_policy_default=ToolApprovalPolicy.allow_inherently_safe(),
         )
         self._history: list[ModelMessage] = []
+
+    @agent.teardown
+    async def _drain_stream(self) -> None:
+        """Let the bridge read this subagent's last events before the workflow completes: a
+        completed workflow's stream can't be read, and the parent stops a subagent as soon as
+        its reply arrives (see harness_ext.DrainableStream)."""
+        await harness_ext.drain_stream(self._stream)
 
     async def _ask(self, prompt: str, output_type: type[BaseModel]) -> BaseModel:
         toolset = harness_ext.per_run_toolset(
@@ -104,7 +111,7 @@ class ExplorerAgent(_ReadOnlyAgent):
     @agent.init
     def __init__(self, config: AgentConfig, data: SubagentInit) -> None:
         # The harness requires the stream to be built directly in @workflow.init.
-        self._setup(config, data, WorkflowStream())
+        self._setup(config, data, harness_ext.DrainableStream())
 
     @agent.accepts
     async def investigate(self, msg: Question) -> Findings:
@@ -121,7 +128,7 @@ class ReviewerAgent(_ReadOnlyAgent):
 
     @agent.init
     def __init__(self, config: AgentConfig, data: SubagentInit) -> None:
-        self._setup(config, data, WorkflowStream())
+        self._setup(config, data, harness_ext.DrainableStream())
 
     @agent.accepts
     async def review(self, msg: ReviewRequest) -> Review:

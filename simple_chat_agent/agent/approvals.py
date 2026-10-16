@@ -102,6 +102,9 @@ TOOL_RISK_CLASSES: dict[str, str] = {
     "fetch_url": NETWORK,
     "search_web": NETWORK,
     "create_artifact": EXTERNAL_SIDE_EFFECT,
+    # Test-only (test_tools): external so it is never judge-approvable, never "always
+    # allowed", and asks under every posture but never_ask.
+    "gated_echo": EXTERNAL_SIDE_EFFECT,
 }
 
 # The inline tools the harness ``subagent_toolset`` emits for our two read-only subagents:

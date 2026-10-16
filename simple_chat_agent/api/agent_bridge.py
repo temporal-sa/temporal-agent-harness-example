@@ -75,6 +75,11 @@ from simple_chat_agent.api import agent_telemetry as telemetry
 from simple_chat_agent.api.agent_store import AgentStore, LeaseLost, SessionMeta, fold, wake_pattern
 
 from simple_chat_agent.agent.contracts import STREAM_ACKED_SIGNAL, StreamAck
+from simple_chat_agent.agent.harness_ext import install_merge_fixes
+
+# The harness merge gave up on a subagent still delivering when the consumer was slow (see
+# harness_ext.install_merge_fixes): our consumer is the slow one (a Redis write per frame).
+install_merge_fixes()
 
 log = logging.getLogger(__name__)
 
@@ -119,6 +124,11 @@ def _digest(event: str, data: dict[str, Any]) -> str:
     """Content identity of a harness frame (``event_offset`` is ours, not the harness's)."""
     body = {k: v for k, v in data.items() if k != "event_offset"}
     return hashlib.sha256(f"{event}|{json.dumps(body, sort_keys=True)}".encode()).hexdigest()
+
+
+def _track_child_turn(child_open: dict[str, bool], event: str, data: dict[str, Any]) -> None:
+    if event in ("turn_started", "turn_end") and data.get("agent_id"):
+        child_open[data["agent_id"]] = event == "turn_started"
 
 
 class _LeaseLostError(Exception):
@@ -500,6 +510,11 @@ class _Forwarder:
         # repeat, e.g. two equal deltas published in one workflow task).
         seen_roots: set[int] = set()
         seen = Counter()
+        # Subagent agent id -> whether its latest turn is open, from the frames stored and
+        # forwarded. A replay that mounts a subagent whose workflow has since completed can't
+        # read it (``subagent_stream_unavailable``); if its turn is already stored in full, the
+        # marker is not news and isn't stored.
+        child_open: dict[str, bool] = {}
         self.tel.root_agent_id = self.tel.root_agent_id or meta.root_agent_id
         for f in await self.store.read_from(self.session, from_offset):
             if f.event.startswith("x_"):
@@ -509,6 +524,7 @@ class _Forwarder:
                 self.tel.root_agent_id = self.tel.root_agent_id or f.data.get("agent_id")
             else:
                 seen[_digest(f.event, f.data)] += 1
+                _track_child_turn(child_open, f.event, f.data)
         self.highest_root = max(self.highest_root, meta.head)
         self.turn_active = meta.turn_active
         if meta.run_id:
@@ -555,6 +571,14 @@ class _Forwarder:
                     if is_root:
                         await self.store.save_meta(self.session, meta)
                     continue
+                if not is_root:
+                    if event == "subagent_stream_unavailable":
+                        sub = data.get("subagent_id") or data.get("agent_id")
+                        if child_open.get(sub) is False:
+                            log.info("bridge %s: %s already stored in full; dropping replay marker",
+                                     self.session, sub)
+                            continue
+                    _track_child_turn(child_open, event, data)
                 if is_root:
                     data["event_offset"] = resume_offset - 1
                 obs = self.tel.observe(event, data, resume_offset, is_root=is_root)

@@ -116,6 +116,91 @@ class P1AgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("PINEAPPLE", chat_replies(events.collected)[-1]["text"])
             await handle.signal("close")
 
+    async def test_p3_forget_always_allowed_survives_continue_as_new(self) -> None:
+        """P3: forget_always_allowed clears "always allow" (here edit_file, given at start as a
+        remembered approval would), says what it forgot, and stays forgotten in the next run."""
+        from temporal_agent_harness.harness.agent_protocol import AgentConfig
+
+        from simple_chat_agent.agent import approvals
+        from simple_chat_agent.agent.contracts import AGENT_WORKFLOW_TYPE, CodingAgentInit
+
+        policy = approvals.policy_for("trust_safe", "local", also_allow=approvals.SUBAGENT_TOOL_NAMES)
+        workflow_id = f"p3-forget-{uuid.uuid4().hex[:8]}"
+        async with support.running_worker(self.client, self.task_queue):
+            handle = await self.client.start_workflow(
+                AGENT_WORKFLOW_TYPE,
+                args=[AgentConfig(approval_policy=policy.with_tool_allowed("edit_file")),
+                      CodingAgentInit(session_id=workflow_id, workspace_id=workflow_id, owner_id="test-user",
+                                      environment="local", posture="trust_safe", model=HAIKU,
+                                      force_continue_as_new_after_turns=1)],
+                id=workflow_id, task_queue=self.task_queue,
+            )
+            first_run = (await handle.describe()).run_id
+            async with support.EventCollector(self.client, handle.id) as events:
+                self.assertIn("edit_file", (await handle.query("history_stats"))["allowed_tools"])
+                await support.send(handle, "forget_always_allowed", {})
+                await events.wait_for(lambda c: any(e.event.output and "forgotten" in e.event.output
+                                                    for e in c.of("message_handler_end")), timeout=60)
+                out = [e.event.output for e in events.collected.of("message_handler_end") if "forgotten" in (e.event.output or {})][-1]
+                self.assertEqual(out["forgotten"], ["edit_file"])
+                self.assertNotIn("edit_file", (await handle.query("history_stats"))["allowed_tools"])
+                # One chat turn, then the agent continues as new (forced after 1 turn).
+                await support.send(handle, "chat", {"text": "Reply with the single word OK."})
+
+                async def next_run() -> bool:
+                    return (await handle.describe()).run_id != first_run
+
+                deadline = asyncio.get_running_loop().time() + 120
+                while not await next_run():
+                    self.assertLess(asyncio.get_running_loop().time(), deadline, "no continue-as-new")
+                    await asyncio.sleep(0.5)
+            stats = await self.client.get_workflow_handle(workflow_id).query("history_stats")
+            self.assertNotIn("edit_file", stats["allowed_tools"])
+            self.assertTrue(set(policy.auto_approve_tools) <= set(stats["allowed_tools"]))
+            await self.client.get_workflow_handle(workflow_id).signal("close")
+
+    async def test_p3_gated_echo_stacked_approvals_apply_once(self) -> None:
+        """P3 3e harness: the test-only gated_echo asks for every call (trust_safe), several
+        calls in one turn (same and different text), and each approved call runs once."""
+        async with support.running_worker(self.client, self.task_queue):
+            handle = await support.start_session(self.client, self.task_queue, model=SONNET, test_tools=True,
+                                                 posture="trust_safe")
+            async with support.EventCollector(self.client, handle.id) as events:
+                await support.send(handle, "chat", {"text": (
+                    "In ONE response, call gated_echo three times in parallel: text='same', text='same' "
+                    "and text='other'. After the results arrive, reply with the word DONE.")})
+                approved: set[str] = set()
+                deadline = asyncio.get_running_loop().time() + 240
+                while events.collected.turn_ends() < 1:
+                    self.assertLess(asyncio.get_running_loop().time(), deadline, "turn did not end")
+                    for e in events.collected.of("tool_approval_requested"):
+                        if e.event.tool_name == "gated_echo" and e.event.tool_id not in approved:
+                            approved.add(e.event.tool_id)
+                            await support.approve(handle, e.event.tool_id)
+                    await asyncio.sleep(0.3)
+                ends = [e for e in events.collected.of("tool_end") if e.event.tool_name == "gated_echo"]
+            await handle.signal("close")
+        asked = [e for e in events.collected.of("tool_approval_requested") if e.event.tool_name == "gated_echo"]
+        print(f"\n[P3 gated_echo] asked {len(asked)}, approved {len(approved)}, ran {len(ends)}")
+        self.assertGreaterEqual(len(asked), 3)
+        self.assertEqual({e.event.tool_id for e in ends}, approved)  # every approved call ran
+        self.assertEqual(len(ends), len(approved))  # once each
+        import ast
+        import json
+
+        def parsed(text: str) -> dict:
+            try:
+                return json.loads(text)
+            except ValueError:
+                return ast.literal_eval(text)
+
+        outputs = [parsed(e.event.tool_output) for e in ends]
+        texts = sorted(o["text"] for o in outputs)
+        self.assertEqual(texts.count("same"), 2, texts)
+        self.assertIn("other", texts)
+        self.assertTrue(all(o["attempt"] == 1 for o in outputs))
+        self.assertEqual(len({o["activity_id"] for o in outputs}), len(outputs))
+
 
 if __name__ == "__main__":
     unittest.main()

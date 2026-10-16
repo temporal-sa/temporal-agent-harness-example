@@ -600,6 +600,32 @@ class SessionTests(AgentRoutesTestBase):
         self.assertEqual(arg, FrontDoorMessage(request_id="m1", type="chat", payload={"text": "hi"}))
         self.assertEqual(self.bridge.woken, [sid])
 
+    def test_forget_always_allowed_and_chat_attachments_go_through_the_front_door(self) -> None:
+        sid = self.create()["workflow_id"]
+        r = self.client.post(
+            "/api/agent/messages",
+            json={"session_id": sid, "message": {"type": "forget_always_allowed", "payload": {}}, "request_id": "f1"},
+            headers=A,
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.temporal.signals[-1][1:],
+                         ("enqueue_message", FrontDoorMessage(request_id="f1", type="forget_always_allowed", payload={})))
+        attachments = [{"attachment_id": "att_1", "name": "notes.md", "size": 120, "content_type": "text/markdown"}]
+        r = self.client.post(
+            "/api/agent/messages",
+            json={"session_id": sid, "message": {"type": "chat", "payload": {"text": "see", "attachments": attachments}},
+                  "request_id": "c1"},
+            headers=A,
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.temporal.signals[-1][2].payload, {"text": "see", "attachments": attachments})
+        # The interface the UI reads lists the operation as not callable by the model.
+        functions = {f["name"]: f for f in self.client.get(f"/api/agent/agent-interface/{sid}", headers=A).json()}
+        forget = functions["forget_always_allowed"]
+        self.assertFalse(forget["model_callable"])
+        self.assertEqual(forget["mid_turn"], "accept")
+        self.assertIn("attachments", functions["chat"]["parameters"]["properties"])
+
     def test_workflow_status_and_status(self) -> None:
         sid = self.create()["workflow_id"]
         r = self.client.get(f"/api/agent/workflow-status/{sid}", headers=A).json()
@@ -974,7 +1000,7 @@ class AgentInterfaceTests(AgentRoutesTestBase):
         r = self.client.get(f"/api/agent/agent-interface/{sid}", headers=A)
         self.assertEqual(r.status_code, 200, r.text)
         names = [f["name"] for f in r.json()]
-        self.assertEqual(names, ["chat", "interrupt", "set_model", "set_posture", "steer"])
+        self.assertEqual(names, ["chat", "forget_always_allowed", "interrupt", "set_model", "set_posture", "steer"])
         chat = r.json()[0]
         self.assertEqual((chat["mid_turn"], chat["model_callable"]), ("enqueue", True))
         self.assertIn("text", chat["parameters"]["properties"])

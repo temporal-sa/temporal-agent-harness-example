@@ -39,11 +39,14 @@ with workflow.unsafe.imports_passed_through():
         ENQUEUE_MESSAGE_SIGNAL,
         STREAM_ACKED_SIGNAL,
         Ack,
+        AlwaysAllowedForgotten,
         CarriedState,
+        ChatAttachment,
         ChatMessage,
         ChatReply,
         CodingAgentInit,
         FrontDoorApproval,
+        ForgetAlwaysAllowed,
         FrontDoorMessage,
         InterruptRequest,
         ModelChoice,
@@ -90,6 +93,25 @@ INTERRUPTED_TOOL_NOTE = (
     "Stopped by the user before this result was used. The call may or may not have completed;\n"
     "check before relying on its effect."
 )
+
+
+def user_prompt(text: str, attachments: list[ChatAttachment]) -> str | list[str]:
+    """The model's prompt for a chat message: the text, plus one part listing the attached
+    files and how to read them (read_attachment) when there are any."""
+    if not attachments:
+        return text
+    lines = [
+        f"(The user attached {len(attachments)} file{'s' if len(attachments) != 1 else ''} to this "
+        "message. Read one with read_attachment(attachment_id=...), or copy it into the workspace "
+        "with import_attachment_to_workspace.)"
+    ]
+    for a in attachments:
+        name = " ".join((a.name or "attachment").split())[:200]
+        about = ", ".join(
+            x for x in (a.content_type or "", f"{a.size} bytes" if a.size is not None else "") if x
+        )
+        lines.append(f"- {name}{f' ({about})' if about else ''}: attachment_id={a.attachment_id}")
+    return [text, "\n".join(lines)]
 
 
 # Versioning behavior comes from the worker's deployment config (PINNED by default), so the
@@ -416,7 +438,7 @@ class CodingAgent:
         self._interrupted = False
         self._snapshot = None
         self._run_turn_id = ctx.turn_id
-        task = asyncio.ensure_future(self._run_turn(msg.text))
+        task = asyncio.ensure_future(self._run_turn(user_prompt(msg.text, msg.attachments)))
         self._run_task = task
         try:
             return ChatReply(text=await task)
@@ -508,7 +530,7 @@ class CodingAgent:
             self.changes, self.workspace, tool_name=name, tool_id=tool_id, args=args, result=result
         )
 
-    async def _run_turn(self, text: str) -> str:
+    async def _run_turn(self, text: str | list[str]) -> str:
         """One model run, with one retry on a context overflow using a tighter budget,
         resumed from the last request so tools that already ran don't run again."""
         budget = context.budget_for(self._model.registry_key)
@@ -520,7 +542,7 @@ class CodingAgent:
             self._history = self._snapshot
             return await self._run_model(None, context.tighter(budget))
 
-    async def _run_model(self, text: str | None, budget: Any) -> str:
+    async def _run_model(self, text: str | list[str] | None, budget: Any) -> str:
         choice = self._model
         hooks = Hooks(
             before_model_request=self._before_model_request,
@@ -637,6 +659,25 @@ class CodingAgent:
         harness_ext.set_policy_keeping_pending(self._runner, policy)
         self._data = self._data.model_copy(update={"posture": msg.posture})
         return Ack(detail=f"Approvals: {msg.posture.replace('_', ' ')}.")
+
+    @agent.accepts(mid_turn=MidTurn.ACCEPT, model_callable=False)
+    async def forget_always_allowed(self, msg: ForgetAlwaysAllowed) -> AlwaysAllowedForgotten:
+        """Forget this session's "always allow" approvals. Those tools ask again unless the posture allows them."""
+        try:
+            policy = approvals.policy_for(
+                self._data.posture, self._data.environment, also_allow=approvals.SUBAGENT_TOOL_NAMES
+            )
+        except ApplicationError as exc:
+            return AlwaysAllowedForgotten(ok=False, detail=exc.message)
+        # The posture's own allow-list stays; everything added by "always allow" goes. Carried
+        # across continue-as-new by AgentConfig.approval_policy, like the allow-list itself.
+        forgotten = sorted(set(self._runner.approval_policy.auto_approve_tools) - set(policy.auto_approve_tools))
+        harness_ext.set_policy_keeping_pending(self._runner, policy)
+        if not forgotten:
+            return AlwaysAllowedForgotten(detail="Nothing was always allowed.")
+        return AlwaysAllowedForgotten(
+            detail=f"These ask again: {', '.join(forgotten)}.", forgotten=forgotten
+        )
 
     @agent.accepts(mid_turn=MidTurn.ACCEPT, model_callable=False)
     async def interrupt(self, msg: InterruptRequest) -> Ack:
