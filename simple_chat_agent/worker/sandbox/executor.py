@@ -1502,6 +1502,7 @@ async def _run_process(
             elapsed_seconds=time.monotonic() - started_at,
             before=before,
             after=after,
+            git_branch=_git_branch(workspace_dir),
         )
         if stop_type is not None:
             result.update(_stop_error(stop_type))
@@ -2071,6 +2072,7 @@ def _result_payload(
     elapsed_seconds: float,
     before: dict[str, tuple[int, int]],
     after: dict[str, tuple[int, int]],
+    git_branch: str | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "workspace": workspace_key,
@@ -2083,6 +2085,9 @@ def _result_payload(
         "timed_out": timed_out,
         "elapsed_seconds": round(elapsed_seconds, 3),
         "files_changed": _changed_files(before, after),
+        # The workspace repo's current branch after the command (None: not a repo, or
+        # unknown). Read from .git/HEAD, so no git process runs for it.
+        "git_branch": git_branch,
     }
     if stdout.truncated:
         result["stdout_truncated"] = True
@@ -2097,6 +2102,48 @@ def _result_payload(
         result["error"] = f"Command exited with code {exit_code}."
         result["type"] = "WorkspaceShellProcessError"
     return result
+
+
+GIT_HEAD_MAX_BYTES = 512
+GIT_DETACHED_HEAD = "HEAD (no branch)"  # what `git status -b` prints for a detached HEAD
+_GIT_HEAD_REF = re.compile(r"ref: refs/heads/([^\x00-\x1f\x7f]{1,250})")
+_GIT_HEAD_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def _git_branch(workspace_dir: Path) -> str | None:
+    """The branch checked out in the workspace's root repo, read from ``.git/HEAD``.
+
+    Returns the branch name, :data:`GIT_DETACHED_HEAD` for a detached HEAD, or None when
+    the workspace root is not a repo or HEAD can't be read (a ``.git`` file or symlink,
+    reftable storage, an unexpected format). Symlinks are never followed, and only a
+    well-formed ref or object id is returned, so nothing else the workspace planted in
+    HEAD can leak out.
+    """
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        git_fd = os.open(workspace_dir / ".git", flags | os.O_DIRECTORY)
+    except OSError:
+        return None
+    try:
+        head_fd = os.open("HEAD", flags | os.O_NONBLOCK, dir_fd=git_fd)
+        try:
+            if not stat_module.S_ISREG(os.fstat(head_fd).st_mode):
+                return None
+            data = os.read(head_fd, GIT_HEAD_MAX_BYTES)
+        finally:
+            os.close(head_fd)
+    except OSError:
+        return None
+    finally:
+        os.close(git_fd)
+    text = data.decode("utf-8", errors="replace").strip()
+    ref = _GIT_HEAD_REF.fullmatch(text)
+    if ref:
+        name = ref.group(1)
+        return None if name == ".invalid" else name  # reftable stores HEAD elsewhere
+    if _GIT_HEAD_SHA.fullmatch(text):
+        return GIT_DETACHED_HEAD
+    return None
 
 
 def _workspace_snapshot(workspace_dir: Path) -> dict[str, tuple[int, int]]:

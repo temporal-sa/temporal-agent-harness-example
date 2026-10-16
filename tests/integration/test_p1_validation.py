@@ -83,6 +83,42 @@ class P1Validation(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(state_value(c, "workspace").get("last_exit_code"), 0)
             await h.signal("close")
 
+    async def test_1_1d_sandbox_notice_stream_tags_and_branch(self) -> None:
+        # P3 (U3): the executor is unreachable on the first attempt, so the browser gets a
+        # "sandbox isn't answering" frame with the retry time, then "up" when Temporal's
+        # retry reaches it. Output arrives tagged by stream, and the workspace state gets
+        # the branch. All through the real Temporal stream.
+        from unittest.mock import patch
+
+        from simple_chat_agent.agent.tools import workspace as ws
+
+        async with support.running_worker(self.client, self.task_queue):
+            h = await support.start_session(self.client, self.task_queue, model=HAIKU, posture="never_ask")
+            async with support.EventCollector(self.client, h.id) as ev:
+                frames = lambda c: [ws.parse_progress_delta(e.event.progress_delta) for e in c.of("tool_progress_delta")]
+                with patch.dict(os.environ, {"WORKSPACE_EXECUTOR_URL": "http://127.0.0.1:9"}):
+                    await support.send(h, "chat", {"text": (
+                        "Run exactly this with run_command: "
+                        "git init -q -b demo-branch && echo to-stdout && echo to-stderr >&2"
+                    )})
+                    await ev.wait_for(lambda c: any(f.get("state") == "down" for f in frames(c)), timeout=180)
+                await ev.wait_for(lambda c: c.turn_ends() >= 1, timeout=180)
+                seen = frames(ev.collected)
+                notices = [f for f in seen if f["type"] == "sandbox"]
+                down = notices[0]
+                self.assertEqual((down["state"], down["attempt"], down["will_retry"]), ("down", 1, True))
+                self.assertEqual(down["message"], ws.SANDBOX_DOWN_MESSAGE)
+                self.assertAlmostEqual(down["next_retry_at"], time.time(), delta=60)
+                self.assertEqual(notices[-1], {"v": 1, "type": "sandbox", "state": "up", "attempt": 2})
+                # The failed attempt's heartbeat reached the retry: no "worker restarted" line.
+                self.assertNotIn("reattaching", ws.progress_text(e.event.progress_delta for e in ev.collected.of("tool_progress_delta")))
+                deltas = [e.event.progress_delta for e in ev.collected.of("tool_progress_delta")]
+                self.assertIn("to-stderr", ws.progress_text(deltas, ("stderr",)))
+                self.assertNotIn("to-stderr", ws.progress_text(deltas, ("stdout",)))
+                self.assertIn("to-stdout", ws.progress_text(deltas, ("stdout",)))
+                self.assertEqual(state_value(ev.collected, "workspace").get("branch"), "demo-branch")
+            await h.signal("close")
+
     async def test_1_1c_sigkill_during_command_runs_it_once(self) -> None:
         a = self._worker("worker-a")
         await asyncio.sleep(5)

@@ -19,6 +19,9 @@ A job is keyed by `(workspace, execution_id)`, and it outlives the HTTP stream t
 - **Replay buffer limits**: the buffer is capped at `JOB_REPLAY_BUFFER_CHARS` (128k) and `JOB_REPLAY_BUFFER_EVENTS` (2048), and the oldest events are dropped first. A client that fell behind gets one `{"kind": "dropped"}` marker. The final result is stored outside the buffer and is never dropped.
 - **Disconnects**: a client disconnect does not kill the job. A job with no attached client for `WORKSPACE_EXECUTOR_ORPHAN_GRACE_SECONDS` (default 120) is stopped, with result type `WorkspaceShellAbandoned`. `/execute/cancel` stops a job immediately, with result type `WorkspaceShellCancelled`.
 
+- **Stream events**: one JSON object per line, `{"kind": ..., "seq": n, "payload": {...}}`. `kind` is `start`, `stdout`, `stderr` (`payload.text`), `progress`, `dropped` or `result`. Output events keep their `stdout`/`stderr` kind in the replay buffer, so a reattached or late client still knows which stream each chunk came from. The worker's `run_command` forwards them to the browser as tagged frames (see the docstring of `simple_chat_agent/agent/tools/workspace.py`).
+- **Result `git_branch`**: the result payload names the branch checked out in the workspace root's repo after the command, read from `.git/HEAD` without running git and without following symlinks. It is `"HEAD (no branch)"` when detached, and `null` when the root isn't a repo or HEAD can't be read (a `.git` file, reftable storage). An older executor omits the field; the worker treats that as unknown.
+
 - **Fingerprint**: every live job and every cached result records a fingerprint of its command, cwd, timeout, network and stdin. A request whose fingerprint doesn't match gets HTTP 409, so a reused `execution_id` never receives another command's result. The worker derives ids from workflow id + run id + activity/tool id, so continue-as-new can't collide.
 
 ### Locks and concurrency

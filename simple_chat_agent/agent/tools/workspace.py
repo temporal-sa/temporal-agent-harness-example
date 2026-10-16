@@ -13,6 +13,28 @@ crash reattaches to the running job (or reads its cached result) instead of star
 
 ``workspace_id`` is always injected by the agent from its own session, never chosen by the model.
 
+Live output frames (``tool_progress_delta`` from ``run_command``)
+---------------------------------------------------------------
+The harness event has one free-text field, ``progress_delta``, and drops any extra field on
+its way to the browser, so each chunk is a tagged frame inside that string: the ASCII
+record separator ``\x1e`` (as in RFC 7464 JSON text sequences) followed by one JSON object.
+A ``progress_delta`` that does not start with ``\x1e`` is a legacy, untagged chunk of plain
+output (treat it as stdout). Frames (``v`` is 1):
+
+* ``{"v": 1, "type": "output", "seq": 12, "chunks": [{"stream": "stdout", "text": "..."},
+  {"stream": "stderr", "text": "..."}]}``: output in arrival order. ``stream`` is
+  ``stdout``, ``stderr`` or ``note`` (a line from us, not the command: the reattach line,
+  "[... dropped ...]", "[live output limit reached ...]"). ``seq`` is the executor's last
+  event seq in the frame (null for a frame of notes only); it only grows within a run, also
+  across a reattach, so a client may drop a frame whose seq it has already shown.
+* ``{"v": 1, "type": "sandbox", "state": "down", "attempt": 2, "max_attempts": 6,
+  "will_retry": true, "retry_in_s": 5.0, "next_retry_at": 1760620005.2, "reason": "...",
+  "message": "The sandbox isn't answering. Temporal will retry the command."}``: this
+  attempt could not reach the executor and fails; Temporal retries it (``next_retry_at``
+  is epoch seconds, approximate; null with ``will_retry: false`` on the last attempt).
+* ``{"v": 1, "type": "sandbox", "state": "up", "attempt": 3}``: a retry reached the
+  executor again; clear the notice. Sent once by every retry that reaches it.
+
 Risk classes and retry policies (PRD §5.2, §5.8):
 
 ==============  ===================  ===========================================================
@@ -87,6 +109,9 @@ TICK_SECONDS = 0.1  # how often a waiting stream checks for progress flushes and
 PROGRESS_BATCH_INTERVAL = timedelta(milliseconds=300)
 PROGRESS_FLUSH_SECONDS = 0.25
 PROGRESS_FLUSH_CHARS = 4_000
+PROGRESS_FRAME_PREFIX = "\x1e"  # ASCII record separator: a tagged frame follows (RFC 7464)
+PROGRESS_FRAME_VERSION = 1
+SANDBOX_DOWN_MESSAGE = "The sandbox isn't answering. Temporal will retry the command."
 MAX_PROGRESS_CHARS = 250_000
 STREAM_RECONNECTS = 3
 LIST_SKIP_DIRS = frozenset(
@@ -331,11 +356,11 @@ class WriteResult(ToolResult):
     diff_truncated: bool = False
 
     def model_text(self) -> str:
+        # A rewrite of an existing file carries its diff, in edit_file's format; a new file
+        # doesn't (its content is the tool's input).
         verb = "Created" if self.created else "Wrote"
-        return (
-            f"{verb} {self.path} ({self.bytes_written} bytes, "
-            f"+{self.added_lines} -{self.removed_lines})."
-        )
+        head = f"{verb} {self.path} ({self.bytes_written} bytes, +{self.added_lines} -{self.removed_lines})."
+        return f"{head}\n{self.diff}" if self.diff and not self.created else head
 
 
 class EditResult(ToolResult):
@@ -398,6 +423,9 @@ class CommandResult(ToolResult):
     log_ref: str = Field(default="", description="Executor execution_id holding the full log.")
     attempt: int = 1
     reattached: bool = False
+    branch: str | None = Field(
+        default=None, description="The workspace repo's branch after the command; None if unknown."
+    )
 
     def model_text(self) -> str:
         shown = self.command if len(self.command) <= 200 else self.command[:200] + "…"
@@ -484,6 +512,7 @@ class GitCommitResult(ToolResult):
     insertions: int = 0
     deletions: int = 0
     output: str = ""
+    branch: str | None = None
 
     def model_text(self) -> str:
         if not self.committed:
@@ -591,6 +620,7 @@ def _executor_headers() -> dict[str, str]:
 def _unavailable(detail: Any) -> ApplicationError:
     return ApplicationError(
         f"The sandbox isn't answering ({detail}). Temporal will retry every 5s.",
+        {"reason": str(detail)[:200]},
         type="ExecutorUnavailable",
     )
 
@@ -662,13 +692,14 @@ async def _stream_execute(
     on_tick: Callable[[], None] | None = None,
     resume_seq: int = -1,
     seq_sink: dict[str, Any] | None = None,
+    on_accept: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """POST /execute and follow its NDJSON stream to the result.
 
     Returns ``(result_payload, attached)``. ``on_event(kind, payload)`` sees every stream
     event after ``resume_seq`` (``stdout``/``stderr``/``progress``/``dropped``); ``on_tick``
     runs after each event and every :data:`TICK_SECONDS` while waiting, for heartbeats and
-    progress flushes.
+    progress flushes. ``on_accept`` runs once, when the executor first accepts the job.
 
     Failures before the executor accepts the job raise a retryable ``ExecutorUnavailable``.
     If the stream breaks after that, this reconnects with the same execution_id (the
@@ -713,6 +744,8 @@ async def _stream_execute(
                     event_kind = str(item.get("kind") or "")
                     payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
                     if event_kind == "start":
+                        if not accepted and on_accept:
+                            on_accept()
                         accepted = True
                         attached = attached or bool(payload.get("attached"))
                         continue
@@ -957,12 +990,14 @@ async def read_file(
 async def write_file(path: str, content: str, workspace_id: agent.Injected[str]) -> WriteResult:
     """Create or overwrite a text file in the workspace. Parent directories are created.
     `path` is relative to the workspace root. Prefer edit_file for changes to an existing file."""
+    diffable = True
     try:
         before = await _read_text_if_exists(workspace_id, path)
     except ApplicationError as err:
         if _error_code(err) not in ("too_large", "binary"):
             raise
-        before = ""  # too big or binary to diff: count the new text only
+        before = ""  # too big or binary to diff: count the new text only, show no diff
+        diffable = False
     data = await _files_call(
         "write",
         {
@@ -975,6 +1010,8 @@ async def write_file(path: str, content: str, workspace_id: agent.Injected[str])
     )
     shown = data.get("path", path)
     diff, added, removed, cut = unified_diff(shown, before or "", content)
+    if not diffable:
+        diff, cut = "", False
     return WriteResult(
         path=shown,
         created=bool(data.get("created", before is None)),
@@ -1129,8 +1166,38 @@ class RunCommandInput(BaseModel):
     tool_ctx: agent.AgentToolContext
 
 
+def progress_frame(frame_type: str, **fields: Any) -> str:
+    """One tagged ``progress_delta`` (see the module docstring)."""
+    body = {"v": PROGRESS_FRAME_VERSION, "type": frame_type, **fields}
+    return PROGRESS_FRAME_PREFIX + json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+
+
+def parse_progress_delta(delta: str) -> dict[str, Any]:
+    """Decode one ``progress_delta``; a legacy untagged chunk reads as stdout output."""
+    if delta.startswith(PROGRESS_FRAME_PREFIX):
+        with suppress(ValueError):
+            frame = json.loads(delta[len(PROGRESS_FRAME_PREFIX):])
+            if isinstance(frame, dict):
+                return frame
+    return {"v": 0, "type": "output", "seq": None, "chunks": [{"stream": "stdout", "text": delta}]}
+
+
+def progress_text(deltas: Any, streams: tuple[str, ...] = ("stdout", "stderr", "note")) -> str:
+    """The output text of some ``progress_delta`` strings, for tests and logs."""
+    return "".join(
+        chunk.get("text", "")
+        for delta in deltas
+        for chunk in parse_progress_delta(delta).get("chunks", [])
+        if chunk.get("stream") in streams
+    )
+
+
 class _ProgressCoalescer:
-    """Turn many small stdout/stderr chunks into fewer ``tool_progress_delta`` events."""
+    """Turn many small stdout/stderr chunks into fewer ``tool_progress_delta`` events.
+
+    Each flush publishes one ``output`` frame whose chunks keep their stream and order
+    (adjacent chunks of one stream are merged).
+    """
 
     def __init__(
         self,
@@ -1144,32 +1211,41 @@ class _ProgressCoalescer:
         self._flush_seconds = flush_seconds
         self._flush_chars = flush_chars
         self._budget = max_chars
-        self._pending: list[str] = []
+        self._pending: list[dict[str, str]] = []
         self._pending_chars = 0
+        self._pending_seq: int | None = None
         self._first_at = 0.0
         self._capped = False
         self.published_chars = 0
 
-    def add(self, text: str) -> None:
+    def _append(self, stream: str, text: str) -> None:
+        if not self._pending:
+            self._first_at = time.monotonic()
+        if self._pending and self._pending[-1]["stream"] == stream:
+            self._pending[-1]["text"] += text
+        else:
+            self._pending.append({"stream": stream, "text": text})
+
+    def add(self, text: str, stream: str = "stdout", seq: int | None = None) -> None:
         if not text:
             return
         if self._budget <= 0:
             if not self._capped:
                 self._capped = True
-                self._pending.append("\n[live output limit reached; the result has the tail]\n")
+                self._append("note", "\n[live output limit reached; the result has the tail]\n")
                 self.flush()
             return
         text = text[: self._budget]
         self._budget -= len(text)
-        if not self._pending:
-            self._first_at = time.monotonic()
-        self._pending.append(text)
+        self._append(stream, text)
+        if seq is not None:
+            self._pending_seq = seq
         self._pending_chars += len(text)
         if self._pending_chars >= self._flush_chars:
             self.flush()
 
     def note(self, text: str) -> None:
-        self._pending.append(text)
+        self._append("note", text)
         self.flush()
 
     def maybe_flush(self) -> None:
@@ -1179,11 +1255,32 @@ class _ProgressCoalescer:
     def flush(self) -> None:
         if not self._pending:
             return
-        text = "".join(self._pending)
-        self._pending.clear()
+        chunks = self._pending
+        seq = self._pending_seq
+        self._pending = []
         self._pending_chars = 0
-        self.published_chars += len(text)
-        self._publish(text)
+        self._pending_seq = None
+        self.published_chars += sum(len(c["text"]) for c in chunks)
+        self._publish(progress_frame("output", seq=seq, chunks=chunks))
+
+
+def _retry_schedule(info: activity.Info) -> dict[str, Any]:
+    """When Temporal retries this failing attempt, from the activity's retry policy."""
+    policy = info.retry_policy or RUN_COMMAND_RETRY_POLICY
+    attempt = info.attempt
+    max_attempts = policy.maximum_attempts or 0
+    will_retry = max_attempts == 0 or attempt < max_attempts
+    initial = policy.initial_interval.total_seconds()
+    delay = initial * (policy.backoff_coefficient ** max(0, attempt - 1))
+    cap = policy.maximum_interval.total_seconds() if policy.maximum_interval else initial * 100
+    delay = round(min(delay, cap), 3)
+    return {
+        "attempt": attempt,
+        "max_attempts": max_attempts or None,
+        "will_retry": will_retry,
+        "retry_in_s": delay if will_retry else None,
+        "next_retry_at": round(time.time() + delay, 3) if will_retry else None,
+    }
 
 
 def command_result(
@@ -1221,7 +1318,13 @@ def command_result(
         log_ref=log_ref,
         attempt=attempt,
         reattached=reattached,
+        branch=_branch(payload),
     )
+
+
+def _branch(payload: dict[str, Any]) -> str | None:
+    branch = payload.get("git_branch")
+    return branch[:250] if isinstance(branch, str) and branch else None
 
 
 @activity.defn(name="workspace.run_command")
@@ -1233,10 +1336,13 @@ async def run_command_activity(request: RunCommandInput) -> CommandResult:
         "run_command", info.workflow_id or "", info.workflow_run_id or "", tool_ctx.tool_id
     )
     resume_seq = -1
+    previous_sandbox_down = False
     if info.attempt > 1 and info.heartbeat_details:
         last = info.heartbeat_details[-1]
-        if isinstance(last, dict) and isinstance(last.get("seq"), int):
-            resume_seq = last["seq"]
+        if isinstance(last, dict):
+            if isinstance(last.get("seq"), int):
+                resume_seq = last["seq"]
+            previous_sandbox_down = bool(last.get("sandbox_down"))
     body = {
         "workspace_id": request.workspace_id,
         "execution_id": execution_id,
@@ -1245,7 +1351,7 @@ async def run_command_activity(request: RunCommandInput) -> CommandResult:
         "timeout_seconds": max(1, min(int(request.timeout_seconds), MAX_TIMEOUT_SECONDS)),
         "network": True,
     }
-    state = {"seq": resume_seq, "execution_id": execution_id}
+    state: dict[str, Any] = {"seq": resume_seq, "execution_id": execution_id}
 
     async with AgentWorkflowRunner.publisher_from_activity(
         tool_ctx.stream_context, batch_interval=PROGRESS_BATCH_INTERVAL
@@ -1258,12 +1364,21 @@ async def run_command_activity(request: RunCommandInput) -> CommandResult:
 
         progress = _ProgressCoalescer(publish)
         beat = _heartbeat_ticker(lambda: dict(state))
-        if info.attempt > 1:
+        # A retry after the sandbox was unreachable, with no output delivered yet, is not a
+        # worker restart; one after output was delivered still reattaches to a live job.
+        if info.attempt > 1 and not (previous_sandbox_down and resume_seq < 0):
             progress.note(f"\n[worker restarted; reattaching to the command (attempt {info.attempt})]\n")
+
+        def on_accept() -> None:
+            # A retry reached the executor: clear any "sandbox isn't answering" notice.
+            if info.attempt > 1:
+                publish(progress_frame("sandbox", state="up", attempt=info.attempt))
+                with suppress(Exception):
+                    activity.heartbeat(dict(state))  # drop the sandbox_down mark now
 
         def on_event(kind: str, payload: dict[str, Any]) -> None:
             if kind in ("stdout", "stderr"):
-                progress.add(str(payload.get("text") or ""))
+                progress.add(str(payload.get("text") or ""), kind, state.get("seq"))
             elif kind == "dropped":
                 progress.note(f"\n{payload.get('message') or '[earlier output dropped]'}\n")
 
@@ -1280,7 +1395,27 @@ async def run_command_activity(request: RunCommandInput) -> CommandResult:
                 on_tick=on_tick,
                 resume_seq=resume_seq,
                 seq_sink=state,
+                on_accept=on_accept,
             )
+        except ApplicationError as err:
+            if err.type == "ExecutorUnavailable" and not err.non_retryable:
+                # Tell the browser, then fail as before: Temporal owns the retry. The
+                # heartbeat marks the next attempt as a sandbox retry, not a worker restart.
+                progress.flush()
+                detail = err.details[0] if err.details else None
+                reason = detail.get("reason") if isinstance(detail, dict) else None
+                publish(
+                    progress_frame(
+                        "sandbox",
+                        state="down",
+                        **_retry_schedule(info),
+                        reason=reason or err.message,
+                        message=SANDBOX_DOWN_MESSAGE,
+                    )
+                )
+                with suppress(Exception):
+                    activity.heartbeat({**state, "sandbox_down": True})
+            raise
         except asyncio.CancelledError:
             # Stop the job only when the workflow asked (user interrupt). A worker shutdown
             # or a zombie attempt whose heartbeat timed out must leave it running: the
@@ -1524,7 +1659,9 @@ async def git_commit(
         workspace_id, "git_commit", git_commit_command(add_all), stdin=message.strip() + "\n"
     )
     _raise_if_git_refused(result)
-    return parse_git_commit(result)
+    commit = parse_git_commit(result)
+    commit.branch = _branch(result)
+    return commit
 
 
 WORKSPACE_TOOLS = (

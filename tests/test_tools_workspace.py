@@ -23,6 +23,7 @@ import threading
 import time
 import unittest
 import uuid
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -30,6 +31,7 @@ from unittest.mock import patch
 import uvicorn
 from fastapi import HTTPException
 from temporalio.activity import ActivityCancellationDetails
+from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -220,12 +222,161 @@ class ResultRenderingTests(unittest.TestCase):
         coalescer = ws._ProgressCoalescer(published.append, flush_seconds=60, flush_chars=10, max_chars=25)
         for _ in range(3):
             coalescer.add("abcd")
-        self.assertEqual(published, ["abcdabcdabcd"])
+        self.assertEqual(len(published), 1)
+        self.assertEqual(ws.progress_text(published), "abcdabcdabcd")
         coalescer.add("x" * 20)  # crosses the 25-char budget
         coalescer.add("more")
         coalescer.flush()
-        self.assertEqual("".join(published).count("x"), 13)
-        self.assertIn("live output limit", published[-1])
+        self.assertEqual(ws.progress_text(published).count("x"), 13)
+        self.assertIn("live output limit", ws.progress_text(published[-1:]))
+
+    def test_progress_frames_keep_each_stream_in_order(self) -> None:
+        published: list[str] = []
+        coalescer = ws._ProgressCoalescer(published.append, flush_seconds=60, flush_chars=1_000)
+        coalescer.add("a\n", "stdout", 0)
+        coalescer.add("b\n", "stdout", 1)
+        coalescer.add("warn\n", "stderr", 2)
+        coalescer.add("c\n", "stdout", 3)
+        coalescer.note("[note]\n")
+        self.assertEqual(len(published), 1)
+        self.assertTrue(published[0].startswith(ws.PROGRESS_FRAME_PREFIX))
+        frame = ws.parse_progress_delta(published[0])
+        self.assertEqual((frame["v"], frame["type"], frame["seq"]), (1, "output", 3))
+        self.assertEqual(
+            frame["chunks"],
+            [
+                {"stream": "stdout", "text": "a\nb\n"},
+                {"stream": "stderr", "text": "warn\n"},
+                {"stream": "stdout", "text": "c\n"},
+                {"stream": "note", "text": "[note]\n"},
+            ],
+        )
+        self.assertEqual(ws.progress_text(published, ("stderr",)), "warn\n")
+
+    def test_untagged_progress_reads_as_stdout(self) -> None:
+        self.assertEqual(
+            ws.parse_progress_delta("legacy text\n"),
+            {"v": 0, "type": "output", "seq": None, "chunks": [{"stream": "stdout", "text": "legacy text\n"}]},
+        )
+        # A broken frame is shown as text rather than lost.
+        self.assertEqual(ws.progress_text(["\x1e{not json"]), "\x1e{not json")
+
+    def test_retry_schedule_follows_the_policy(self) -> None:
+        def info(attempt: int, policy: Any) -> Any:
+            return dataclasses.replace(ActivityEnvironment().info, attempt=attempt, retry_policy=policy)
+
+        before = time.time()
+        first = ws._retry_schedule(info(1, ws.RUN_COMMAND_RETRY_POLICY))
+        self.assertEqual(
+            {k: first[k] for k in ("attempt", "max_attempts", "will_retry", "retry_in_s")},
+            {"attempt": 1, "max_attempts": 6, "will_retry": True, "retry_in_s": 5.0},
+        )
+        self.assertAlmostEqual(first["next_retry_at"], before + 5, delta=2)
+        last = ws._retry_schedule(info(6, ws.RUN_COMMAND_RETRY_POLICY))
+        self.assertEqual((last["will_retry"], last["retry_in_s"], last["next_retry_at"]), (False, None, None))
+        backoff = RetryPolicy(initial_interval=timedelta(seconds=1), backoff_coefficient=2.0,
+                              maximum_interval=timedelta(seconds=5))
+        self.assertEqual(ws._retry_schedule(info(3, backoff))["retry_in_s"], 4.0)
+        self.assertEqual(ws._retry_schedule(info(9, backoff))["retry_in_s"], 5.0)
+        self.assertIsNone(ws._retry_schedule(info(9, backoff))["max_attempts"])  # unlimited
+
+
+class GitBranchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+
+    def head(self, text: str) -> str | None:
+        git = self.root / ".git"
+        git.mkdir(exist_ok=True)
+        (git / "HEAD").write_text(text)
+        return ex._git_branch(self.root)
+
+    def test_reads_the_branch_without_running_git(self) -> None:
+        self.assertIsNone(ex._git_branch(self.root))  # not a repo
+        self.assertEqual(self.head("ref: refs/heads/main\n"), "main")
+        self.assertEqual(self.head("ref: refs/heads/feature/x-1\n"), "feature/x-1")
+        self.assertEqual(self.head("0123456789abcdef0123456789abcdef01234567\n"), ex.GIT_DETACHED_HEAD)
+        self.assertIsNone(self.head("ref: refs/heads/.invalid\n"))  # reftable
+        self.assertIsNone(self.head("ref: refs/tags/v1\n"))
+        self.assertIsNone(self.head("ref: refs/heads/a\x1b[31mred\n"))
+        self.assertIsNone(self.head("anything else"))
+
+    def test_never_follows_symlinks(self) -> None:
+        secret = self.root / "secret"
+        secret.write_text("ref: refs/heads/leaked\n")
+        git = self.root / ".git"
+        git.mkdir()
+        (git / "HEAD").symlink_to(secret)
+        self.assertIsNone(ex._git_branch(self.root))
+        other = self.root / "elsewhere"
+        other.mkdir()
+        (other / "HEAD").write_text("ref: refs/heads/leaked\n")
+        nested = self.root / "nested"
+        nested.mkdir()
+        (nested / ".git").symlink_to(other)
+        self.assertIsNone(ex._git_branch(nested))
+
+    def test_git_file_is_not_followed(self) -> None:
+        (self.root / ".git").write_text("gitdir: /somewhere/else\n")
+        self.assertIsNone(ex._git_branch(self.root))
+
+
+class WorkspaceStateFoldTests(unittest.TestCase):
+    def refs(self) -> tuple[Any, Any, list[Any]]:
+        from temporal_agent_harness.harness.state import StateRef
+
+        from simple_chat_agent.agent import state as st
+
+        events: list[Any] = []
+        return (
+            StateRef("changes", st.ChangesState(), events.append),
+            StateRef("workspace", st.WorkspaceState(), events.append),
+            events,
+        )
+
+    def fold(self, changes: Any, workspace: Any, name: str, result: Any, args: dict[str, Any] | None = None) -> None:
+        from simple_chat_agent.agent import state as st
+
+        st.fold_tool_result(changes, workspace, tool_name=name, tool_id="t", args=args or {}, result=result)
+
+    def test_branch_follows_git_status_commit_and_run_command(self) -> None:
+        changes, workspace, events = self.refs()
+        self.assertEqual(workspace.current.branch, "")
+        self.fold(changes, workspace, "git_status", ws.GitStatusResult(branch="main"))
+        self.assertEqual(workspace.current.branch, "main")
+        published = len(events)
+        self.fold(changes, workspace, "git_status", ws.GitStatusResult(branch="main"))
+        self.assertEqual(len(events), published)  # unchanged: no patch
+        self.fold(changes, workspace, "git_status", ws.GitStatusResult(error="boom", clean=False))
+        self.assertEqual(workspace.current.branch, "main")  # unknown keeps the last one
+        self.fold(
+            changes, workspace, "run_command",
+            ws.CommandResult(command="git switch -c fix", exit_code=0, stdout_tail="", stderr_tail="", branch="fix"),
+            {"command": "git switch -c fix"},
+        )
+        self.assertEqual(
+            (workspace.current.branch, workspace.current.last_command, workspace.current.last_exit_code),
+            ("fix", "git switch -c fix", 0),
+        )
+        self.fold(changes, workspace, "run_command",
+                  ws.CommandResult(command="ls", exit_code=0, stdout_tail="", stderr_tail=""), {"command": "ls"})
+        self.assertEqual(workspace.current.branch, "fix")
+        self.fold(changes, workspace, "git_commit",
+                  ws.GitCommitResult(committed=True, commit="abc", summary="m", branch="release"))
+        self.assertEqual(workspace.current.branch, "release")
+        # Other tools never move it, even with a field of that name.
+        self.fold(changes, workspace, "read_file", ws.GitStatusResult(branch="nope"))
+        self.assertEqual(workspace.current.branch, "release")
+
+    def test_state_from_an_older_run_still_loads(self) -> None:
+        from simple_chat_agent.agent import state as st
+
+        old = {"last_command": "pytest", "last_exit_code": 1, "commands_run": 3}
+        restored = st.WorkspaceState.model_validate(old)
+        self.assertEqual(restored.branch, "")
+        self.assertEqual(restored.commands_run, 3)
 
 
 class SandboxEnvTests(unittest.TestCase):
@@ -699,7 +850,10 @@ class _FakePublisher:
 
     @property
     def text(self) -> str:
-        return "".join(e.progress_delta for _, e in self.events)
+        return ws.progress_text(e.progress_delta for _, e in self.events)
+
+    def frames(self) -> list[dict[str, Any]]:
+        return [ws.parse_progress_delta(e.progress_delta) for _, e in self.events]
 
 
 def _tool_ctx(tool_id: str) -> agent.AgentToolContext:
@@ -768,10 +922,21 @@ class RunCommandActivityTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
         )
         # "hi" was published well before the command finished (within 1 s of output).
         first_at, first = self.publisher.events[0]
-        self.assertEqual(first.progress_delta, "hi\n")
+        self.assertEqual(
+            ws.parse_progress_delta(first.progress_delta)["chunks"], [{"stream": "stdout", "text": "hi\n"}]
+        )
         self.assertEqual(first.tool_id, "toolu_1")
         self.assertLess(first_at - started, 1.0)
         self.assertEqual(self.publisher.text, "hi\ndone\noops\n")
+        # Every chunk says which stream it came from.
+        chunks = [c for f in self.publisher.frames() for c in f["chunks"]]
+        self.assertEqual(
+            "".join(c["text"] for c in chunks if c["stream"] == "stderr"), "oops\n"
+        )
+        self.assertEqual(
+            "".join(c["text"] for c in chunks if c["stream"] == "stdout"), "hi\ndone\n"
+        )
+        self.assertIsNone(result.branch)  # not a git repo
         self.assertTrue(heartbeats)
         self.assertEqual(heartbeats[-1][0]["execution_id"], result.log_ref)
 
@@ -813,10 +978,17 @@ class RunCommandActivityTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.attempt, 2)
         self.assertEqual(result.stdout_tail, "hi\ndone\n")
         self.assertEqual((self.ws_dir / "runs.txt").read_text(), "run\n")  # one start marker
-        retried = "".join(e.progress_delta for _, e in self.publisher.events[delivered:])
+        retried = ws.progress_text(e.progress_delta for _, e in self.publisher.events[delivered:])
         self.assertIn("reattaching", retried)
         self.assertIn("done", retried)
         self.assertNotIn("hi\n", retried)  # not re-published
+        # Tags survive the reattach, and the reattach line is a note, not output.
+        frames = [ws.parse_progress_delta(e.progress_delta) for _, e in self.publisher.events[delivered:]]
+        chunks = [c for f in frames if f["type"] == "output" for c in f["chunks"]]
+        self.assertIn({"stream": "stdout", "text": "done\n"}, chunks)
+        self.assertTrue(any(c["stream"] == "note" and "reattaching" in c["text"] for c in chunks))
+        self.assertGreater(min(f["seq"] for f in frames if f["type"] == "output" and f["seq"] is not None),
+                           heartbeats[-1][0]["seq"])
 
     async def test_retry_after_the_command_finished_publishes_the_missed_output(self) -> None:
         # Regression (1.1c): worker A dies mid-command; by the time attempt 2 runs, the
@@ -842,7 +1014,7 @@ class RunCommandActivityTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
         result = await self.env(attempt=2, heartbeat_details=[heartbeats[-1][0]]).run(
             ws.run_command_activity, self.input(command)
         )
-        retried = "".join(e.progress_delta for _, e in self.publisher.events[delivered:])
+        retried = ws.progress_text(e.progress_delta for _, e in self.publisher.events[delivered:])
         self.assertIn("reattaching", retried)
         self.assertIn("finished\n", retried)
         self.assertNotIn("hi\n", retried)
@@ -856,8 +1028,28 @@ class RunCommandActivityTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
         await self.env().run(ws.run_command_activity, self.input(command))
         delivered = len(self.publisher.events)
         await self.env(attempt=2).run(ws.run_command_activity, self.input(command))
-        retried = "".join(e.progress_delta for _, e in self.publisher.events[delivered:])
+        retried = ws.progress_text(e.progress_delta for _, e in self.publisher.events[delivered:])
         self.assertIn("hi\nfinished\n", retried)
+
+    async def test_replayed_output_keeps_its_stream(self) -> None:
+        command = "echo out; echo err >&2"
+        await self.env().run(ws.run_command_activity, self.input(command))
+        delivered = len(self.publisher.events)
+        await self.env(attempt=2).run(ws.run_command_activity, self.input(command))
+        replayed = [ws.parse_progress_delta(e.progress_delta) for _, e in self.publisher.events[delivered:]]
+        self.assertEqual(ws.progress_text([e.progress_delta for _, e in self.publisher.events[delivered:]], ("stderr",)), "err\n")
+        self.assertEqual(ws.progress_text([e.progress_delta for _, e in self.publisher.events[delivered:]], ("stdout",)), "out\n")
+        self.assertIn({"v": 1, "type": "sandbox", "state": "up", "attempt": 2}, replayed)
+
+    async def test_run_command_reports_the_branch(self) -> None:
+        import subprocess
+
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.ws_dir, check=True)
+        result = await self.env().run(
+            ws.run_command_activity, self.input("git checkout -q -b feature/x", tool_id="toolu_b")
+        )
+        self.assertEqual(result.exit_code, 0, result)
+        self.assertEqual(result.branch, "feature/x")
 
     async def _start_then_cancel(self, cancel: Any, tool_id: str = "toolu_1") -> None:
         environment = self.env()
@@ -924,6 +1116,49 @@ class RunCommandActivityTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.type, "ExecutorUnavailable")
         self.assertFalse(caught.exception.non_retryable)
 
+    async def test_unreachable_executor_tells_the_browser_and_clears_on_retry(self) -> None:
+        heartbeats: list[Any] = []
+        environment = self.env(attempt=2, heartbeat_details=[{"seq": -1, "sandbox_down": True}])
+        environment.info = dataclasses.replace(environment.info, retry_policy=ws.RUN_COMMAND_RETRY_POLICY)
+        environment.on_heartbeat = lambda *d: heartbeats.append(d)
+        before = time.time()
+        with patch.dict("os.environ", {"WORKSPACE_EXECUTOR_URL": "http://127.0.0.1:9"}):
+            with self.assertRaises(ApplicationError) as caught:
+                await environment.run(ws.run_command_activity, self.input("echo hi"))
+        # The retry semantics are unchanged: the same retryable error.
+        self.assertEqual(caught.exception.type, "ExecutorUnavailable")
+        self.assertFalse(caught.exception.non_retryable)
+        frames = self.publisher.frames()
+        self.assertEqual(len(frames), 1, frames)  # no "worker restarted" line for a sandbox retry
+        notice = frames[0]
+        self.assertEqual(
+            {k: notice[k] for k in ("v", "type", "state", "attempt", "max_attempts", "will_retry", "retry_in_s", "message")},
+            {"v": 1, "type": "sandbox", "state": "down", "attempt": 2, "max_attempts": 6,
+             "will_retry": True, "retry_in_s": 5.0, "message": ws.SANDBOX_DOWN_MESSAGE},
+        )
+        self.assertAlmostEqual(notice["next_retry_at"], before + 5, delta=3)
+        self.assertTrue(notice["reason"])
+        self.assertTrue(heartbeats[-1][0]["sandbox_down"])
+
+        # The next attempt reaches the executor: one "up" notice, then the output.
+        self.publisher.events.clear()
+        result = await self.env(attempt=3, heartbeat_details=[heartbeats[-1][0]]).run(
+            ws.run_command_activity, self.input("echo hi")
+        )
+        self.assertEqual(result.exit_code, 0)
+        frames = self.publisher.frames()
+        self.assertEqual(frames[0], {"v": 1, "type": "sandbox", "state": "up", "attempt": 3})
+        self.assertEqual(self.publisher.text, "hi\n")  # no reattach note either
+
+    async def test_last_attempt_says_no_retry(self) -> None:
+        environment = self.env(attempt=6)
+        environment.info = dataclasses.replace(environment.info, retry_policy=ws.RUN_COMMAND_RETRY_POLICY)
+        with patch.dict("os.environ", {"WORKSPACE_EXECUTOR_URL": "http://127.0.0.1:9"}):
+            with self.assertRaises(ApplicationError):
+                await environment.run(ws.run_command_activity, self.input("echo hi"))
+        notice = [f for f in self.publisher.frames() if f["type"] == "sandbox"][-1]
+        self.assertEqual((notice["will_retry"], notice["next_retry_at"]), (False, None))
+
     async def test_bad_cwd_is_not_retryable(self) -> None:
         with self.assertRaises(ApplicationError) as caught:
             await self.env().run(ws.run_command_activity, self.input("pwd", cwd="/etc"))
@@ -980,6 +1215,7 @@ class ExecToolsTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
         commit = await self.call(ws.git_commit, "Add app", "ws-1", True, activity_id="commit-1")
         self.assertTrue(commit.committed, commit)
         self.assertEqual(commit.summary, "Add app")
+        self.assertEqual(commit.branch, "main")
         self.assertFalse((self.ws_dir / "HOOK_RAN").exists())  # hooks never run
         # A retry of the same tool call returns the first result; no second commit.
         again = await self.call(ws.git_commit, "Add app", "ws-1", True, activity_id="commit-1")
@@ -993,6 +1229,7 @@ class ExecToolsTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(str(staged), "No staged changes.")
         nothing = await self.call(ws.git_commit, "noop", "ws-1", False)
         self.assertFalse(nothing.committed)
+        self.assertEqual(nothing.branch, "main")
 
 
 
@@ -1260,6 +1497,30 @@ class FileToolsTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
         self.assertFalse(changed.created)
         self.assertEqual((changed.added_lines, changed.removed_lines), (1, 1))
         self.assertIn("-b\n+c\n", changed.diff)
+        # The UI reads the text: a rewrite carries the diff in edit_file's format, a new
+        # file doesn't (the UI shows its content from the tool input).
+        self.assertEqual(str(created), "Created pkg/a.py (4 bytes, +2 -0).")
+        head, diff = str(changed).split("\n", 1)
+        self.assertEqual(head, "Wrote pkg/a.py (4 bytes, +1 -1).")
+        self.assertEqual(diff, changed.diff)
+        self.assertIn("@@ -1,2 +1,2 @@\n a\n-b\n+c\n", diff)
+
+    async def test_write_diff_is_bounded_like_edit(self) -> None:
+        (self.ws_dir / "big.txt").write_text("".join(f"old line {i}\n" for i in range(2_000)))
+        result = await self.call(
+            ws.write_file, "big.txt", "".join(f"new line {i}\n" for i in range(2_000)), "ws-1"
+        )
+        self.assertTrue(result.diff_truncated)
+        self.assertEqual((result.added_lines, result.removed_lines), (2_000, 2_000))
+        self.assertLess(len(result.diff), ws.MAX_DIFF_CHARS + 100)
+        self.assertIn("diff truncated", str(result))
+
+    async def test_write_over_a_binary_file_has_no_diff(self) -> None:
+        (self.ws_dir / "blob.bin").write_bytes(b"\x00\xff\x00binary")
+        result = await self.call(ws.write_file, "blob.bin", "text now\n", "ws-1")
+        self.assertFalse(result.created)
+        self.assertEqual(result.diff, "")
+        self.assertEqual(str(result), "Wrote blob.bin (9 bytes, +1 -0).")
 
     async def test_edit_exact_unique_match(self) -> None:
         (self.ws_dir / "a.py").write_text("one\ntwo\nthree\ntwo\n")
@@ -1417,7 +1678,9 @@ class LiveExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.stdout_tail, "hi\ndone\n")
         first_at, first = self.publisher.events[0]
         last_at, _ = self.publisher.events[-1]
-        self.assertEqual(first.progress_delta, "hi\n")
+        self.assertEqual(
+            ws.parse_progress_delta(first.progress_delta)["chunks"], [{"stream": "stdout", "text": "hi\n"}]
+        )
         self.assertLess(first_at - started, 1.0)
         self.assertGreater(last_at - first_at, 1.5)  # "done" arrived live, ~2 s later
 

@@ -6,7 +6,7 @@ panels update live with no Queries.
 
 * ``plan``: the agent's own checklist, written by the inline ``update_plan`` tool.
 * ``changes``: files the agent touched and commits it made, folded from tool results.
-* ``workspace``: the last command and its exit code.
+* ``workspace``: the repo's current branch, the last command and its exit code.
 
 No ``from __future__ import annotations``: tool annotations are read concretely by the harness.
 """
@@ -25,6 +25,8 @@ MAX_PLAN_ITEMS = 30
 MAX_PLAN_TEXT = 300
 MAX_CHANGED_FILES = 200
 MAX_COMMITS = 50
+MAX_BRANCH_CHARS = 250
+BRANCH_TOOLS = frozenset({"git_status", "git_commit", "run_command"})
 
 
 class PlanItem(HarnessState):
@@ -66,8 +68,15 @@ class ChangesState(HarnessState):
 
 
 class WorkspaceState(HarnessState):
-    """What the workspace's terminal did last."""
+    """What the workspace's terminal did last, and the branch it is on.
 
+    Every field has a default: a run restores this from CarriedState JSON written by an
+    older version.
+    """
+
+    # The workspace repo's checked-out branch ("HEAD (no branch)" when detached), from the
+    # latest git_status, git_commit or run_command that reported one; "" until then.
+    branch: str = ""
     last_command: str = ""
     last_exit_code: int | None = None
     commands_run: int = 0
@@ -169,11 +178,20 @@ def fold_tool_result(
             if len(draft.commits) > MAX_COMMITS:
                 del draft.commits[: len(draft.commits) - MAX_COMMITS]
 
+    # git_status, git_commit and run_command report the branch; None means unknown, so the
+    # last known branch stays.
+    branch = getattr(result, "branch", None) if tool_name in BRANCH_TOOLS else None
+    branch = branch[:MAX_BRANCH_CHARS] if isinstance(branch, str) and branch else None
     if tool_name == "run_command" and hasattr(result, "exit_code"):
         with workspace.mutate() as draft:
             draft.last_command = str(args.get("command", ""))[:500]
             draft.last_exit_code = result.exit_code
             draft.commands_run += 1
+            if branch is not None:
+                draft.branch = branch
+    elif branch is not None and branch != workspace.current.branch:
+        with workspace.mutate() as draft:
+            draft.branch = branch
 
 
 def _normalize_status(status: str) -> str:
