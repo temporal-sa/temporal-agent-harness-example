@@ -48,6 +48,10 @@ DEFAULT_MAX_ORPHAN_ZOMBIES = 8
 JOB_REPLAY_BUFFER_CHARS = 128_000
 JOB_REPLAY_BUFFER_EVENTS = 2_048
 DEFAULT_ORPHAN_GRACE_SECONDS = 120.0
+# Per-execution state (result, replay events, started marker) older than this is swept.
+# Longer than any activity's retry window, so idempotency is unaffected.
+DEFAULT_STATE_TTL_SECONDS = 24 * 3600.0
+STATE_GC_INTERVAL_SECONDS = 3600.0
 _SAFE_EXECUTION_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 
 # /files/* limits (PRD §5 rule 5).
@@ -104,23 +108,33 @@ class FileListRequest(_FileRequest):
     path: str = Field(default=".", max_length=MAX_FILE_REQUEST_PATH_CHARS)
 
 
-class FileWriteRequest(FilePathRequest):
+class _MutationRequest(BaseModel):
+    # How long a mutation waits for a running command to finish before failing with
+    # workspace_busy (nothing is written). None waits indefinitely.
+    busy_timeout_seconds: float | None = Field(default=None, ge=0, le=600)
+
+
+class FileWriteRequest(FilePathRequest, _MutationRequest):
     content: str = Field(max_length=MAX_FILE_CONTENT_CHARS)
     encoding: Literal["utf-8", "base64"] = "utf-8"
     create_parents: bool = False
     overwrite: bool = True
 
 
-class FileEditRequest(FilePathRequest):
+class FileEditRequest(FilePathRequest, _MutationRequest):
     old_string: str = Field(min_length=1, max_length=MAX_FILE_CONTENT_CHARS)
     new_string: str = Field(max_length=MAX_FILE_CONTENT_CHARS)
 
 
-class FileMkdirRequest(FilePathRequest):
+class FileMkdirRequest(FilePathRequest, _MutationRequest):
     parents: bool = False
 
 
-class FileRenameRequest(_FileRequest):
+class FileDeleteRequest(FilePathRequest, _MutationRequest):
+    pass
+
+
+class FileRenameRequest(_FileRequest, _MutationRequest):
     source: str = Field(max_length=MAX_FILE_REQUEST_PATH_CHARS)
     destination: str = Field(max_length=MAX_FILE_REQUEST_PATH_CHARS)
     overwrite: bool = False
@@ -195,8 +209,10 @@ class _WorkspaceLocks:
     ``files``, so it does not hold up readers; once it owns ``exec`` it waits
     only for in-flight reads, which are millisecond operations.
 
-    Lock order is always ``_concurrency`` -> ``exec`` -> ``files``, so there is
-    no cycle. A command cannot keep mutating after its ``/execute`` returns:
+    Lock order is always ``exec`` -> ``_concurrency`` (jobs) and ``exec`` ->
+    ``files`` (mutations), so there is no cycle. A job takes its workspace's
+    ``exec`` before a global ``_concurrency`` slot, so jobs queued behind a
+    long command in one workspace never hold slots other workspaces need. A command cannot keep mutating after its ``/execute`` returns:
     the sandbox has its own PID namespace and ``--die-with-parent``, and the
     process group is killed on timeout or cancellation.
     """
@@ -295,6 +311,7 @@ app = FastAPI(title="Agent workspace executor", docs_url=None, redoc_url=None)
 _workspace_locks: dict[str, _WorkspaceLocks] = {}
 # Live (queued or running) jobs by (workspace_key, execution_id).
 _jobs: dict[tuple[str, str], _Job] = {}
+_last_state_gc_at = 0.0
 _workspace_locks_guard = asyncio.Lock()
 _concurrency = asyncio.Semaphore(
     max(1, int(os.environ.get("WORKSPACE_EXECUTOR_MAX_CONCURRENT", "4")))
@@ -423,6 +440,8 @@ class _FileOpError(Exception):
         "exists": 409,
         "not_empty": 409,
         "match_count": 409,
+        "workspace_busy": 409,
+        "protected_path": 403,
         "too_large": 413,
         "io_error": 500,
     }
@@ -475,12 +494,14 @@ async def files_write(
     request: FileWriteRequest, authorization: str | None = Header(default=None)
 ) -> dict[str, Any]:
     _authorize(authorization)
+    _refuse_protected(request.path)
     data = _decode_write_content(request)
     return await _run_file_op(
         request.workspace_id,
         True,
         lambda root, req: _op_write(root, req, data),
         request,
+        busy_timeout=request.busy_timeout_seconds,
     )
 
 
@@ -489,7 +510,11 @@ async def files_edit(
     request: FileEditRequest, authorization: str | None = Header(default=None)
 ) -> dict[str, Any]:
     _authorize(authorization)
-    return await _run_file_op(request.workspace_id, True, _op_edit, request)
+    _refuse_protected(request.path)
+    return await _run_file_op(
+        request.workspace_id, True, _op_edit, request,
+        busy_timeout=request.busy_timeout_seconds,
+    )
 
 
 @app.post("/files/mkdir")
@@ -497,15 +522,23 @@ async def files_mkdir(
     request: FileMkdirRequest, authorization: str | None = Header(default=None)
 ) -> dict[str, Any]:
     _authorize(authorization)
-    return await _run_file_op(request.workspace_id, True, _op_mkdir, request)
+    _refuse_protected(request.path)
+    return await _run_file_op(
+        request.workspace_id, True, _op_mkdir, request,
+        busy_timeout=request.busy_timeout_seconds,
+    )
 
 
 @app.post("/files/delete")
 async def files_delete(
-    request: FilePathRequest, authorization: str | None = Header(default=None)
+    request: FileDeleteRequest, authorization: str | None = Header(default=None)
 ) -> dict[str, Any]:
     _authorize(authorization)
-    return await _run_file_op(request.workspace_id, True, _op_delete, request)
+    _refuse_protected(request.path)
+    return await _run_file_op(
+        request.workspace_id, True, _op_delete, request,
+        busy_timeout=request.busy_timeout_seconds,
+    )
 
 
 @app.post("/files/rename")
@@ -513,7 +546,32 @@ async def files_rename(
     request: FileRenameRequest, authorization: str | None = Header(default=None)
 ) -> dict[str, Any]:
     _authorize(authorization)
-    return await _run_file_op(request.workspace_id, True, _op_rename, request)
+    _refuse_protected(request.source, request.destination)
+    return await _run_file_op(
+        request.workspace_id, True, _op_rename, request,
+        busy_timeout=request.busy_timeout_seconds,
+    )
+
+
+def _refuse_protected(*paths: str) -> None:
+    """Refuse mutations of git's control files (B1).
+
+    Anything under ``.git`` (config, hooks, info/attributes) and a root-level
+    ``.gitconfig`` (the sandbox's ``$HOME/.gitconfig``) can make a later git call run
+    workspace-chosen programs. Compared case-insensitively, because a macOS-hosted
+    executor sits on a case-insensitive filesystem.
+    """
+    for path in paths:
+        parts = _split_path(path, allow_root=True)
+        if not parts:
+            continue
+        first = parts[0].casefold()
+        if first == ".git" or (len(parts) == 1 and first == ".gitconfig"):
+            raise _FileOpError(
+                "protected_path",
+                f"{_display(parts)} is git control data and can't be changed with "
+                "file tools. Use the git tools for git operations.",
+            )
 
 
 async def _run_file_op(
@@ -521,6 +579,8 @@ async def _run_file_op(
     mutates: bool,
     operation: Callable[[int, _T], dict[str, Any]],
     request: _T,
+    *,
+    busy_timeout: float | None = None,
 ) -> dict[str, Any]:
     workspace_key = _workspace_key(workspace_id)
     workspace_dir = _workspace_dir(workspace_key)
@@ -544,8 +604,24 @@ async def _run_file_op(
     async def locked() -> dict[str, Any]:
         # Lock scheme: see _WorkspaceLocks.
         if mutates:
-            async with locks.exec, locks.files.exclusive():
-                return await asyncio.to_thread(run)
+            if busy_timeout is None:
+                await locks.exec.acquire()
+            else:
+                try:
+                    await asyncio.wait_for(locks.exec.acquire(), busy_timeout)
+                except (asyncio.TimeoutError, TimeoutError):
+                    # Nothing was written: the caller gets a definite outcome
+                    # instead of a client timeout while the write lands later.
+                    raise _FileOpError(
+                        "workspace_busy",
+                        "A command is running in the workspace; file changes wait "
+                        "for it. Retry when it finishes.",
+                    ) from None
+            try:
+                async with locks.files.exclusive():
+                    return await asyncio.to_thread(run)
+            finally:
+                locks.exec.release()
         async with locks.files.shared():
             return await asyncio.to_thread(run)
 
@@ -995,7 +1071,7 @@ def _op_mkdir(root_fd: int, request: FileMkdirRequest) -> dict[str, Any]:
     return {"ok": True, "path": shown, "created": True}
 
 
-def _op_delete(root_fd: int, request: FilePathRequest) -> dict[str, Any]:
+def _op_delete(root_fd: int, request: FileDeleteRequest) -> dict[str, Any]:
     parts = _split_path(request.path, allow_root=False)
     shown = _display(parts)
     with ExitStack() as stack:
@@ -1070,6 +1146,10 @@ def _op_rename(root_fd: int, request: FileRenameRequest) -> dict[str, Any]:
 def main() -> None:
     global _self_test_error
     _prepare_executor_root()
+    global _last_state_gc_at
+    with suppress(OSError):
+        _sweep_state()
+    _last_state_gc_at = time.monotonic()
     _self_test_error = _credential_boundary_self_test() or _sandbox_self_test()
     if _self_test_error is not None:
         print(_self_test_error, flush=True)
@@ -1089,6 +1169,7 @@ def _execute_events(request: ExecuteRequest) -> AsyncIterator[dict[str, Any]]:
     concurrent requests with one execution_id can never start two processes. A mismatched
     request for a live execution_id raises HTTPException(409) here, before streaming.
     """
+    _maybe_schedule_state_gc()
     workspace_key = _workspace_key(request.workspace_id)
     key = (workspace_key, request.execution_id)
     job = _jobs.get(key)
@@ -1103,6 +1184,12 @@ def _execute_events(request: ExecuteRequest) -> AsyncIterator[dict[str, Any]]:
     state_path = _state_path(workspace_key, request.execution_id)
     cached = _load_cached_result(state_path)
     if cached is not None:
+        stored = cached.pop("fingerprint", None)
+        if stored is not None and stored != _request_fingerprint(request):
+            raise HTTPException(
+                status_code=409,
+                detail="execution_id already ran a different command.",
+            )
         cached["cached"] = True
         # A client reattaching after the job finished (a retried activity whose worker died
         # mid-run) still needs the output it missed, so the job's replay buffer is kept
@@ -1238,7 +1325,7 @@ async def _run_job(job: "_Job", request: ExecuteRequest, state_path: Path) -> No
     try:
         locks = await _workspace_locks_for(job.workspace_key)
         # See _WorkspaceLocks: commands exclude file mutations, not file reads.
-        async with _concurrency, locks.exec:
+        async with locks.exec, _concurrency:
             if job.cancel_requested.is_set():
                 result = _stopped_payload(request, job, "WorkspaceShellCancelled")
                 store = True
@@ -1266,7 +1353,9 @@ async def _run_job(job: "_Job", request: ExecuteRequest, state_path: Path) -> No
             with suppress(OSError):
                 # Events first: a request that finds the result also finds its output.
                 _store_cached_events(state_path, [event for _, event, _ in job.events])
-                _store_cached_result(state_path, result)
+                _store_cached_result(
+                    state_path, {**result, "fingerprint": job.fingerprint}
+                )
         # Cache first, then unregister: a request that misses _jobs finds the cache.
         _jobs.pop((job.workspace_key, job.execution_id), None)
         job.finish(result)
@@ -1541,24 +1630,11 @@ def _sandbox_command(request: ExecuteRequest, workspace_dir: Path) -> list[str]:
             "--chdir",
             cwd,
             "--clearenv",
-            "--setenv",
-            "PATH",
-            "/workspace/.venv/bin:/usr/local/bin:/usr/bin:/bin",
-            "--setenv",
-            "HOME",
-            "/workspace",
-            "--setenv",
-            "LANG",
-            "C.UTF-8",
-            "--setenv",
-            "LC_ALL",
-            "C.UTF-8",
-            "--setenv",
-            "PIP_CACHE_DIR",
-            "/workspace/.cache/pip",
-            "--setenv",
-            "PYTHONUNBUFFERED",
-            "1",
+            *[
+                arg
+                for name, value in _sandbox_env().items()
+                for arg in ("--setenv", name, value)
+            ],
             "--",
             bash,
             "--noprofile",
@@ -1570,6 +1646,33 @@ def _sandbox_command(request: ExecuteRequest, workspace_dir: Path) -> list[str]:
         ]
     )
     return args
+
+
+DEFAULT_GIT_NAME = "Coding Agent"
+DEFAULT_GIT_EMAIL = "agent@coding-agent.invalid"
+
+
+def _sandbox_env() -> dict[str, str]:
+    """The whole environment of a sandboxed command (bwrap --clearenv).
+
+    Includes a git identity, so a plain ``git commit`` from run_command works in a
+    fresh repo without relying on a ``.gitconfig`` in ``HOME`` (which git tools ignore,
+    see B1). Override with WORKSPACE_EXECUTOR_GIT_NAME / WORKSPACE_EXECUTOR_GIT_EMAIL.
+    """
+    name = os.environ.get("WORKSPACE_EXECUTOR_GIT_NAME") or DEFAULT_GIT_NAME
+    email = os.environ.get("WORKSPACE_EXECUTOR_GIT_EMAIL") or DEFAULT_GIT_EMAIL
+    return {
+        "PATH": "/workspace/.venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "HOME": "/workspace",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PIP_CACHE_DIR": "/workspace/.cache/pip",
+        "PYTHONUNBUFFERED": "1",
+        "GIT_AUTHOR_NAME": name,
+        "GIT_AUTHOR_EMAIL": email,
+        "GIT_COMMITTER_NAME": name,
+        "GIT_COMMITTER_EMAIL": email,
+    }
 
 
 def _normalize_cwd(value: str) -> str:
@@ -1857,6 +1960,62 @@ def _load_cached_result(path: Path) -> dict[str, Any] | None:
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _state_ttl_seconds() -> float:
+    return max(
+        60.0,
+        float(
+            os.environ.get(
+                "WORKSPACE_EXECUTOR_STATE_TTL_SECONDS", str(DEFAULT_STATE_TTL_SECONDS)
+            )
+        ),
+    )
+
+
+def _sweep_state(now: float | None = None) -> int:
+    """Delete per-execution state files older than the TTL; returns how many.
+
+    Files of live jobs are kept whatever their age. Empty per-workspace directories
+    are removed too.
+    """
+    root = _executor_root() / STATE_DIR_NAME
+    if not root.is_dir():
+        return 0
+    cutoff = (time.time() if now is None else now) - _state_ttl_seconds()
+    live = {
+        _state_path(workspace_key, execution_id).stem
+        for workspace_key, execution_id in list(_jobs)
+    }
+    removed = 0
+    for directory in root.iterdir():
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        for entry in directory.iterdir():
+            if entry.name.split(".", 1)[0] in live:
+                continue
+            with suppress(OSError):
+                if entry.is_file() and entry.lstat().st_mtime < cutoff:
+                    entry.unlink()
+                    removed += 1
+        with suppress(OSError):
+            directory.rmdir()  # only succeeds when empty
+    return removed
+
+
+def _maybe_schedule_state_gc() -> None:
+    global _last_state_gc_at
+    now = time.monotonic()
+    if now - _last_state_gc_at < STATE_GC_INTERVAL_SECONDS:
+        return
+    _last_state_gc_at = now
+    with suppress(RuntimeError):
+        task = asyncio.get_running_loop().create_task(asyncio.to_thread(_sweep_state))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+
+_background_tasks: set[asyncio.Future[Any]] = set()
 
 
 def _started_marker(state_path: Path) -> Path:

@@ -88,8 +88,14 @@ class ArtifactResult(BaseModel):
     download_url: str
     expires_at: str
 
+    # The harness adapter (harness_ext._invoker) sends the model str(result), so __str__
+    # carries everything the model needs to refer to the artifact afterwards.
     def __str__(self) -> str:
-        return f"Created artifact {self.name} ({self.mime_type}, {self.size} bytes): {self.view_url}"
+        return (
+            f"Created artifact {self.name} (artifact_id={self.artifact_id}, {self.mime_type}, "
+            f"{self.size} bytes). View: {self.view_url} Download: {self.download_url} "
+            f"Expires: {self.expires_at}"
+        )
 
 
 class AttachmentReadResult(BaseModel):
@@ -106,12 +112,26 @@ class AttachmentReadResult(BaseModel):
     returned_chars: int = 0
     reason: str | None = None
 
+    # This is what the model sees (harness_ext._invoker sends str(result)): a one-line
+    # header, then the text, which read_attachment_impl has already bounded.
     def __str__(self) -> str:
-        head = f"{self.name} ({self.mime_type}, {self.size} bytes)"
+        head = (
+            f"Attachment {self.name} (attachment_id={self.attachment_id}, {self.mime_type}, "
+            f"{self.size} bytes, kind={self.content_kind})"
+        )
         if not self.content_available:
-            return f"{head}: no text content. {self.reason or ''}".rstrip()
-        more = f", truncated from {self.original_chars}" if self.truncated else ""
-        return f"{head}: {self.returned_chars} chars{more}"
+            return (
+                f"{head} is binary; its content can't be shown as text. {self.reason or ''} "
+                "To work on it, copy it into the workspace with import_attachment_to_workspace."
+            ).rstrip()
+        if self.truncated:
+            head += (
+                f" [truncated: showing the first {self.returned_chars} of "
+                f"{self.original_chars} characters; pass a larger max_chars (up to "
+                f"{MAX_ATTACHMENT_READ_CHARS}) or use import_attachment_to_workspace for "
+                "the whole file]"
+            )
+        return f"{head}:\n{self.content or ''}"
 
 
 class AttachmentImportResult(BaseModel):
@@ -122,7 +142,10 @@ class AttachmentImportResult(BaseModel):
     path: str
 
     def __str__(self) -> str:
-        return f"Imported {self.name} ({self.size} bytes) to {self.path}."
+        return (
+            f"Imported attachment {self.name} (attachment_id={self.attachment_id}, "
+            f"{self.mime_type}, {self.size} bytes) to workspace path {self.path}."
+        )
 
 
 # -- Shared helpers -------------------------------------------------------------------
@@ -314,8 +337,7 @@ async def read_attachment_impl(
             content_available=False,
             reason=(
                 "This attachment is not a text-like file. Provider-native inspection may be "
-                "available for supported models; otherwise ask the user for a text version, "
-                "or import it into the workspace with import_attachment_to_workspace."
+                "available for supported models; otherwise ask the user for a text version."
             ),
         )
     text = decode_text_attachment(data, mime_type=mime_type)

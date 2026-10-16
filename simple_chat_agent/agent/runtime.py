@@ -18,7 +18,7 @@ from temporal_agent_harness.ai_sdks.pydantic_ai_harness import HarnessDeps
 from simple_chat_agent.agent import harness_ext
 from simple_chat_agent.agent.contracts import ModelChoice
 from simple_chat_agent.agent.model_registry import build_registry, settings_for
-from simple_chat_agent.agent.tools.research import RESEARCH_TOOLS, research_tools_available
+from simple_chat_agent.agent.tools.research import RESEARCH_TOOLS  # noqa: F401 - re-exported
 
 AGENT_NAME = "coding-agent"
 
@@ -51,10 +51,6 @@ MODEL_ACTIVITY = ActivityConfig(
         non_retryable_error_types=["ProviderRejected"],
     ),
 )
-
-# Research tools whose backends this worker has configured. Decided once at import, from the
-# worker's environment, so workflow code reads a constant (deterministic per deployment).
-ENABLED_RESEARCH_TOOLS = tuple(research_tools_available())
 
 MODELS = build_registry()
 ALLOWED_KEYS = frozenset(MODELS)

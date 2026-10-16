@@ -2,12 +2,41 @@ from __future__ import annotations
 
 import hashlib
 import mimetypes
+from dataclasses import dataclass, field
 from pathlib import PurePath
 from typing import Any, Literal
 
-from agent_harness.attachments import AttachmentContentKind, AttachmentRef
-
 from .store import AppStore, ArtifactRecord, artifact_expires_at
+
+# Defined here rather than imported from the old in-tree ``agent_harness`` package, which
+# P5 deletes. The field layout matches ``agent_harness.attachments.AttachmentRef`` exactly:
+# the old API serializes these into a ChatSignalRequest and the old worker decodes them
+# into its own class, so the two must stay wire-compatible until P5
+# (tests/test_tools_artifacts.py pins this).
+AttachmentContentKind = Literal[
+    "text",
+    "code",
+    "markdown",
+    "image",
+    "pdf",
+    "binary",
+    "paste",
+]
+
+
+@dataclass(frozen=True)
+class AttachmentRef:
+    attachment_id: str
+    name: str
+    mime_type: str
+    size_bytes: int
+    content_kind: AttachmentContentKind = "binary"
+    source: str = "user_attachment"
+    text_preview: str = ""
+    text_chars: int | None = None
+    expires_at: str = ""
+    metadata: dict = field(default_factory=dict)
+
 
 USER_ATTACHMENT_SOURCE = "user_attachment"
 MAX_ATTACHMENT_BYTES = 10_000_000

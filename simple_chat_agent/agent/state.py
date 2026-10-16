@@ -22,6 +22,7 @@ PlanStatus = Literal["pending", "in_progress", "done", "skipped"]
 FileStatus = Literal["added", "modified", "deleted", "renamed"]
 
 MAX_PLAN_ITEMS = 30
+MAX_PLAN_TEXT = 300
 MAX_CHANGED_FILES = 200
 MAX_COMMITS = 50
 
@@ -100,8 +101,11 @@ async def update_plan(update: PlanUpdate, plan: agent.Injected[StateRef[PlanStat
     Call it at the start of a multi-step task, and again whenever a step starts, finishes or
     changes. Send the whole list each time; mark at most one step `in_progress`.
     """
-    items = update.items[:MAX_PLAN_ITEMS]
-    plan.set(PlanState(goal=update.goal, items=items))
+    # Bounded: every plan change becomes a state patch in workflow history.
+    items = [
+        PlanItem(text=i.text.strip()[:MAX_PLAN_TEXT], status=i.status) for i in update.items[:MAX_PLAN_ITEMS]
+    ]
+    plan.set(PlanState(goal=update.goal.strip()[:MAX_PLAN_TEXT], items=items))
     done = sum(1 for i in items if i.status == "done")
     return PlanReply(summary=f"Plan updated: {done}/{len(items)} steps done.")
 

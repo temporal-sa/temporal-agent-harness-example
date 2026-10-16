@@ -19,7 +19,7 @@ from temporalio.exceptions import ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from pydantic_ai.capabilities import Hooks
-    from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
+    from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter, UserPromptPart
     from temporal_agent_harness.harness import agent
     from temporal_agent_harness.harness.agent_protocol import (
         AgentConfig,
@@ -54,7 +54,7 @@ with workflow.unsafe.imports_passed_through():
     from simple_chat_agent.agent.runtime import (
         CODING_AGENT,
         DEFAULT_MODEL,
-        ENABLED_RESEARCH_TOOLS,
+        RESEARCH_TOOLS,
         CodingDeps,
         is_allowed_model,
         model_settings,
@@ -117,20 +117,34 @@ class CodingAgent:
         self._steer: list[str] = list(carried.steer_queue)
         self._stream = WorkflowStream(prior_state=carried.stream_state)
         criteria = approvals.default_criteria(data.environment)
+        session_id = data.session_id or workflow.info().workflow_id
         if data.environment == "catalog":
-            # In the catalog the operator's criteria are the only criteria: a caller can't
-            # retarget, say, run_command to a class the judge may approve.
-            config = config.model_copy(update={"auto_approval_criteria": None})
+            # In the catalog the operator's rules are the only rules: a caller can't retarget,
+            # say, run_command to a class the judge may approve, or pass a skip-all policy.
+            config = config.model_copy(
+                update={
+                    "auto_approval_criteria": None,
+                    "approval_policy": approvals.sanitize_caller_policy(
+                        config.approval_policy, data.environment
+                    ),
+                }
+            )
         self._runner = AgentWorkflowRunner(
             config,
             stream=self._stream,
-            approval_policy_default=approvals.policy_for(data.posture, data.environment),
+            approval_policy_default=approvals.policy_for(
+                data.posture, data.environment, also_allow=approvals.SUBAGENT_TOOL_NAMES
+            ),
             auto_approval_criteria_default=criteria,
             # Always wired, so switching to auto mode mid-session works (the harness rejects
-            # an auto-mode policy without an evaluator).
-            auto_mode_evaluator=approvals.build_evaluator(data.environment, data.judge),
+            # an auto-mode policy without an evaluator). Judge tokens count toward this
+            # session's spend caps.
+            auto_mode_evaluator=approvals.build_evaluator(
+                data.environment, data.judge, session_id=session_id, owner_id=data.owner_id
+            ),
         )
-        harness_ext.guard_tool_approval(self._runner, self._limit_remember)
+        self._updates_this_run = 0
+        harness_ext.guard_tool_approval(self._runner, self._limit_remember, on_update=self._count_update)
         harness_ext.restore_turn_counter(self._runner, carried.turn_counter)
         self._history: list[ModelMessage] = ModelMessagesTypeAdapter.validate_python(
             carried.conversation
@@ -149,6 +163,7 @@ class CodingAgent:
         self._snapshot: list[ModelMessage] | None = None
         self._rejected: list[dict[str, Any]] = []
         self._signals_this_run = 0
+        self._subagent_starts_in_flight = 0
         self._checkpoint_requested = False
         self._history_budget = (
             HistoryBudget(max_events=data.test_history_event_cap, fraction=1.0)
@@ -158,7 +173,9 @@ class CodingAgent:
 
         # Messages sent through the harness Update are refused while we hand off to the next
         # run; callers retry and reach the new run. The Signal front door buffers instead.
-        harness_ext.guard_send_agent_message(self._runner, lambda: self._continuing)
+        harness_ext.guard_send_agent_message(
+            self._runner, lambda: self._continuing, on_update=self._count_update
+        )
 
         # Messages that arrived during the previous run's handoff go first, before any Signal
         # delivered in this run's first activation (signal handlers run before `run` starts).
@@ -283,15 +300,15 @@ class CodingAgent:
         self._signals_this_run += 1
         if self._is_duplicate(approval.request_id):
             return
-        decision = self._limit_remember(
-            ToolApprovalDecision(
-                tool_id=approval.tool_id,
-                approved=approval.approved,
-                reason=approval.reason,
-                remember=approval.remember,
-            )
-        )
         try:
+            decision = self._limit_remember(
+                ToolApprovalDecision(
+                    tool_id=approval.tool_id,
+                    approved=approval.approved,
+                    reason=approval.reason,
+                    remember=approval.remember,
+                )
+            )
             await harness_ext.admit_approval(self._runner, decision)
         except ApplicationError as exc:
             self._reject(approval.request_id, exc)
@@ -308,6 +325,9 @@ class CodingAgent:
             harness_ext.publish_rejection(
                 self._runner, message_id=message.request_id, reason=f"Not accepted: {exc.message}"
             )
+
+    def _count_update(self) -> None:
+        self._updates_this_run += 1
 
     def _limit_remember(self, decision: ToolApprovalDecision) -> ToolApprovalDecision:
         """"Always allow" only for workspace edits (PRD A14): for shell, network and
@@ -391,10 +411,15 @@ class CodingAgent:
             # Subagents live for one turn: none outlive the turn that started them (and none
             # may be running when the agent continues as new).
             for subagent_id in harness_ext.active_subagent_ids(self._runner):
-                await self._runner.stop_subagent(subagent_id)
+                try:
+                    await self._runner.stop_subagent(subagent_id)
+                except Exception:  # noqa: BLE001 - e.g. the child already closed
+                    workflow.logger.warning("could not stop subagent %s; forgetting it", subagent_id)
+                    harness_ext.forget_subagent(self._runner, subagent_id)
 
     def _tools(self) -> list[Any]:
-        tools: list[Any] = [*WORKSPACE_TOOLS, *ENABLED_RESEARCH_TOOLS, *ARTIFACT_TOOLS, *STATE_TOOLS]
+        research = [t for t in RESEARCH_TOOLS if t.__name__ in set(self._data.research_tools)]
+        tools: list[Any] = [*WORKSPACE_TOOLS, *research, *ARTIFACT_TOOLS, *STATE_TOOLS]
         if self._data.depth == 0:
             tools += subagent_tools(
                 task_queue=workflow.info().task_queue,
@@ -410,12 +435,21 @@ class CodingAgent:
         return tools
 
     def _before_tool(self, name: str) -> str | None:
-        if name.startswith("start_") and len(harness_ext.active_subagent_ids(self._runner)) >= MAX_CONCURRENT_SUBAGENTS:
-            return (
-                f"At most {MAX_CONCURRENT_SUBAGENTS} subagents can run at once. Use or stop "
-                "one that is running first."
-            )
+        if name.startswith("start_"):
+            # Count starts already in flight too: several start calls in one model response
+            # all pass this check before any of them registers its child.
+            running = len(harness_ext.active_subagent_ids(self._runner)) + self._subagent_starts_in_flight
+            if running >= MAX_CONCURRENT_SUBAGENTS:
+                return (
+                    f"At most {MAX_CONCURRENT_SUBAGENTS} subagents can run at once. Use or stop "
+                    "one that is running first."
+                )
+            self._subagent_starts_in_flight += 1
         return None
+
+    def _after_call(self, name: str) -> None:
+        if name.startswith("start_"):
+            self._subagent_starts_in_flight -= 1
 
     def _after_tool(self, name: str, tool_id: str, args: dict[str, Any], result: Any) -> None:
         fold_tool_result(
@@ -452,6 +486,7 @@ class CodingAgent:
             is_interrupted=lambda: self._interrupted,
             before_call=self._before_tool,
             on_result=self._after_tool,
+            after_call=self._after_call,
         )
         result = await CODING_AGENT.run(
             text,
@@ -478,26 +513,38 @@ class CodingAgent:
             history_length=info.get_current_history_length(),
             history_size_bytes=info.get_current_history_size(),
             signals=self._signals_this_run,
+            updates=self._updates_this_run,
         )
         if reason is not None:
             self._snapshot = list(request_context.messages)
             raise harness_ext.CheckpointNeeded(reason)
         self._snapshot = list(request_context.messages)
-        self._deliver_steer(ctx)
+        self._steer_into_request(request_context)
         return request_context
 
     async def _after_model_request(self, ctx: Any, *, request_context: Any, response: Any) -> Any:
         self._snapshot = [*request_context.messages, response]
-        # Steer that arrived during this model call goes in before the next one (or redirects
-        # the run if this response would have ended it).
-        self._deliver_steer(ctx)
+        # If this response ends the run (no tool calls), steer that arrived while it streamed
+        # would otherwise be lost: enqueue it, which redirects the run. Otherwise it goes into
+        # the next request directly (before_model_request).
+        if self._steer and not any(p.part_kind == "tool-call" for p in response.parts):
+            ctx.enqueue(self._take_steer())
         return response
 
-    def _deliver_steer(self, ctx: Any) -> None:
-        if self._steer:
-            text = "\n\n".join(self._steer)
-            self._steer.clear()
-            ctx.enqueue(f"(The user adds, while you work:)\n{text}")
+    def _take_steer(self) -> str:
+        text = "\n\n".join(self._steer)
+        self._steer.clear()
+        return f"(The user adds, while you work:)\n{text}"
+
+    def _steer_into_request(self, request_context: Any) -> None:
+        """Add queued steer to the request about to be sent. Pydantic AI drains its own
+        enqueue queue before this hook runs, so text enqueued here would wait one more model
+        call; appending to the outgoing request delivers it now, and it stays in history."""
+        if not self._steer or not request_context.messages:
+            return
+        last = request_context.messages[-1]
+        if getattr(last, "kind", None) == "request":
+            last.parts = [*last.parts, UserPromptPart(content=self._take_steer())]
 
     @agent.accepts(mid_turn=MidTurn.ACCEPT, model_callable=False)
     async def steer(self, msg: SteerMessage) -> Ack:
@@ -523,13 +570,19 @@ class CodingAgent:
     async def set_posture(self, msg: SetPosture) -> Ack:
         """Change how tool calls are approved. Applies to new calls; pending ones stay with you."""
         try:
-            policy = approvals.policy_for(msg.posture, self._data.environment)
+            policy = approvals.policy_for(
+                msg.posture, self._data.environment, also_allow=approvals.SUBAGENT_TOOL_NAMES
+            )
         except ApplicationError as exc:
             return Ack(ok=False, detail=exc.message)
         # Keep "always allow" rules the user already gave (they are workspace-edit only).
         for tool in self._runner.approval_policy.auto_approve_tools:
-            policy = policy.with_tool_allowed(tool)
-        self._runner.set_approval_policy(policy)
+            # Carry over only "always allow" rules (workspace edits); the posture decides the
+            # rest, so "ask for everything" really asks for everything.
+            if approvals.remember_allowed(approvals.risk_class_for(tool, self._runner.auto_approval_criteria)):
+                policy = policy.with_tool_allowed(tool)
+        # New calls only: calls already waiting for a human stay waiting.
+        harness_ext.set_policy_keeping_pending(self._runner, policy)
         self._data = self._data.model_copy(update={"posture": msg.posture})
         return Ack(detail=f"Approvals: {msg.posture.replace('_', ' ')}.")
 

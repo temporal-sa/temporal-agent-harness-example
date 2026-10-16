@@ -60,7 +60,13 @@ async def connect() -> Client:
     # The harness plugin goes last, so it keeps the Pydantic converter the others installed.
     plugins.append(
         AgentHarnessPlugin(
-            tools=[*WORKSPACE_TOOLS, *TEST_TOOLS, *RESEARCH_TOOLS, *ARTIFACT_TOOLS],
+            tools=[
+                *WORKSPACE_TOOLS,
+                *RESEARCH_TOOLS,
+                *ARTIFACT_TOOLS,
+                # Test-only tools are registered only when explicitly enabled.
+                *(TEST_TOOLS if os.environ.get("AGENT_ENABLE_TEST_TOOLS") == "1" else ()),
+            ],
             large_payload_offload=payload_storage(),
         )
     )

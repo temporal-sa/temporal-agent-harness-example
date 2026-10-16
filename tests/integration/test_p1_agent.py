@@ -83,14 +83,18 @@ class P1AgentTests(unittest.IsolatedAsyncioTestCase):
             async with support.EventCollector(self.client, handle.id) as events:
                 await support.send(handle, "chat", {"text": "Create a.txt containing 'apple' and b.txt containing 'banana'."})
                 await events.wait_for(lambda c: c.turn_ends() >= 1, timeout=180)
+                # Review M3: subagents must run without approval clicks under the default posture.
+                await support.send(handle, "set_posture", {"posture": "trust_safe"})
+                asks_before = len(events.collected.of("tool_approval_requested"))
                 await support.send(handle, "chat", {"text": (
                     "Start two explorer subagents in parallel: ask one what a.txt contains and the "
                     "other what b.txt contains. Then tell me both answers."
                 )})
-                await events.wait_for(lambda c: c.turn_ends() >= 2, timeout=300)
+                await events.wait_for(lambda c: c.turn_ends() >= 3, timeout=300)
                 started = events.collected.of("subagent_started")
                 stopped = events.collected.of("subagent_stopped")
                 self.assertGreaterEqual(len(started), 2, [e.event for e in started])
+                self.assertEqual(len(events.collected.of("tool_approval_requested")), asks_before)
                 self.assertEqual(len(stopped), len(started))
                 reply = chat_replies(events.collected)[-1]["text"].lower()
                 self.assertIn("apple", reply)

@@ -6,6 +6,7 @@ import base64
 import inspect
 import json
 import os
+import re
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -87,12 +88,13 @@ class CreateArtifactTests(_StoreCase):
         self.assertEqual(self.store.read_artifact_bytes(record), b"# Hi\n")
         self.assertIsNone(self.store.get_artifact(user_id="someone-else", artifact_id=result.artifact_id))
 
-    async def test_str_is_compact(self) -> None:
+    async def test_str_carries_what_the_model_needs_without_the_body(self) -> None:
         result = await self.create(name="r.txt", content="x" * 5000)
         text = str(result)
-        self.assertLess(len(text), 200)
-        self.assertIn("r.txt", text)
-        self.assertIn(result.view_url, text)
+        self.assertLess(len(text), 400)
+        for part in ("r.txt", result.artifact_id, result.view_url, result.download_url, "5000 bytes"):
+            self.assertIn(part, text)
+        self.assertNotIn("xxxxx", text)
 
     async def test_base64_binary_round_trips(self) -> None:
         result = await self.create(
@@ -165,7 +167,12 @@ class ReadAttachmentTests(_StoreCase):
         self.assertEqual(result.returned_chars, 16)
         self.assertEqual(result.size, 16)
         self.assertEqual(result.view_url, f"/api/attachments/{upload.artifact_id}")
-        self.assertNotIn("hello attachment", str(result))
+        # M1: the model sees str(result), so the text must be in it, after a short header.
+        text = str(result)
+        header, _, body = text.partition("\n")
+        self.assertEqual(body, "hello attachment")
+        self.assertIn("notes.txt", header)
+        self.assertIn(upload.artifact_id, header)
 
     async def test_reads_are_bounded(self) -> None:
         upload = self.upload("big.txt", b"a" * 60_000)
@@ -175,9 +182,15 @@ class ReadAttachmentTests(_StoreCase):
         self.assertTrue(short.truncated)
         self.assertEqual(short.original_chars, 60_000)
 
+        self.assertIn("truncated", str(short))
+        self.assertIn("a" * 100, str(short))
+        self.assertNotIn("a" * 101, str(short))
+
         clamped = await self.read(upload.artifact_id, max_chars=10**9)
         self.assertEqual(len(clamped.content), artifacts.MAX_ATTACHMENT_READ_CHARS)
         self.assertTrue(clamped.truncated)
+        # The model-facing text stays bounded: the content cap plus a short header.
+        self.assertLess(len(str(clamped)), artifacts.MAX_ATTACHMENT_READ_CHARS + 600)
 
     async def test_binary_attachment_returns_metadata_only(self) -> None:
         upload = self.upload("pixel.png", PNG, mime="image/png")
@@ -187,6 +200,8 @@ class ReadAttachmentTests(_StoreCase):
         self.assertIsNone(result.content)
         self.assertEqual(result.content_kind, "image")
         self.assertIn("not a text-like file", result.reason)
+        self.assertIn("binary", str(result))
+        self.assertIn("import_attachment_to_workspace", str(result))
 
     async def test_text_stored_as_binary_is_sniffed(self) -> None:
         record = self.store.create_artifact(
@@ -289,7 +304,8 @@ class ImportAttachmentTests(_StoreCase):
         self.assertTrue(write["create_parents"])
         self.assertEqual(base64.b64decode(write["content"]), PNG)
         self.assertEqual(result.size, len(PNG))
-        self.assertEqual(str(result), f"Imported pixel.png ({len(PNG)} bytes) to assets/pixel.png.")
+        for part in ("pixel.png", upload.artifact_id, f"{len(PNG)} bytes", "assets/pixel.png"):
+            self.assertIn(part, str(result))
 
     async def test_ownership_is_checked_before_writing(self) -> None:
         theirs = self.upload("notes.txt", b"theirs", owner="user-2")
@@ -411,6 +427,142 @@ class ToolDefinitionTests(unittest.TestCase):
             self.assertIsNotNone(config["retry_policy"].maximum_attempts)
             self.assertGreater(config["retry_policy"].maximum_attempts, 0)
             self.assertIn("start_to_close_timeout", config)
+
+
+class _FakeRunner:
+    def __init__(self, result: Any) -> None:
+        self.result = result
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def run_tool(self, tool_call_id: str, tool: Any, *, injections: Any = None, **kwargs: Any) -> Any:
+        self.calls.append((tool_call_id, kwargs))
+        return self.result
+
+
+class ModelFacingRenderingTests(_StoreCase):
+    """M1 regression: what the model receives goes through harness_ext.per_run_toolset."""
+
+    async def model_sees(self, tool_name: str, result: Any, **kwargs: Any) -> Any:
+        from types import SimpleNamespace
+
+        from simple_chat_agent.agent import harness_ext
+
+        runner = _FakeRunner(result)
+        toolset = harness_ext.per_run_toolset(list(ARTIFACT_TOOLS), id="t", injections={})
+        invoke = toolset.tools[tool_name].function
+        with patch.object(harness_ext, "_runner_from_ctx", lambda ctx, tool_name: runner):
+            seen = await invoke(SimpleNamespace(tool_call_id="call-1"), **kwargs)
+        self.assertEqual(len(runner.calls), 1)
+        return seen
+
+    async def test_read_attachment_text_reaches_the_model(self) -> None:
+        upload = self.upload("notes.txt", b"the secret ingredient is cardamom")
+        result = await read_attachment_impl(
+            store=self.store, owner_id=OWNER, session_id=SESSION, attachment_id=upload.artifact_id
+        )
+        seen = await self.model_sees("read_attachment", result, attachment_id=upload.artifact_id)
+        self.assertIsInstance(seen, str)
+        self.assertIn("the secret ingredient is cardamom", seen)
+
+    async def test_binary_attachment_tells_the_model_how_to_proceed(self) -> None:
+        upload = self.upload("pixel.png", PNG, mime="image/png")
+        result = await read_attachment_impl(
+            store=self.store, owner_id=OWNER, session_id=SESSION, attachment_id=upload.artifact_id
+        )
+        seen = await self.model_sees("read_attachment", result, attachment_id=upload.artifact_id)
+        self.assertIn("binary", seen)
+        self.assertIn("import_attachment_to_workspace", seen)
+
+    async def test_create_and_import_results_reach_the_model_with_ids(self) -> None:
+        created = await create_artifact_impl(
+            store=self.store, owner_id=OWNER, session_id=SESSION, name="r.txt", content="x"
+        )
+        seen = await self.model_sees("create_artifact", created, name="r.txt", content="x")
+        self.assertIn(created.artifact_id, seen)
+        self.assertIn(created.view_url, seen)
+
+        upload = self.upload("notes.txt", b"hi")
+        imported = await import_attachment_impl(
+            store=self.store,
+            executor=_FakeExecutor(),
+            owner_id=OWNER,
+            session_id=SESSION,
+            workspace_id=WORKSPACE,
+            attachment_id=upload.artifact_id,
+            path="in/notes.txt",
+        )
+        seen = await self.model_sees(
+            "import_attachment_to_workspace", imported, attachment_id=upload.artifact_id, path="in/notes.txt"
+        )
+        self.assertIn("in/notes.txt", seen)
+
+    def test_every_result_model_defines_its_own_str(self) -> None:
+        from pydantic import BaseModel
+
+        for model in (artifacts.ArtifactResult, artifacts.AttachmentReadResult, artifacts.AttachmentImportResult):
+            with self.subTest(model=model.__name__):
+                self.assertIsNot(model.__str__, BaseModel.__str__)
+
+
+_REPO = Path(__file__).resolve().parents[1]
+_OLD_HARNESS_IMPORT = re.compile(r"^\s*(?:from|import)\s+agent_harness\b", re.MULTILINE)
+# Files still on the old harness, owned by others; each entry must be removed once its file
+# is ported (the test fails if an entry no longer imports agent_harness).
+_PENDING_OLD_HARNESS_IMPORTS = {"simple_chat_agent/common/streaming.py"}
+
+
+class NoOldHarnessImportTests(unittest.TestCase):
+    """Minor 16: the new agent and the shared code must not import the in-tree agent_harness
+    package (P5 deletes it). ``temporal_agent_harness`` is the official one and is fine."""
+
+    def offenders(self) -> set[str]:
+        found = set()
+        for folder in ("simple_chat_agent/agent", "simple_chat_agent/common"):
+            for path in sorted((_REPO / folder).rglob("*.py")):
+                if _OLD_HARNESS_IMPORT.search(path.read_text(encoding="utf-8")):
+                    found.add(path.relative_to(_REPO).as_posix())
+        return found
+
+    def test_no_new_imports_of_the_old_harness(self) -> None:
+        self.assertEqual(self.offenders() - _PENDING_OLD_HARNESS_IMPORTS, set())
+
+    def test_pending_list_only_shrinks(self) -> None:
+        self.assertEqual(_PENDING_OLD_HARNESS_IMPORTS - self.offenders(), set())
+
+    def test_pattern_ignores_the_official_harness(self) -> None:
+        self.assertIsNone(_OLD_HARNESS_IMPORT.search("from temporal_agent_harness.harness import agent"))
+        self.assertIsNotNone(_OLD_HARNESS_IMPORT.search("    from agent_harness.attachments import X"))
+        self.assertIsNotNone(_OLD_HARNESS_IMPORT.search("import agent_harness"))
+
+
+class AttachmentRefCompatTests(unittest.TestCase):
+    """The old API sends common's AttachmentRef over a signal and the old worker decodes it
+    into agent_harness's; the field layout must match until P5 removes the old app."""
+
+    def test_common_attachment_ref_matches_the_old_one(self) -> None:
+        import dataclasses
+
+        try:
+            from agent_harness.attachments import AttachmentRef as OldRef
+        except ImportError:  # pragma: no cover - after P5 deletes agent_harness
+            self.skipTest("agent_harness is gone")
+        from simple_chat_agent.common.attachments import AttachmentRef as NewRef
+
+        def layout(cls: type) -> list[tuple[str, str, Any]]:
+            return [
+                (f.name, str(f.type), f.default if f.default is not dataclasses.MISSING else f.default_factory)
+                for f in dataclasses.fields(cls)
+            ]
+
+        self.assertEqual(layout(NewRef), layout(OldRef))
+
+    def test_old_app_import_paths_still_work(self) -> None:
+        from simple_chat_agent.common.attachments import (  # noqa: F401
+            AttachmentContentKind,
+            AttachmentRef,
+            attachment_dict,
+            attachment_ref_from_artifact,
+        )
 
 
 REFUND_SERVICE_FILES = [

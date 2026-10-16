@@ -48,6 +48,7 @@ from temporal_agent_harness.harness.agent_protocol import (
     SEND_AGENT_MESSAGE_UPDATE,
     TOOL_APPROVAL_UPDATE,
     AgentMessage,
+    ToolApprovalPolicy,
     MidTurn,
     ModelInteractionStarted,
     ToolApprovalDecision,
@@ -323,6 +324,7 @@ def per_run_toolset(
     is_interrupted: Callable[[], bool] = lambda: False,
     before_call: Callable[[str], str | None] | None = None,
     on_result: Callable[[str, str, dict[str, Any], Any], None] | None = None,
+    after_call: Callable[[str], None] | None = None,
 ) -> FunctionToolset[Any]:
     """Adapt harness tools into a FunctionToolset that may be passed to ``run(toolsets=...)``.
 
@@ -339,14 +341,15 @@ def per_run_toolset(
 
     ``before_call(name)`` may refuse a call by returning the text the model sees instead
     (e.g. a concurrency limit). ``on_result(name, tool_id, args, result)`` runs in the
-    workflow after a successful call (e.g. to update observable state).
+    workflow after a successful call (e.g. to update observable state). ``after_call(name)``
+    runs after every call that ``before_call`` let through, success or not.
     """
     adapted: list[Tool[Any]] = []
     for tool in tools:
         name, description, schema = _tool_schema(tool)
         adapted.append(
             Tool.from_schema(
-                _invoker(tool, name, injections, is_interrupted, before_call, on_result),
+                _invoker(tool, name, injections, is_interrupted, before_call, on_result, after_call),
                 name=name,
                 description=description,
                 json_schema=schema,
@@ -364,6 +367,7 @@ def _invoker(
     is_interrupted: Callable[[], bool],
     before_call: Callable[[str], str | None] | None,
     on_result: Callable[[str, str, dict[str, Any], Any], None] | None,
+    after_call: Callable[[str], None] | None = None,
 ) -> Callable[..., Awaitable[Any]]:
     # Pydantic AI flattens a tool whose only parameter is a model: the model sends that
     # model's fields as top-level arguments. Re-wrap them so run_tool binds the parameter.
@@ -395,6 +399,9 @@ def _invoker(
             if is_interrupted():
                 raise asyncio.CancelledError(f"{name} stopped by the user") from exc
             return f"Tool {name!r} failed: {exc}"
+        finally:
+            if after_call is not None:
+                after_call(name)
         if on_result is not None:
             on_result(name, ctx.tool_call_id or "", kwargs, result)
         # Result models carry structured fields (for state and the UI) and a compact __str__
@@ -587,6 +594,26 @@ def active_subagent_ids(runner: AgentWorkflowRunner) -> list[str]:
     return [info.subagent_id for info in runner._status.active_subagents()]
 
 
+def set_policy_keeping_pending(runner: AgentWorkflowRunner, policy: ToolApprovalPolicy) -> None:
+    """Swap the approval policy WITHOUT auto-resolving calls already waiting for a human.
+
+    ``runner.set_approval_policy`` cascades: pending calls the new policy allows are approved
+    on the spot (agent_workflow.py ``_apply_policy_update``). A posture change applies to new
+    calls only (PRD A14), so this sets ``_WorkflowStatus`` directly after the same
+    auto-mode-needs-an-evaluator check.
+    """
+    from temporal_agent_harness.harness.agent_workflow import _assert_auto_mode_has_an_evaluator
+
+    _assert_auto_mode_has_an_evaluator(policy, runner._auto_mode_evaluator)
+    runner._status.set_approval_policy(policy)
+
+
+def forget_subagent(runner: AgentWorkflowRunner, subagent_id: str) -> None:
+    """Drop a subagent the runner can no longer stop (its workflow already closed), so it
+    doesn't block continue-as-new forever (``_WorkflowStatus.remove_subagent``)."""
+    runner._status.remove_subagent(subagent_id)
+
+
 def is_closed(runner: AgentWorkflowRunner) -> bool:
     """Whether ``close`` was signalled (``AgentWorkflowRunner._closed``)."""
     return runner._closed
@@ -657,12 +684,14 @@ def pending_tool_name(runner: AgentWorkflowRunner, tool_id: str) -> str | None:
 def guard_tool_approval(
     runner: AgentWorkflowRunner,
     adjust: Callable[[ToolApprovalDecision], ToolApprovalDecision],
+    on_update: Callable[[], None] = lambda: None,
 ) -> None:
     """Re-register the harness ``tool_approval`` Update so every decision passes through
     ``adjust`` first (used to drop "always allow" for tools where it isn't permitted). The
     Signal front door applies the same ``adjust``."""
 
     async def handler(decision: ToolApprovalDecision) -> Any:
+        on_update()
         return await runner._handle_tool_approval(adjust(decision))
 
     workflow.set_update_handler(
@@ -671,7 +700,9 @@ def guard_tool_approval(
 
 
 def guard_send_agent_message(
-    runner: AgentWorkflowRunner, is_continuing: Callable[[], bool]
+    runner: AgentWorkflowRunner,
+    is_continuing: Callable[[], bool],
+    on_update: Callable[[], None] = lambda: None,
 ) -> None:
     """Re-register the ``send_agent_message`` Update with a validator that refuses messages
     while the agent hands off to its next run.
@@ -689,6 +720,8 @@ def guard_send_agent_message(
             )
         runner._validate_send_agent_message(message)
 
-    workflow.set_update_handler(
-        SEND_AGENT_MESSAGE_UPDATE, runner._handle_send_agent_message, validator=validator
-    )
+    async def handler(message: AgentMessage) -> Any:
+        on_update()
+        return await runner._handle_send_agent_message(message)
+
+    workflow.set_update_handler(SEND_AGENT_MESSAGE_UPDATE, handler, validator=validator)

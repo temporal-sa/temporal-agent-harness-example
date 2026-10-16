@@ -97,6 +97,11 @@ async def start_session(client: Any, task_queue: str, **init: Any) -> Any:
 
     workflow_id = f"p0-{uuid.uuid4().hex[:10]}"
     init.setdefault("environment", "local")
+    init.setdefault("owner_id", "test-user")
+    if "research_tools" not in init:
+        from simple_chat_agent.agent.tools.research import research_tools_available
+
+        init["research_tools"] = [t.__name__ for t in research_tools_available()]
     data = CodingAgentInit(session_id=workflow_id, workspace_id=workflow_id, **init)
     return await client.start_workflow(
         AGENT_WORKFLOW_TYPE,

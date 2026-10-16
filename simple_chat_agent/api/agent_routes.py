@@ -39,6 +39,7 @@ from simple_chat_agent.agent.contracts import (
     Posture,
 )
 from simple_chat_agent.agent.approvals import configured_judge_backend
+from simple_chat_agent.agent.tools.research import research_tools_available
 from simple_chat_agent.agent.model_registry import is_allowed
 from simple_chat_agent.api.agent_bridge import Bridge
 from simple_chat_agent.api.agent_store import AgentStore
@@ -108,6 +109,7 @@ def create_agent_router(
             posture=body.posture,
             environment=agent_environment(),
             judge=configured_judge_backend(),
+            research_tools=[t.__name__ for t in research_tools_available()],
         )
         if body.posture == "never_ask" and data.environment == "catalog":
             return _error(422, "posture_not_allowed", "\"Never ask\" isn't available here.")

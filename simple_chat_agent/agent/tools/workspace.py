@@ -26,7 +26,7 @@ git_diff        read_only (safe)     5 attempts; same execution_id
 write_file      workspace_edit       3 attempts; rewriting the same content is idempotent
 edit_file       workspace_edit       3 attempts; a retry that finds the edit already applied
                                      reports it instead of failing
-git_commit      workspace_edit       3 attempts; execution_id per tool call, so the executor
+git_commit      shell                3 attempts; execution_id per tool call, so the executor
                                      returns the first attempt's cached result (one commit)
 run_command     shell                retries only while the executor is unreachable before the
                                      job starts, and after a worker crash; every retry reuses
@@ -75,6 +75,10 @@ MAX_STATUS_ENTRIES = 200
 MAX_COMMIT_MESSAGE_CHARS = 10_000
 MAX_COMMAND_CHARS = 100_000
 MAX_TIMEOUT_SECONDS = 15 * 60
+# A write or edit waits this long for a running command to finish, then fails with a
+# definite "workspace busy" (nothing written). Well inside the 20 s client timeout, so a
+# client timeout can no longer report failure for a write that lands later.
+MUTATION_BUSY_TIMEOUT_SECONDS = 10.0
 # A job can wait for the workspace lock behind another command before it starts.
 QUEUE_ALLOWANCE_SECONDS = 120
 HEARTBEAT_TIMEOUT = timedelta(seconds=15)
@@ -89,12 +93,39 @@ LIST_SKIP_DIRS = frozenset(
     {".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache",
      ".ruff_cache", ".cache", ".tox", "dist", "build"}
 )
-# Git configuration that would let workspace content run code from a git call (hooks,
-# fsmonitor, signing programs, pagers). Applied to every git tool invocation.
-GIT = (
-    "git --no-pager -c core.hooksPath=/dev/null -c core.fsmonitor=false "
-    "-c commit.gpgsign=false -c core.quotePath=false -c color.ui=false"
-)
+# The git tools are approved as read-only (status, diff) or without a shell review
+# (commit), so no git call they make may run a program the workspace chose (B1). Git runs
+# programs from: hooks, fsmonitor, signing, pagers, external diff and textconv drivers,
+# and filter drivers (clean/smudge/process) selected by gitattributes. This prelude
+# defines `safe_git`, which every git tool uses instead of `git`:
+#
+# - HOME=/tmp, GIT_CONFIG_GLOBAL=/dev/null, GIT_CONFIG_NOSYSTEM=1: no global or system
+#   config, so a workspace `.gitconfig` (the sandbox HOME is /workspace) is never read.
+# - --attr-source=<empty tree>, core.attributesFile=/dev/null, GIT_ATTR_NOSYSTEM=1: no
+#   attributes from the worktree, a global file or the system. (git >= 2.40.)
+# - `.git/info/attributes` cannot be switched off, so every filter driver defined in the
+#   repo config is overridden to nothing; a filter with no command is not run.
+# - Hooks, fsmonitor, signing and pagers are disabled; diffs pass --no-ext-diff and
+#   --no-textconv; submodules (which have their own config) are ignored.
+#
+# The executor also refuses /files writes under `.git/` and to a root `.gitconfig`.
+GIT_PRELUDE = r"""export HOME=/tmp XDG_CONFIG_HOME=/tmp/.config GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1
+safe_git() {
+  local overrides=() key name keys
+  keys=$(command git config --name-only --get-regexp '^filter\.' 2>/dev/null) || true
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    name=${key#filter.}; name=${name%.*}
+    overrides+=(-c "filter.$name.clean=" -c "filter.$name.smudge=" -c "filter.$name.process=" -c "filter.$name.required=false")
+  done <<< "$keys"
+  command git --no-pager --attr-source="$(command git hash-object -t tree /dev/null)" \
+    -c core.attributesFile=/dev/null -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    -c commit.gpgsign=false -c tag.gpgsign=false -c core.quotePath=false -c color.ui=false \
+    -c diff.ignoreSubmodules=all -c status.submoduleSummary=false \
+    "${overrides[@]}" "$@"
+}
+"""
+GIT = "safe_git"
 _SEPARATOR = "@@@workspace-tool-separator-7f3a@@@"
 
 # -- Activity configs -----------------------------------------------------------------------
@@ -143,6 +174,8 @@ _PERMANENT_CODES = frozenset(
         "not_a_directory",
         "not_empty",
         "invalid_request",
+        "protected_path",
+        "workspace_busy",
     }
 )
 
@@ -439,8 +472,10 @@ def _execution_id(kind: str, *parts: str) -> str:
 
 
 def _activity_execution_id(kind: str) -> str:
+    # The run id matters: activity ids restart at 1 after continue-as-new. All three are
+    # stable across retries of one activity.
     info = activity.info()
-    return _execution_id(kind, info.workflow_id or "", info.activity_id)
+    return _execution_id(kind, info.workflow_id or "", info.workflow_run_id or "", info.activity_id)
 
 
 # -- Executor client ------------------------------------------------------------------------
@@ -648,6 +683,15 @@ async def _cancel_execution(workspace_id: str, execution_id: str) -> None:
         pass
 
 
+def _cancel_was_requested() -> bool:
+    details = activity.cancellation_details()
+    return bool(
+        details is not None
+        and details.cancel_requested
+        and not (details.timed_out or details.worker_shutdown)
+    )
+
+
 def _heartbeat_ticker(details: Callable[[], Any]) -> Callable[[], None]:
     last = [0.0]
 
@@ -763,7 +807,13 @@ async def write_file(path: str, content: str, workspace_id: agent.Injected[str])
         before = ""  # too big or binary to diff: count the new text only
     data = await _files_call(
         "write",
-        {"workspace_id": workspace_id, "path": path, "content": content, "create_parents": True},
+        {
+            "workspace_id": workspace_id,
+            "path": path,
+            "content": content,
+            "create_parents": True,
+            "busy_timeout_seconds": MUTATION_BUSY_TIMEOUT_SECONDS,
+        },
     )
     shown = data.get("path", path)
     diff, added, removed, cut = unified_diff(shown, before or "", content)
@@ -806,7 +856,13 @@ async def edit_file(
     try:
         data = await _files_call(
             "edit",
-            {"workspace_id": workspace_id, "path": path, "old_string": old_string, "new_string": new_string},
+            {
+                "workspace_id": workspace_id,
+                "path": path,
+                "old_string": old_string,
+                "new_string": new_string,
+                "busy_timeout_seconds": MUTATION_BUSY_TIMEOUT_SECONDS,
+            },
         )
     except ApplicationError as err:
         # A retry after an edit that landed but whose response was lost: old_string is
@@ -1015,7 +1071,9 @@ async def run_command_activity(request: RunCommandInput) -> CommandResult:
     """Run one shell command in the workspace sandbox, streaming its output to the turn."""
     info = activity.info()
     tool_ctx = request.tool_ctx
-    execution_id = _execution_id("run_command", info.workflow_id or "", tool_ctx.tool_id)
+    execution_id = _execution_id(
+        "run_command", info.workflow_id or "", info.workflow_run_id or "", tool_ctx.tool_id
+    )
     resume_seq = -1
     if info.attempt > 1 and info.heartbeat_details:
         last = info.heartbeat_details[-1]
@@ -1066,7 +1124,11 @@ async def run_command_activity(request: RunCommandInput) -> CommandResult:
                 seq_sink=state,
             )
         except asyncio.CancelledError:
-            await asyncio.shield(_cancel_execution(request.workspace_id, execution_id))
+            # Stop the job only when the workflow asked (user interrupt). A worker shutdown
+            # or a zombie attempt whose heartbeat timed out must leave it running: the
+            # next attempt reattaches to it.
+            if _cancel_was_requested():
+                await asyncio.shield(_cancel_execution(request.workspace_id, execution_id))
             raise
         finally:
             progress.flush()
@@ -1152,17 +1214,27 @@ def _git_error(result: dict[str, Any]) -> str | None:
 @agent.activity_tool_defn(inherently_safe=True, activity_config=EXEC_READ_CONFIG)
 async def git_status(workspace_id: agent.Injected[str]) -> GitStatusResult:
     """Show the workspace's git branch and changed, staged and untracked files."""
-    result = await _exec_collect(workspace_id, "git_status", f"{GIT} status --porcelain=v1 -b")
+    result = await _exec_collect(workspace_id, "git_status", git_status_command())
     error = _git_error(result)
     if error:
         return GitStatusResult(error=error, clean=False)
     return parse_git_status(str(result.get("stdout") or ""))
 
 
+def git_status_command() -> str:
+    return f"{GIT_PRELUDE}\n{GIT} status --porcelain=v1 -b --ignore-submodules=all"
+
+
 def git_diff_command(path: str | None, staged: bool) -> str:
-    base = f"{GIT} diff --no-ext-diff --no-textconv --no-color" + (" --cached" if staged else "")
+    base = (
+        f"{GIT} diff --no-ext-diff --no-textconv --no-color --ignore-submodules=all"
+        + (" --cached" if staged else "")
+    )
     scope = f" -- {shlex.quote(path)}" if path else ""
-    return f"{base} --numstat{scope} && printf '\\n%s\\n' {_SEPARATOR} && {base}{scope}"
+    return (
+        f"{GIT_PRELUDE}\n"
+        f"{base} --numstat{scope} && printf '\\n%s\\n' {_SEPARATOR} && {base}{scope}"
+    )
 
 
 def parse_git_diff(stdout: str, staged: bool, limit: int = MAX_GIT_DIFF_CHARS) -> GitDiffResult:
@@ -1206,16 +1278,16 @@ async def git_diff(
 
 def git_commit_command(add_all: bool) -> str:
     # The message arrives on stdin (`-F -`), so it is never shell-quoted.
+    # The identity comes from the executor's GIT_AUTHOR_*/GIT_COMMITTER_* environment.
     return "\n".join(
         [
+            GIT_PRELUDE,
             "set -e",
-            f'name="$({GIT} config user.name || echo "Coding Agent")"',
-            f'email="$({GIT} config user.email || echo "agent@sandbox.local")"',
             *([f"{GIT} add -A"] if add_all else []),
-            f'if {GIT} diff --cached --quiet; then echo "nothing to commit"; exit 3; fi',
-            f'{GIT} -c user.name="$name" -c user.email="$email" commit --no-verify -q -F -',
+            f'if {GIT} diff --cached --quiet --ignore-submodules=all; then echo "nothing to commit"; exit 3; fi',
+            f"{GIT} commit --no-verify -q -F -",
             f"{GIT} log -1 --format='%H%n%s'",
-            f"{GIT} show --shortstat --format= HEAD",
+            f"{GIT} show --no-ext-diff --no-textconv --shortstat --format= HEAD",
         ]
     )
 
@@ -1250,7 +1322,9 @@ def parse_git_commit(result: dict[str, Any]) -> GitCommitResult:
     )
 
 
-@agent.activity_tool_defn(activity_config=EXEC_WRITE_CONFIG, auto_approval_criteria="workspace_edit")
+# "shell", not "workspace_edit": a commit always goes to a human in the catalog, and
+# "always allow" never applies to it.
+@agent.activity_tool_defn(activity_config=EXEC_WRITE_CONFIG, auto_approval_criteria="shell")
 async def git_commit(
     message: str,
     workspace_id: agent.Injected[str],

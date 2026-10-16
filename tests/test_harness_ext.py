@@ -34,6 +34,9 @@ class HarnessInternals(unittest.TestCase):
             "pending_approval_entries",
             "pending_callbacks",
             "active_subagents",
+            "approval_entry",
+            "remove_subagent",
+            "set_approval_policy",
         ):
             self.assertTrue(callable(getattr(_WorkflowStatus, name, None)), name)
         init = inspect.getsource(_WorkflowStatus.__init__)
