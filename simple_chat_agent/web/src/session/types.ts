@@ -69,6 +69,13 @@ export type PendingApproval = WaitingToolCall & {
   /** Null only while config hasn't loaded. */
   riskClass: RiskClass | (string & {}) | null;
   rememberAllowed: boolean;
+  /** The Auto mode judge is deciding it (its latest evaluation is running: from
+   *  auto_approval_evaluation_started until _ended, _error or _superseded). A person can still
+   *  answer. Always set by the facade; optional until Eng W's hand-built fixtures carry it. */
+  judging?: boolean;
+  /** The judge's latest finished evaluation (ended, superseded or error), once there is one;
+   *  e.g. an escalation's reason. Always set by the facade (optional as above). */
+  evaluation?: Evaluation | null;
 };
 
 // -- config and catalog (GET /api/agent/config) ---------------------------------------------

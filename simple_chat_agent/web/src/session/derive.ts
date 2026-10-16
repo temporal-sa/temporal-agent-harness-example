@@ -3,6 +3,7 @@
 
 import type {
   AgentNode,
+  Evaluation,
   Message,
   ModelChoice,
   PendingApproval,
@@ -127,7 +128,9 @@ export function sessionStatus(input: {
   worker: WorkerHealth;
   waitingForWorker: boolean;
 }): SessionStatus {
-  if (input.pendingApprovals.length > 0) return "waiting_for_you";
+  // Calls the judge is still deciding don't wait on you yet: the turn is running.
+  if (input.pendingApprovals.some((w) => !w.judging)) return "waiting_for_you";
+  if (input.pendingApprovals.length > 0) return "running";
   if ((input.anyBusy && !input.worker.answering) || input.waitingForWorker) return "worker_unresponsive";
   if (input.anyBusy) return "running";
   return "idle";
@@ -185,4 +188,23 @@ export function toChatAttachments(
     ...(u.size_bytes !== undefined ? { size: u.size_bytes } : {}),
     ...(u.mime_type !== undefined ? { content_type: u.mime_type } : {}),
   }));
+}
+
+/** Whether the judge is deciding a waiting call, and its latest finished evaluation. */
+export function judgeState(part: Pick<ToolPart, "evaluations">): { judging: boolean; evaluation: Evaluation | null } {
+  const evals = part.evaluations ?? [];
+  const latest = evals[evals.length - 1];
+  let evaluation: Evaluation | null = null;
+  for (let i = evals.length - 1; i >= 0; i--) {
+    if (evals[i]!.status !== "running") {
+      evaluation = evals[i]!;
+      break;
+    }
+  }
+  return { judging: latest?.status === "running", evaluation };
+}
+
+/** Tag each waiting call with the judge's state. */
+export function withJudging<T extends { part: Pick<ToolPart, "evaluations"> }>(approvals: readonly T[]): (T & { judging: boolean; evaluation: Evaluation | null })[] {
+  return approvals.map((w) => ({ ...w, ...judgeState(w.part) }));
 }

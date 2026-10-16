@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { modelInUse, alwaysApprovedFrom, currentModel, currentPosture, sessionStatus, subagentsOf, toChatAttachments, visibleMessages } from "./derive";
+import { judgeState, withJudging, modelInUse, alwaysApprovedFrom, currentModel, currentPosture, sessionStatus, subagentsOf, toChatAttachments, visibleMessages } from "./derive";
 import { HEALTHY } from "./telemetry";
 import type { AgentNode, Message, PendingApproval } from "./types";
 
@@ -108,5 +108,40 @@ describe("model in use (UX verification nit)", () => {
     const change = control("set_model", { model: { provider: "anthropic", model: "claude-opus-5" } }, { turnNumber: 2 });
     expect(modelInUse([chat, change], seed, "busy")).toEqual(seed);
     expect(modelInUse([chat, change], seed, "idle")).toMatchObject({ model: "claude-opus-5" });
+  });
+});
+
+describe("the judge's checking state", () => {
+  const ev = (status: "running" | "ended" | "superseded" | "error", verdict: "approve" | "deny" | "escalate" | null = null) => ({
+    id: `e-${status}`,
+    evaluator: "judge",
+    status,
+    verdict,
+    reason: verdict === "escalate" ? "rule: commits need a person" : null,
+    details: {},
+    error: status === "error" ? "judge unavailable" : null,
+  });
+  const waiting = (evaluations: ReturnType<typeof ev>[]) =>
+    ({ agentId: "root", messageId: "m", part: { toolName: "run_command", evaluations } as never, riskClass: "shell", rememberAllowed: false }) as PendingApproval;
+
+  it("is judging from evaluation_started until it ends, errs or is superseded", () => {
+    expect(judgeState({ evaluations: [ev("running")] })).toEqual({ judging: true, evaluation: null });
+    expect(judgeState({ evaluations: [ev("running"), ] }).judging).toBe(true);
+    expect(judgeState({ evaluations: [ev("ended", "escalate")] })).toMatchObject({ judging: false, evaluation: { verdict: "escalate" } });
+    expect(judgeState({ evaluations: [ev("error")] })).toMatchObject({ judging: false, evaluation: { status: "error" } });
+    expect(judgeState({ evaluations: [ev("superseded", "approve")] })).toMatchObject({ judging: false, evaluation: { status: "superseded" } });
+    expect(judgeState({ evaluations: [] })).toEqual({ judging: false, evaluation: null });
+    // A new evaluation after an escalation: judging again, the last finished one kept.
+    expect(judgeState({ evaluations: [ev("ended", "escalate"), ev("running")] })).toMatchObject({ judging: true, evaluation: { verdict: "escalate" } });
+  });
+
+  it("tags waiting calls, and keeps the pill on Running while every call is only being judged", () => {
+    const [judged, asked] = withJudging([waiting([ev("running")]), waiting([ev("ended", "escalate")])]);
+    expect(judged).toMatchObject({ judging: true, evaluation: null });
+    expect(asked).toMatchObject({ judging: false });
+    const base = { anyBusy: true, worker: HEALTHY, waitingForWorker: false };
+    expect(sessionStatus({ ...base, pendingApprovals: [judged!] })).toBe("running");
+    expect(sessionStatus({ ...base, pendingApprovals: [judged!, asked!] })).toBe("waiting_for_you");
+    expect(sessionStatus({ ...base, pendingApprovals: [{ ...asked!, judging: false }] })).toBe("waiting_for_you");
   });
 });

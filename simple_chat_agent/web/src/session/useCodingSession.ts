@@ -27,6 +27,7 @@ import {
   subagentsOf,
   toolIndex,
   visibleMessages,
+  withJudging,
   withRiskClass,
 } from "./derive";
 import { advance, landed, observe, startRecord, stuckInTemporal } from "./sendStates";
@@ -116,7 +117,7 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
   const progress = useMemo(() => activeProgress.update(h.frames), [activeProgress, h.frames]);
   const { toolRiskClasses, defaultToolRiskClass, rememberAllowedClasses } = seed;
   const pendingApprovals = useMemo(
-    () => withRiskClass(h.pendingApprovals, toolRiskClasses, defaultToolRiskClass, rememberAllowedClasses),
+    () => withJudging(withRiskClass(h.pendingApprovals, toolRiskClasses, defaultToolRiskClass, rememberAllowedClasses)),
     [h.pendingApprovals, toolRiskClasses, defaultToolRiskClass, rememberAllowedClasses],
   );
 
