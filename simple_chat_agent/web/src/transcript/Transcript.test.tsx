@@ -112,7 +112,7 @@ describe("Transcript", () => {
 
   it("mutes a waiting row while the decision card shows it (UX review m11)", () => {
     const waiting = tool("edit_file", { toolId: "t-wait", state: "awaiting_approval", input: { path: "a.py", old_string: "a", new_string: "b" } });
-    const html = render([message([call(), waiting])], { pendingApprovals: [{ agentId: "root", messageId: "m1", part: waiting, riskClass: "workspace_edit", rememberAllowed: true }] } as never);
+    const html = render([message([call(), waiting])], { pendingApprovals: [{ agentId: "root", messageId: "m1", part: waiting, riskClass: "workspace_edit", rememberAllowed: true, judging: false, evaluation: null }] } as never);
     expect(html).toContain('<span class="badge idle">waiting · see card</span>');
     expect(html).not.toContain(">Waiting for you<");
   });
@@ -125,5 +125,16 @@ describe("not-sent copy (UX verification 3)", () => {
     expect(notSentText(rec(502, null), { error: "raw" })).toMatch(/^Not sent. The app's API isn't answering/);
     expect(notSentText(rec(409, "session_closed"), { error: "raw" })).toBe("Not sent. This session is closed. Start a new one.");
     expect(notSentText(rec(0, null), { error: "Failed to fetch" })).toMatch(/^Not sent. Couldn't reach the app/);
+  });
+});
+
+describe("judge checking row", () => {
+  it("reads 'judge checking' in neutral while the judge decides, not 'waiting · see card'", () => {
+    const judged = tool("run_command", { toolId: "t-judge", state: "evaluating", input: { command: "pytest -q" } });
+    const html = render([message([call(), judged])], {
+      pendingApprovals: [{ agentId: "root", messageId: "m1", part: judged, riskClass: "shell", rememberAllowed: false, judging: true, evaluation: null }],
+    } as never);
+    expect(html).toContain('<span class="badge idle">judge checking</span>');
+    expect(html).not.toContain("waiting · see card");
   });
 });

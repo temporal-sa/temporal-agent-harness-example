@@ -122,7 +122,7 @@ describe("the judge's checking state", () => {
     error: status === "error" ? "judge unavailable" : null,
   });
   const waiting = (evaluations: ReturnType<typeof ev>[]) =>
-    ({ agentId: "root", messageId: "m", part: { toolName: "run_command", evaluations } as never, riskClass: "shell", rememberAllowed: false }) as PendingApproval;
+    ({ agentId: "root", messageId: "m", part: { toolName: "run_command", evaluations } as never, riskClass: "shell", rememberAllowed: false, judging: false, evaluation: null }) as PendingApproval;
 
   it("is judging from evaluation_started until it ends, errs or is superseded", () => {
     expect(judgeState({ evaluations: [ev("running")] })).toEqual({ judging: true, evaluation: null });

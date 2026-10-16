@@ -30,14 +30,13 @@ function StateBadge({ part, elapsed }: { part: ToolPart; elapsed: number | null 
   const cmd = part.toolName === "run_command" ? commandSummary(part.output) : null;
   switch (part.state) {
     case "awaiting_approval":
+    case "evaluating": {
       // The decision card is the one pink focus; the row only points at it (UX review m11).
-      return session.pendingApprovals.some((w) => w.part.toolId === part.toolId) ? (
-        <span className="badge idle">waiting · see card</span>
-      ) : (
-        <span className="badge git">Waiting for you</span>
-      );
-    case "evaluating":
-      return <span className="badge prog">Judge deciding</span>;
+      const waiting = session.pendingApprovals.find((w) => w.part.toolId === part.toolId);
+      if (waiting?.judging) return <span className="badge idle">judge checking</span>;
+      if (waiting) return <span className="badge idle">waiting · see card</span>;
+      return part.state === "evaluating" ? <span className="badge prog">Judge deciding</span> : <span className="badge git">Waiting for you</span>;
+    }
     case "denied":
       return <span className="badge leaving">{decisionBadge(part) ?? "Declined"}</span>;
     case "requested":
