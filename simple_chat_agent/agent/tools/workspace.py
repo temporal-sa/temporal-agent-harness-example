@@ -21,12 +21,23 @@ record separator ``\x1e`` (as in RFC 7464 JSON text sequences) followed by one J
 A ``progress_delta`` that does not start with ``\x1e`` is a legacy, untagged chunk of plain
 output (treat it as stdout). Frames (``v`` is 1):
 
-* ``{"v": 1, "type": "output", "seq": 12, "chunks": [{"stream": "stdout", "text": "..."},
-  {"stream": "stderr", "text": "..."}]}``: output in arrival order. ``stream`` is
-  ``stdout``, ``stderr`` or ``note`` (a line from us, not the command: the reattach line,
-  "[... dropped ...]", "[live output limit reached ...]"). ``seq`` is the executor's last
-  event seq in the frame (null for a frame of notes only); it only grows within a run, also
-  across a reattach, so a client may drop a frame whose seq it has already shown.
+* ``{"v": 1, "type": "output", "seq": 12, "chunks": [{"stream": "stdout", "seq": 11,
+  "text": "..."}, {"stream": "stderr", "seq": 12, "text": "..."}]}``: output in arrival
+  order. ``stream`` is ``stdout``, ``stderr`` or ``note`` (a line from us, not the command:
+  the reattach line, "[... dropped ...]", "[live output limit reached ...]").
+
+  Each chunk is exactly one executor stream event, and its ``seq`` is that event's seq
+  (``null`` for a ``note``). Chunks from different events are never merged, so a reader can
+  dedupe per chunk: keep the highest seq shown so far and skip any chunk whose non-null
+  ``seq`` is not above it; always show ``note`` chunks. This matters after a worker crash:
+  the retry resumes from the last *heartbeated* seq, which can be seconds behind what was
+  already published, so its first frame may start with events the reader has already shown
+  and end with new ones.
+
+  The frame-level ``seq`` (the last chunk seq in the frame, null for a frame of notes only)
+  is kept for older readers. It only grows within a run, also across a reattach, but
+  dropping a whole frame by it is not enough after a reattach (it either repeats or loses
+  lines); trim per chunk instead.
 * ``{"v": 1, "type": "sandbox", "state": "down", "attempt": 2, "max_attempts": 6,
   "will_retry": true, "retry_in_s": 5.0, "next_retry_at": 1760620005.2, "reason": "...",
   "message": "The sandbox isn't answering. Temporal will retry the command."}``: this
@@ -1179,7 +1190,7 @@ def parse_progress_delta(delta: str) -> dict[str, Any]:
             frame = json.loads(delta[len(PROGRESS_FRAME_PREFIX):])
             if isinstance(frame, dict):
                 return frame
-    return {"v": 0, "type": "output", "seq": None, "chunks": [{"stream": "stdout", "text": delta}]}
+    return {"v": 0, "type": "output", "seq": None, "chunks": [{"stream": "stdout", "seq": None, "text": delta}]}
 
 
 def progress_text(deltas: Any, streams: tuple[str, ...] = ("stdout", "stderr", "note")) -> str:
@@ -1195,8 +1206,9 @@ def progress_text(deltas: Any, streams: tuple[str, ...] = ("stdout", "stderr", "
 class _ProgressCoalescer:
     """Turn many small stdout/stderr chunks into fewer ``tool_progress_delta`` events.
 
-    Each flush publishes one ``output`` frame whose chunks keep their stream and order
-    (adjacent chunks of one stream are merged).
+    Each flush publishes one ``output`` frame whose chunks keep their stream, order and
+    executor seq (one chunk per executor event; see the module docstring). Only text with
+    the same stream and the same seq is merged: consecutive notes, or seq-less output.
     """
 
     def __init__(
@@ -1211,20 +1223,21 @@ class _ProgressCoalescer:
         self._flush_seconds = flush_seconds
         self._flush_chars = flush_chars
         self._budget = max_chars
-        self._pending: list[dict[str, str]] = []
+        self._pending: list[dict[str, Any]] = []
         self._pending_chars = 0
         self._pending_seq: int | None = None
         self._first_at = 0.0
         self._capped = False
         self.published_chars = 0
 
-    def _append(self, stream: str, text: str) -> None:
+    def _append(self, stream: str, text: str, seq: int | None = None) -> None:
         if not self._pending:
             self._first_at = time.monotonic()
-        if self._pending and self._pending[-1]["stream"] == stream:
-            self._pending[-1]["text"] += text
+        last = self._pending[-1] if self._pending else None
+        if last is not None and last["stream"] == stream and last["seq"] == seq:
+            last["text"] += text
         else:
-            self._pending.append({"stream": stream, "text": text})
+            self._pending.append({"stream": stream, "seq": seq, "text": text})
 
     def add(self, text: str, stream: str = "stdout", seq: int | None = None) -> None:
         if not text:
@@ -1237,7 +1250,7 @@ class _ProgressCoalescer:
             return
         text = text[: self._budget]
         self._budget -= len(text)
-        self._append(stream, text)
+        self._append(stream, text, seq)
         if seq is not None:
             self._pending_seq = seq
         self._pending_chars += len(text)

@@ -245,18 +245,66 @@ class ResultRenderingTests(unittest.TestCase):
         self.assertEqual(
             frame["chunks"],
             [
-                {"stream": "stdout", "text": "a\nb\n"},
-                {"stream": "stderr", "text": "warn\n"},
-                {"stream": "stdout", "text": "c\n"},
-                {"stream": "note", "text": "[note]\n"},
+                {"stream": "stdout", "seq": 0, "text": "a\n"},
+                {"stream": "stdout", "seq": 1, "text": "b\n"},
+                {"stream": "stderr", "seq": 2, "text": "warn\n"},
+                {"stream": "stdout", "seq": 3, "text": "c\n"},
+                {"stream": "note", "seq": None, "text": "[note]\n"},
             ],
         )
         self.assertEqual(ws.progress_text(published, ("stderr",)), "warn\n")
 
+    def test_reattach_from_an_older_seq_shows_each_line_once_with_per_chunk_trim(self) -> None:
+        # Attempt 1 publishes lines 1..6 one frame each, but its last heartbeat said seq 2.
+        # After a SIGKILL, attempt 2 resumes from seq 2 and the executor replays 3..9 in one
+        # burst, so one frame spans already-shown seqs (3..6) and new ones (7..9).
+        published: list[str] = []
+        first = ws._ProgressCoalescer(published.append, flush_seconds=60, flush_chars=10_000)
+        for seq in range(1, 7):
+            first.add(f"line{seq}\n", "stdout", seq)
+            first.flush()
+        second = ws._ProgressCoalescer(published.append, flush_seconds=60, flush_chars=10_000)
+        second.note("\n[worker restarted; reattaching]\n")
+        for seq in range(3, 10):
+            second.add(f"line{seq}\n", "stderr" if seq == 8 else "stdout", seq)
+        second.flush()
+        replay = ws.parse_progress_delta(published[-1])
+        self.assertEqual(replay["seq"], 9)  # frame-level seq kept for older readers
+        self.assertEqual([c["seq"] for c in replay["chunks"]], list(range(3, 10)))
+
+        def lines(text: str) -> list[str]:
+            return [line for line in text.splitlines() if line.startswith("line")]
+
+        # The old frame-level trim repeats lines 3..6 after the reattach note.
+        last: int | None = None
+        frame_trim = ""
+        for delta in published:
+            frame = ws.parse_progress_delta(delta)
+            if frame["seq"] is not None:
+                if last is not None and frame["seq"] <= last:
+                    continue
+                last = frame["seq"]
+            frame_trim += "".join(c["text"] for c in frame["chunks"])
+        self.assertEqual(lines(frame_trim).count("line3"), 2)
+
+        # A per-chunk trim shows every line once, in order, and keeps the note.
+        last = None
+        chunk_trim = ""
+        for delta in published:
+            for chunk in ws.parse_progress_delta(delta)["chunks"]:
+                if chunk["seq"] is not None:
+                    if last is not None and chunk["seq"] <= last:
+                        continue
+                    last = chunk["seq"]
+                chunk_trim += chunk["text"]
+        self.assertEqual(lines(chunk_trim), [f"line{n}" for n in range(1, 10)])
+        self.assertIn("reattaching", chunk_trim)
+
     def test_untagged_progress_reads_as_stdout(self) -> None:
         self.assertEqual(
             ws.parse_progress_delta("legacy text\n"),
-            {"v": 0, "type": "output", "seq": None, "chunks": [{"stream": "stdout", "text": "legacy text\n"}]},
+            {"v": 0, "type": "output", "seq": None,
+             "chunks": [{"stream": "stdout", "seq": None, "text": "legacy text\n"}]},
         )
         # A broken frame is shown as text rather than lost.
         self.assertEqual(ws.progress_text(["\x1e{not json"]), "\x1e{not json")
@@ -923,7 +971,8 @@ class RunCommandActivityTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
         # "hi" was published well before the command finished (within 1 s of output).
         first_at, first = self.publisher.events[0]
         self.assertEqual(
-            ws.parse_progress_delta(first.progress_delta)["chunks"], [{"stream": "stdout", "text": "hi\n"}]
+            [(c["stream"], c["text"]) for c in ws.parse_progress_delta(first.progress_delta)["chunks"]],
+            [("stdout", "hi\n")]
         )
         self.assertEqual(first.tool_id, "toolu_1")
         self.assertLess(first_at - started, 1.0)
@@ -985,7 +1034,7 @@ class RunCommandActivityTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
         # Tags survive the reattach, and the reattach line is a note, not output.
         frames = [ws.parse_progress_delta(e.progress_delta) for _, e in self.publisher.events[delivered:]]
         chunks = [c for f in frames if f["type"] == "output" for c in f["chunks"]]
-        self.assertIn({"stream": "stdout", "text": "done\n"}, chunks)
+        self.assertIn(("stdout", "done\n"), [(c["stream"], c["text"]) for c in chunks])
         self.assertTrue(any(c["stream"] == "note" and "reattaching" in c["text"] for c in chunks))
         self.assertGreater(min(f["seq"] for f in frames if f["type"] == "output" and f["seq"] is not None),
                            heartbeats[-1][0]["seq"])
@@ -1679,7 +1728,8 @@ class LiveExecutorTests(unittest.IsolatedAsyncioTestCase):
         first_at, first = self.publisher.events[0]
         last_at, _ = self.publisher.events[-1]
         self.assertEqual(
-            ws.parse_progress_delta(first.progress_delta)["chunks"], [{"stream": "stdout", "text": "hi\n"}]
+            [(c["stream"], c["text"]) for c in ws.parse_progress_delta(first.progress_delta)["chunks"]],
+            [("stdout", "hi\n")]
         )
         self.assertLess(first_at - started, 1.0)
         self.assertGreater(last_at - first_at, 1.5)  # "done" arrived live, ~2 s later
