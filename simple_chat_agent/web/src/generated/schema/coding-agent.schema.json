@@ -464,6 +464,11 @@
           "title": "Depth",
           "type": "integer"
         },
+        "mcp": {
+          "default": false,
+          "title": "Mcp",
+          "type": "boolean"
+        },
         "system_prompt": {
           "anyOf": [
             {

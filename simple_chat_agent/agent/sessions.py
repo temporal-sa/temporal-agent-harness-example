@@ -17,6 +17,8 @@ from temporalio import workflow
 with workflow.unsafe.imports_passed_through():
     from pydantic import BaseModel, Field
 
+    from simple_chat_agent.agent.mcp_client import MAX_SERVERS, McpServerRecord
+
 SESSIONS_WORKFLOW_TYPE = "CodingSessions"
 IDLE_WAKE = timedelta(hours=1)
 MAX_SESSIONS = 500
@@ -43,6 +45,10 @@ class SessionsState(BaseModel):
     owner_digest: str
     sessions: list[SessionRecord] = Field(default_factory=list)
     settings: dict[str, str] = Field(default_factory=dict)
+    # The user's MCP server registrations (PRD A8): name, URL, auth ref. No secrets. Changed
+    # by Signal from the API; read by the agent's listing activity (a Query) and mirrored in
+    # the memo so the API can rebuild its Redis copy without a worker.
+    mcp_servers: list[McpServerRecord] = Field(default_factory=list)
 
 
 class RenameRequest(BaseModel):
@@ -68,6 +74,8 @@ class CodingSessions:
 
     @workflow.run
     async def run(self, state: SessionsState) -> None:
+        if self._state.mcp_servers:
+            self._publish_mcp_memo()
         while True:
             try:
                 await workflow.wait_condition(self._should_continue_as_new, timeout=IDLE_WAKE)
@@ -141,6 +149,33 @@ class CodingSessions:
     @workflow.signal(name="remove_session_signal")
     async def remove_session_signal(self, session_id: str) -> None:
         await self.remove_session(session_id)
+
+    # -- MCP servers (PRD A8) ------------------------------------------------------------
+
+    @workflow.signal(name="upsert_mcp_server_signal")
+    async def upsert_mcp_server_signal(self, record: McpServerRecord) -> None:
+        """Add or replace a registration by name; newest first, at most MAX_SERVERS."""
+        rest = [s for s in self._state.mcp_servers if s.name != record.name]
+        self._state.mcp_servers = [record, *rest][:MAX_SERVERS]
+        self._publish_mcp_memo()
+
+    @workflow.signal(name="remove_mcp_server_signal")
+    async def remove_mcp_server_signal(self, name: str) -> None:
+        before = len(self._state.mcp_servers)
+        self._state.mcp_servers = [s for s in self._state.mcp_servers if s.name != name]
+        if len(self._state.mcp_servers) != before:
+            self._publish_mcp_memo()
+
+    @workflow.query
+    def list_mcp_servers(self) -> list[McpServerRecord]:
+        """For the agent's MCP listing activity (worker side). Browsers never Query: the API
+        serves its Redis mirror, rebuilt from the memo."""
+        return self._state.mcp_servers
+
+    def _publish_mcp_memo(self) -> None:
+        workflow.upsert_memo(
+            {"mcp_servers": [s.model_dump(mode="json") for s in self._state.mcp_servers]}
+        )
 
     @workflow.update
     async def compact(self) -> None:

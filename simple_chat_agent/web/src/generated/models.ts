@@ -400,6 +400,7 @@ export interface CodingAgentInit {
   research_tools?: string[];
   workspace_id?: string;
   depth?: number;
+  mcp?: boolean;
   system_prompt?: string | null;
   carried?: CarriedState | null;
   force_continue_as_new_after_turns?: number | null;

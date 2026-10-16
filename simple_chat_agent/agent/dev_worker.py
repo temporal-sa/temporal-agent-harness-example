@@ -21,6 +21,7 @@ from temporalio.worker import Worker
 from temporal_agent_harness.plugin import AgentHarnessPlugin
 
 from simple_chat_agent.agent.harness_ext import payload_storage
+from simple_chat_agent.agent.mcp import MCP_ACTIVITIES
 
 from simple_chat_agent.agent.runtime import CODING_AGENT
 from simple_chat_agent.agent.approvals import APPROVAL_ACTIVITIES
@@ -48,7 +49,7 @@ async def main() -> None:
         client,
         task_queue=args.task_queue,
         workflows=[CodingAgent, CodingSessions, *SUBAGENT_WORKFLOWS],
-        activities=[*WORKSPACE_ACTIVITIES, *APPROVAL_ACTIVITIES],
+        activities=[*WORKSPACE_ACTIVITIES, *APPROVAL_ACTIVITIES, *MCP_ACTIVITIES],
         plugins=[AgentPlugin(CODING_AGENT)],
         identity=args.identity,
         max_heartbeat_throttle_interval=timedelta(seconds=1),

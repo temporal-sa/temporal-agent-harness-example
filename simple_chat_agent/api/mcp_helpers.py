@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from simple_chat_agent.api.auth import AuthenticatedUser
 from simple_chat_agent.common.mcp_auth import mcp_oauth_provider
-from simple_chat_agent.common.store import AppStore
-from agent_harness.mcp_types import HttpMcpServerConfig
+
+if TYPE_CHECKING:  # annotations only: the agent API imports this without the old harness
+    from agent_harness.mcp_types import HttpMcpServerConfig
+    from simple_chat_agent.api.auth import AuthenticatedUser
+    from simple_chat_agent.common.store import AppStore
 
 
 def mcp_server_url_candidates(server_url: str) -> list[str]:

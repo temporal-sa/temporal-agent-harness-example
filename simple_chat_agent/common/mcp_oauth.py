@@ -274,11 +274,12 @@ def mcp_oauth_provider_for_flow(
     *,
     flow: PendingMcpOAuthFlow,
     store: AppStore,
+    redirect_uri: str | None = None,
 ) -> OAuthClientProvider:
     return AppMcpOAuthClientProvider(
         server_url=flow.server_url,
         client_metadata=OAuthClientMetadata(
-            redirect_uris=[mcp_redirect_uri(flow.flow_id)],
+            redirect_uris=[redirect_uri or mcp_redirect_uri(flow.flow_id)],
             client_name="Temporal Agent Harness Example",
             scope=None,
         ),
@@ -296,15 +297,20 @@ async def authorize_mcp_oauth_flow(
     *,
     flow: PendingMcpOAuthFlow,
     store: AppStore,
+    redirect_uri: str | None = None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> None:
-    provider = mcp_oauth_provider_for_flow(flow=flow, store=store)
+    """Run one MCP OAuth authorization. ``redirect_uri`` overrides the old app's callback
+    URL; ``http_client`` (e.g. one whose transport applies the SSRF guard) carries every
+    discovery, registration and token request."""
+    provider = mcp_oauth_provider_for_flow(flow=flow, store=store, redirect_uri=redirect_uri)
 
     # The MCP SDK currently starts OAuth from an HTTPX 401/403 auth flow. Some
     # servers expose list_tools anonymously, so the app needs an explicit path.
     await provider._initialize()
     provider.context.protocol_version = LATEST_PROTOCOL_VERSION
 
-    async with httpx.AsyncClient() as client:
+    async with http_client or httpx.AsyncClient() as client:
         await _discover_oauth_metadata(provider, client)
         await _persist_oauth_context(provider)
         provider.context.client_metadata.scope = get_client_metadata_scopes(

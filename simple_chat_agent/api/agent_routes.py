@@ -95,6 +95,7 @@ from simple_chat_agent.agent.contracts import (
 from simple_chat_agent.agent.tools.workspace import ExecutionLogNotFound, ExecutorRequestError, read_execution_log
 from simple_chat_agent.common.attachments import MAX_ATTACHMENT_BYTES
 from simple_chat_agent.api import agent_models
+from simple_chat_agent.api.agent_mcp import create_mcp_router, mcp_enabled, mcp_feature
 from simple_chat_agent.api.agent_bridge import Bridge
 from simple_chat_agent.api.agent_store import MAX_SEQ, AgentStore, prefix, session_ttl_seconds
 
@@ -1112,11 +1113,30 @@ def create_agent_router(
         body["auto_mode"] = auto_mode
         body["links"] = view_links()
         body.update(tool_risk_info(environment))
+        # MCP servers (PRD A8): local development only (D7); the settings dialog reads this.
+        body["mcp"] = mcp_feature(environment)
         # How long an idle session and its list entry are kept (the store's own TTL).
         ttl = session_ttl_seconds()
         body["session_ttl_seconds"] = ttl
         body["session_ttl_days"] = ttl // 86400 if ttl % 86400 == 0 else round(ttl / 86400, 1)
         return JSONResponse(body, headers=NO_STORE)
+
+    # -- MCP servers (PRD A8): agent_mcp.py --------------------------------------------
+
+    router.include_router(
+        create_mcp_router(
+            user_id=user_id,
+            redis=store.r,
+            directory=sessions,
+            temporal=temporal,
+            app_store=app_store,
+            environment=agent_environment,
+            error=HarnessError,
+            key_prefix=prefix,
+            digest=owner_digest,
+            route_class=HarnessErrorRoute,
+        )
+    )
 
     # -- sessions ------------------------------------------------------------------------
 
@@ -1191,6 +1211,7 @@ def create_agent_router(
             judge=configured_judge_backend(),
             research_tools=offered_research_tools(),
             test_tools=body.test_tools,
+            mcp=mcp_enabled(environment),
         )
         title = (body.title or "").strip() or (
             agent_models.DEMOS[body.demo] if body.demo else "New session"

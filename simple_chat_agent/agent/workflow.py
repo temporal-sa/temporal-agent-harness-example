@@ -31,7 +31,7 @@ with workflow.unsafe.imports_passed_through():
     from temporal_agent_harness.harness.agent_workflow import AgentWorkflowRunner, MessageContext
     from temporalio.contrib.workflow_streams import WorkflowStream
 
-    from simple_chat_agent.agent import approvals, context, harness_ext
+    from simple_chat_agent.agent import approvals, context, harness_ext, mcp
     from simple_chat_agent.agent.budget import HistoryBudget
     from simple_chat_agent.agent.contracts import (
         AGENT_WORKFLOW_TYPE,
@@ -620,7 +620,8 @@ class CodingAgent:
             message_history=self._history,
             model=choice.registry_key,
             model_settings=model_settings(choice, session_id=self._data.session_id),
-            toolsets=[toolset],
+            # MCP tools (PRD A8; local sessions with MCP on): agent/mcp.py.
+            toolsets=[toolset, *await mcp.toolsets_for_run(self._data, is_interrupted=lambda: self._interrupted)],
             # ContextFit before Hooks: the snapshot then holds the history as sent.
             capabilities=[context.ContextFit(budget), hooks],
         )
