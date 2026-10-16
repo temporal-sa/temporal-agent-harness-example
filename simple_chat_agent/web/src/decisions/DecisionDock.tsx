@@ -9,16 +9,15 @@ import { branchFrom } from "../workbench/changes";
 import { DiffView } from "../workbench/DiffView";
 import { agentLabel, anythingRunning, toolsOf } from "../workbench/tree";
 import {
-  ALWAYS_APPROVE_LABEL,
   ALWAYS_APPROVE_WHY,
+  alwaysApproveLabel,
   alwaysApproveReason,
   argSummary,
   callTitle,
-  canAlwaysApprove,
   editStat,
   reviewOf,
   toolBadge,
-  type RiskClass,
+  type Risk,
 } from "./describe";
 import {
   answersFrom,
@@ -145,7 +144,7 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
               <button type="button" className="btn green small" onClick={() => approve([it.toolId])}>
                 Approve
               </button>
-              <AlwaysButton risk={it.risk} onClick={() => approve([it.toolId], true)} />
+              <AlwaysButton risk={it.risk} allowed={it.rememberAllowed} onClick={() => approve([it.toolId], true)} />
               <button
                 type="button"
                 className="btn ghost small"
@@ -161,7 +160,7 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
         </div>
         {declineForm("one")}
         <SendError answer={a} />
-        <p className="why">{canAlwaysApprove(it.risk) ? ALWAYS_APPROVE_WHY : `${alwaysApproveReason(it.risk)}.`}</p>
+        <p className="why">{it.rememberAllowed ? alwaysWhy(it.risk) : `${alwaysApproveReason(it.risk)}.`}</p>
       </section>
     );
   }
@@ -232,12 +231,18 @@ function latestRecord(items: readonly ApprovalItem[], answers: ReadonlyMap<strin
 
 // -- pieces ---------------------------------------------------------------------------------
 
-function AlwaysButton({ risk, onClick, label = ALWAYS_APPROVE_LABEL }: { risk: RiskClass; onClick(): void; label?: string }) {
+function alwaysWhy(risk: Risk): string {
+  return risk === "workspace_edit" || risk === null
+    ? ALWAYS_APPROVE_WHY
+    : `Always approve lasts for this session. You can undo it from the posture menu.`;
+}
+
+function AlwaysButton({ risk, allowed, onClick }: { risk: Risk; allowed: boolean; onClick(): void }) {
   const id = useId();
-  if (canAlwaysApprove(risk)) {
+  if (allowed) {
     return (
       <button type="button" className="btn secondary small" onClick={onClick}>
-        {label}
+        {alwaysApproveLabel(risk)}
       </button>
     );
   }
@@ -346,7 +351,7 @@ function GroupRows(p: GroupRowsProps) {
             <button type="button" className="btn green small" onClick={() => p.onApprove(groupTargets(g))}>
               Approve {n}
             </button>
-            <AlwaysButton risk={g.risk} onClick={() => p.onApprove(groupTargets(g), true)} />
+            <AlwaysButton risk={g.risk} allowed={g.rememberAllowed} onClick={() => p.onApprove(groupTargets(g), true)} />
             <button
               type="button"
               className="btn ghost small"
@@ -361,7 +366,7 @@ function GroupRows(p: GroupRowsProps) {
       {p.declineForm(key)}
       {expanded && (
         <ul className="items" id={panel}>
-          {!canAlwaysApprove(g.risk) && n > 0 && <li className="why">{alwaysApproveReason(g.risk)}.</li>}
+          {!g.rememberAllowed && n > 0 && <li className="why">{alwaysApproveReason(g.risk)}.</li>}
           {g.folds.map((f) => (
             <FoldRows key={f.key} fold={f} {...p} />
           ))}

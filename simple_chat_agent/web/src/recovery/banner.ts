@@ -14,6 +14,8 @@ export interface BannerView {
   waiting: string;
   /** The workflow whose pending Activity to open: a subagent's when it is the one stuck. */
   workflowId: string | null;
+  /** Its current run id (from the facade), for the deep link to its pending Activities. */
+  runId: string | null;
 }
 
 const TESTS = /\b(pytest|py\.test|tox|nox|jest|vitest|mocha|rspec|phpunit|(npm|pnpm|yarn|bun) (run )?test|go test|cargo test|mvn test|gradle test|make test|unittest)\b/;
@@ -23,7 +25,8 @@ export function commandNoun(command: string): string {
 }
 
 type BannerInput = SessionTree &
-  Pick<CodingSession, "sessionId" | "status" | "anyBusy" | "telemetry">;
+  Pick<CodingSession, "sessionId" | "status" | "anyBusy" | "telemetry" | "runIdFor"> &
+  Partial<Pick<CodingSession, "toolProgress">>;
 
 export function bannerView(s: BannerInput): BannerView {
   const worker = s.telemetry.worker;
@@ -44,7 +47,7 @@ export function bannerView(s: BannerInput): BannerView {
           if (p.state === "done") tools++;
           else if (p.state === "running" || p.state === "approved") {
             const cmd = strArg(p.input, "command");
-            running = { kind: "tool", name: p.toolName, command: cmd, output: !!p.progress };
+            running = { kind: "tool", name: p.toolName, command: cmd, output: !!(s.toolProgress?.[p.toolId] || p.progress) };
           }
         }
       }
@@ -53,6 +56,7 @@ export function bannerView(s: BannerInput): BannerView {
 
   const agent = worker.agentId ? s.agent(worker.agentId) : undefined;
   const workflowId = agent?.workflowId ?? s.sessionId;
+  const runId = s.runIdFor(workflowId);
   const at = hms(worker.since);
 
   if (!openTurn) {
@@ -62,6 +66,7 @@ export function bannerView(s: BannerInput): BannerView {
       saved: "your message, in the Workflow's history",
       waiting: "for a worker to start the turn. It runs when one returns.",
       workflowId,
+      runId,
     };
   }
 
@@ -87,12 +92,21 @@ export function bannerView(s: BannerInput): BannerView {
     saved,
     waiting: `for another worker to pick up ${thing}. Your messages still land.`,
     workflowId,
+    runId,
   };
 }
 
-/** Fill a Temporal UI url template for one workflow. */
-export function temporalUiUrl(template: string | null | undefined, workflowId: string | null): string | null {
+/**
+ * Fill a Temporal UI url template (`…/namespaces/<ns>/workflows/{workflow_id}`) for one
+ * workflow. With its run id, the link opens that run's pending Activities; without one, the
+ * Workflow's page.
+ */
+export function temporalUiUrl(template: string | null | undefined, workflowId: string | null, runId: string | null = null): string | null {
   if (!template || !workflowId) return null;
   const id = encodeURIComponent(workflowId);
-  return template.replaceAll("{workflow_id}", id).replaceAll("{session_id}", id);
+  const url = template.replaceAll("{workflow_id}", id).replaceAll("{session_id}", id);
+  if (!runId) return url;
+  const cut = url.search(/[?#]/);
+  const [base, rest] = cut < 0 ? [url, ""] : [url.slice(0, cut), url.slice(cut)];
+  return `${base.replace(/\/+$/, "")}/${encodeURIComponent(runId)}/pending-activities${rest}`;
 }

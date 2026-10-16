@@ -5,69 +5,67 @@ import type { Evaluation } from "../session";
 import { count } from "../recovery/format";
 import { addedFilePreview, countLines, editPreview, type DiffLine } from "../workbench/diff";
 
-export type RiskClass = "read_only" | "workspace_edit" | "shell" | "network" | "external_side_effect";
+/** A tool's approval class, from the facade (`PendingApproval.riskClass`, which comes from
+ *  config). Null while config hasn't loaded. Not narrowed: config may name new classes. */
+export type Risk = string | null;
 
-/**
- * The agent's risk class per tool (simple_chat_agent/agent/approvals.py TOOL_RISK_CLASSES).
- * The facade doesn't carry it yet; an evaluation's `details.criteria_set` wins when present.
- */
-const TOOL_RISK: Record<string, RiskClass> = {
-  read_file: "read_only",
-  list_files: "read_only",
-  search_code: "read_only",
-  git_status: "read_only",
-  git_diff: "read_only",
-  read_attachment: "read_only",
-  write_file: "workspace_edit",
-  edit_file: "workspace_edit",
-  import_attachment_to_workspace: "workspace_edit",
-  git_commit: "shell",
-  run_command: "shell",
-  fetch_url: "network",
-  search_web: "network",
-  create_artifact: "external_side_effect",
-};
-
-const RISK: ReadonlySet<string> = new Set(["read_only", "workspace_edit", "shell", "network", "external_side_effect"]);
-
-export function riskClass(toolName: string, evaluations: readonly Evaluation[] = []): RiskClass {
+/** The class an evaluation recorded (`details.criteria_set`), for judge cards. */
+export function criteriaOf(evaluations: readonly Evaluation[]): Risk {
   for (const e of evaluations) {
     const c = e.details?.criteria_set;
-    if (typeof c === "string" && RISK.has(c)) return c as RiskClass;
+    if (typeof c === "string" && c) return c;
   }
-  if (TOOL_RISK[toolName]) return TOOL_RISK[toolName];
-  // The subagent drivers (start_explorer, explorer_ask, stop_explorer) are read-only.
-  if (/^(start|stop)_\w+$|^(explorer|reviewer)_\w+$/.test(toolName)) return "read_only";
-  return "external_side_effect";
+  return null;
 }
 
-/** Whether "Always approve" is offered. The agent honors `remember` for file edits only. */
-export function canAlwaysApprove(risk: RiskClass): boolean {
-  return risk === "workspace_edit";
+/** The live button's label. The agent honors `remember` for the classes config allows. */
+export function alwaysApproveLabel(risk: Risk): string {
+  return risk === "workspace_edit" || risk === null ? ALWAYS_APPROVE_LABEL : `Always approve ${riskNoun(risk, "")}`;
 }
 
 export const ALWAYS_APPROVE_LABEL = "Always approve file edits";
 export const ALWAYS_APPROVE_WHY = "Always approve lasts for this session and covers file edits only. You can undo it from the posture menu.";
 
-/** Why "Always approve" is greyed out for this class. */
-export function alwaysApproveReason(risk: RiskClass): string {
+/** Plural noun for a class: "file edits", "shell commands", "commits" (git_commit). */
+export function riskNoun(risk: Risk, toolName: string): string {
+  if (toolName === "git_commit") return "commits";
   switch (risk) {
+    case "shell":
+      return "shell commands";
+    case "network":
+      return "network calls";
     case "workspace_edit":
-      return "";
+      return "file edits";
+    case "read_only":
+      return "reads";
+    case "external_side_effect":
+      return "actions outside the workspace";
+    default:
+      return "these calls";
+  }
+}
+
+/** Why "Always approve" is greyed out for this class. */
+export function alwaysApproveReason(risk: Risk): string {
+  switch (risk) {
     case "shell":
       return "Commits and shell commands need a yes each time";
     case "network":
       return "Network calls need a yes each time";
     case "read_only":
       return "Always approve covers file edits only";
-    default:
+    case "external_side_effect":
       return "Calls that act outside the workspace need a yes each time";
+    case null:
+      return "Always approve covers file edits only";
+    default:
+      return `${riskNoun(risk, "")[0]!.toUpperCase()}${riskNoun(risk, "").slice(1)} need a yes each time`;
   }
 }
 
 export type BadgeKind = "edit" | "shell" | "git" | "net" | "read" | "agent" | "art";
 
-export function toolBadge(toolName: string, risk: RiskClass): { kind: BadgeKind; text: string } {
+export function toolBadge(toolName: string, risk: Risk): { kind: BadgeKind; text: string } {
   if (toolName === "git_commit" || toolName.startsWith("git_")) return { kind: risk === "read_only" ? "read" : "git", text: "Git" };
   if (toolName === "run_command") return { kind: "shell", text: "Shell" };
   if (risk === "workspace_edit") return { kind: "edit", text: "Edit" };

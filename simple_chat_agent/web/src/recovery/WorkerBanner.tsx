@@ -42,7 +42,7 @@ export function WorkerBanner({ session, temporalUiTemplate }: WorkerBannerProps)
   const v = bannerView(session);
   const template = useTemporalUiTemplate(temporalUiTemplate, v.show);
   if (!v.show) return null;
-  const href = temporalUiUrl(template, v.workflowId);
+  const href = temporalUiUrl(template, v.workflowId, v.runId);
   return (
     <section className="rc-banner" role="status" aria-label="Worker isn't answering">
       <span className="ic" aria-hidden="true">
@@ -51,7 +51,7 @@ export function WorkerBanner({ session, temporalUiTemplate }: WorkerBannerProps)
       <span className="t">Worker isn't answering</span>
       {href ? (
         <a href={href} target="_blank" rel="noopener noreferrer">
-          Open the pending Activity in Temporal UI ↗
+          {v.runId ? "Open the pending Activity in Temporal UI ↗" : "Open the Workflow in Temporal UI ↗"}
         </a>
       ) : (
         <span />

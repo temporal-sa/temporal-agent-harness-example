@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import type { Recovery, ToolPart } from "../session";
-import { exitBadge, parseCommandOutput, ProgressLog, reattachFor, runLines, SANDBOX_DOWN } from "./terminal";
+import type { Recovery, ToolPart, ToolProgressChunk } from "../session";
+import { exitBadge, liveRows, parseCommandOutput, reattachFor, RunClock, runLines, SANDBOX_DOWN, sandboxDown } from "./terminal";
+
+const out = (text: string, stream: ToolProgressChunk["stream"] = null): ToolProgressChunk => ({ text, stream, at: null });
 
 // CommandResult.model_text, as the harness hands it to the model and the stream.
 const FAILING = [
@@ -56,7 +58,7 @@ describe("command output", () => {
   });
 
   it("colours stderr lines and marks the passing summary", () => {
-    const ctx = { live: "", workerAnswering: true, pausedAt: null, sandboxDown: false, reattach: null };
+    const ctx = { live: [], workerAnswering: true, pausedAt: null, sandbox: null, reattach: null };
     const failing = runLines(part("done", FAILING), ctx);
     expect(failing.find((l) => l.text.startsWith("E   RefundError"))!.kind).toBe("err");
     const passing = runLines(part("done", PASSING), ctx);
@@ -68,32 +70,51 @@ describe("live stream markers", () => {
   const recovery = { kind: "command_reattached", toolName: "workspace.run_command", agentId: "a", turnNumber: 2, retracted: false, resumedOn: "worker-b" } as Recovery;
 
   it("marks where the stream paused while no worker answers", () => {
-    const lines = runLines(part("running"), { live: "tests/test_money.py ....\n", workerAnswering: false, pausedAt: "14:02:11", sandboxDown: false, reattach: null });
+    const lines = runLines(part("running"), { live: [out("tests/test_money.py ....\n")], workerAnswering: false, pausedAt: "14:02:11", sandbox: null, reattach: null });
     expect(lines.at(-1)).toEqual({ kind: "pause", text: "── stream paused at 14:02:11 · waiting for a worker ──" });
   });
 
   it("names the worker that reattached when telemetry says so", () => {
-    const live = "batch 6\n\n[worker restarted; reattaching to the command (attempt 2)]\nbatch 7\n";
-    const lines = runLines(part("running"), { live, workerAnswering: true, pausedAt: null, sandboxDown: false, reattach: reattachFor({ agentId: "a", turnNumber: 2 }, [recovery]) });
+    const live = [out("batch 6\n\n[worker restarted; reattaching"), out(" to the command (attempt 2)]\nbatch 7\n")];
+    const lines = runLines(part("running"), { live, workerAnswering: true, pausedAt: null, sandbox: null, reattach: reattachFor({ agentId: "a", turnNumber: 2 }, [recovery]) });
     expect(lines.map((l) => l.text)).toEqual(["$ pytest -q", "batch 6", "", "── reattached on worker-b · same run, not restarted ──", "batch 7"]);
     expect(reattachFor({ agentId: "a", turnNumber: 3 }, [recovery])).toBeNull();
   });
 
-  it("says the sandbox isn't answering", () => {
-    const lines = runLines(part("running"), { live: "", workerAnswering: true, pausedAt: null, sandboxDown: true, reattach: null });
-    expect(lines.at(-1)!.text).toBe(SANDBOX_DOWN);
+  it("says the sandbox isn't answering, with the attempt and the next try", () => {
+    const lines = runLines(part("running"), { live: [], workerAnswering: true, pausedAt: null, sandbox: { attempt: 2, nextRetryAt: 6_000 }, now: 1_000, reattach: null });
+    expect(lines.slice(-2)).toEqual([
+      { kind: "pause", text: SANDBOX_DOWN },
+      { kind: "muted", text: "attempt 2 · next try in 5s" },
+    ]);
     expect(SANDBOX_DOWN).toBe("The sandbox isn't answering. Temporal will retry the command.");
   });
 
-  it("accumulates progress chunks once each", () => {
-    const log = new ProgressLog();
-    log.observe("t", "a", "running");
-    log.observe("t", "a", "running"); // a re-render with the same chunk
-    log.observe("t", "b", "running");
-    expect(log.text("t")).toBe("ab");
-    expect(log.startedAt("t")).toBeNull(); // first seen already running: elapsed unknown
-    log.observe("u", null, "approved", 100);
-    log.observe("u", null, "running", 250);
-    expect(log.startedAt("u")).toBe(250);
+  it("reads sandbox health from the facade and scopes it to the named run", () => {
+    expect(sandboxDown({ answering: true, toolId: null }, "r1")).toBe(false);
+    expect(sandboxDown({ answering: false, toolId: null }, "r1")).toBe(true);
+    expect(sandboxDown({ answering: false, toolId: "r1" }, "r1")).toBe(true);
+    expect(sandboxDown({ answering: false, toolId: "r2" }, "r1")).toBe(false);
+  });
+
+  it("colours live stderr from the facade's stream tags, across chunk boundaries", () => {
+    const rows = liveRows([out("collected 27 items\nwarn", "stdout"), out("ing: deprecated\n", "stderr"), out("ok\n", null)]);
+    expect(rows).toEqual([
+      { text: "collected 27 items", stderr: false },
+      { text: "warning: deprecated", stderr: true },
+      { text: "ok", stderr: false },
+    ]);
+    const lines = runLines(part("running"), { live: [out("boom\n", "stderr")], workerAnswering: true, pausedAt: null, sandbox: null, reattach: null });
+    expect(lines[1]).toEqual({ kind: "err", text: "boom" });
+  });
+
+  it("times a run only when it was seen starting", () => {
+    const clock = new RunClock();
+    clock.observe("t", "running");
+    clock.observe("t", "running");
+    expect(clock.startedAt("t")).toBeNull(); // first seen already running: elapsed unknown
+    clock.observe("u", "approved", 100);
+    clock.observe("u", "running", 250);
+    expect(clock.startedAt("u")).toBe(250);
   });
 });

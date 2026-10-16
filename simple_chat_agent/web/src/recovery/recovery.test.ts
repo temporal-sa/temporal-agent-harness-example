@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { Recovery, SendRecord, TurnRecovery } from "../session";
 import { CHECKING, COMPARISON, dividerView } from "./divider";
+import { temporalUiUrl } from "./banner";
 import { hms } from "./format";
 import { trailSteps } from "./sendTrail";
 
@@ -116,5 +117,17 @@ describe("send-state trail", () => {
 
   it("ends a decline at Accepted", () => {
     expect(trailSteps(record("accepted", { kind: "approval", approved: false })).map((s) => s.label)).toEqual(["Sending", "In Temporal", "Accepted"]);
+  });
+});
+
+describe("Temporal UI link", () => {
+  const T = "https://ui.example/namespaces/demo/workflows/{workflow_id}";
+  it("opens the run's pending Activities when the facade knows the run id", () => {
+    expect(temporalUiUrl(T, "coding-agent/s 1", "abc")).toBe("https://ui.example/namespaces/demo/workflows/coding-agent%2Fs%201/abc/pending-activities");
+    expect(temporalUiUrl(`${T}?x=1`, "w", "r")).toBe("https://ui.example/namespaces/demo/workflows/w/r/pending-activities?x=1");
+  });
+  it("falls back to the Workflow page without a run id, and to nothing without a template", () => {
+    expect(temporalUiUrl(T, "w", null)).toBe("https://ui.example/namespaces/demo/workflows/w");
+    expect(temporalUiUrl(null, "w", "r")).toBeNull();
   });
 });

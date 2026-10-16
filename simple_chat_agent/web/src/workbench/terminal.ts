@@ -1,8 +1,8 @@
 // The Terminal tab's model: every run_command call as a run with its output, an exit badge,
 // and the markers for a paused stream, a reattached run and a sandbox that isn't answering.
-// Pure, apart from ProgressLog, which remembers live output between renders.
+// Pure, apart from RunClock, which remembers when this browser saw each run start.
 
-import type { Recovery, ToolPart, WorkerHealth } from "../session";
+import type { Recovery, SandboxHealth, ToolPart, ToolProgressChunk } from "../session";
 import { strArg, type LocatedTool } from "./tree";
 
 export const COMMAND_TOOLS: ReadonlySet<string> = new Set(["run_command", "workspace.run_command"]);
@@ -145,34 +145,25 @@ export function exitBadge(
   }
 }
 
-// -- live output ----------------------------------------------------------------------------
+// -- run clock ------------------------------------------------------------------------------
 
 /**
- * Live run_command output. The harness keeps only a tool's latest progress chunk, so this
- * appends each new chunk it sees. Idempotent per chunk (a re-render with the same chunk adds
- * nothing), so React's double render in development is safe. Chunks that arrive in one stream
- * flush can still be missed; the final output replaces the live text when the run ends.
+ * When this browser first saw each run, and when it saw it start running. Live output comes
+ * from the facade (`toolProgressChunks`); this only times runs. Idempotent per observation, so
+ * React's double render in development is safe.
  */
-export class ProgressLog {
-  #runs = new Map<string, { last: string; text: string; firstSeen: number; sawBeforeStart: boolean; startedAt: number | null }>();
+export class RunClock {
+  #runs = new Map<string, { firstSeen: number; sawBeforeStart: boolean; startedAt: number | null }>();
 
-  observe(toolId: string, progress: string | null, state?: ToolPart["state"], now: number = Date.now()): void {
-    let r = this.#runs.get(toolId);
+  observe(toolId: string, state?: ToolPart["state"], now: number = Date.now()): void {
     const before = state === "requested" || state === "awaiting_approval" || state === "evaluating" || state === "approved";
+    let r = this.#runs.get(toolId);
     if (!r) {
-      r = { last: "", text: "", firstSeen: now, sawBeforeStart: before, startedAt: null };
+      r = { firstSeen: now, sawBeforeStart: before, startedAt: null };
       this.#runs.set(toolId, r);
     }
     if (before) r.sawBeforeStart = true;
     if (state === "running" && r.startedAt === null && r.sawBeforeStart) r.startedAt = now;
-    if (progress && progress !== r.last) {
-      r.text += progress;
-      r.last = progress;
-    }
-  }
-
-  text(toolId: string): string {
-    return this.#runs.get(toolId)?.text ?? "";
   }
 
   firstSeen(toolId: string): number | null {
@@ -234,11 +225,14 @@ function textLines(text: string, kind: "out" | "err", passedLine: boolean): Term
 }
 
 export interface RunLineContext {
-  live: string;
+  /** The run's live output chunks (`session.toolProgressChunks[toolId]`). */
+  live: readonly ToolProgressChunk[];
   workerAnswering: boolean;
   /** HH:MM:SS the worker stopped answering. */
   pausedAt: string | null;
-  sandboxDown: boolean;
+  /** The sandbox isn't answering for this run: the attempt and next try, for the detail line. */
+  sandbox: Pick<SandboxHealth, "attempt" | "nextRetryAt"> | null;
+  now?: number;
   /** Telemetry's reattach for this run (resumed_on names the new worker). */
   reattach: Recovery | null;
 }
@@ -260,33 +254,68 @@ export function runLines(part: Pick<ToolPart, "state" | "output" | "input">, ctx
     }
     return lines;
   }
-  // Live: the progress stream doesn't say which stream a chunk came from, so it is all stdout.
-  const rows = ctx.live.replace(/\r\n/g, "\n").split("\n");
-  if (rows[rows.length - 1] === "") rows.pop();
+  // Live: each line takes its stream from the chunks it came from (stderr wins). Chunks the
+  // backend hasn't tagged yet (stream null) read as stdout.
   let sawReattach = false;
-  for (const row of rows) {
-    if (REATTACH_NOTE.test(row.trim())) {
+  for (const row of liveRows(ctx.live)) {
+    const text = row.text;
+    if (REATTACH_NOTE.test(text.trim())) {
       sawReattach = true;
       lines.push({ kind: "reattach", text: reattachLine(ctx.reattach?.resumedOn ?? null) });
-    } else if (row === "" && lines[lines.length - 1]?.kind === "reattach") {
+    } else if (text === "" && lines[lines.length - 1]?.kind === "reattach") {
       continue;
-    } else if (MUTED_NOTE.test(row)) {
-      lines.push({ kind: "muted", text: row });
+    } else if (MUTED_NOTE.test(text)) {
+      lines.push({ kind: "muted", text });
     } else {
-      lines.push({ kind: "out", text: row });
+      lines.push({ kind: row.stderr ? "err" : "out", text });
     }
   }
   if (!sawReattach && ctx.reattach && running) lines.push({ kind: "reattach", text: reattachLine(ctx.reattach.resumedOn) });
   if (running && !ctx.workerAnswering) lines.push({ kind: "pause", text: pauseLine(ctx.pausedAt) });
-  if (running && ctx.sandboxDown) lines.push({ kind: "pause", text: SANDBOX_DOWN });
+  if (running && ctx.sandbox) {
+    lines.push({ kind: "pause", text: SANDBOX_DOWN });
+    const detail = sandboxDetail(ctx.sandbox, ctx.now ?? Date.now());
+    if (detail) lines.push({ kind: "muted", text: detail });
+  }
   if (part.state === "failed") lines.push({ kind: "muted", text: "The command didn't finish." });
   return lines;
 }
 
-/**
- * The sandbox (workspace executor) isn't answering. The facade has no field for this yet; the
- * bridge's worker reason names the retrying activity's failure type when it reports one.
- */
-export function sandboxDown(worker: Pick<WorkerHealth, "reason">): boolean {
-  return !!worker.reason && /ExecutorUnavailable|sandbox isn't answering/i.test(worker.reason);
+/** Split live chunks into lines; a line is stderr if any part of it came from stderr. */
+export function liveRows(chunks: readonly ToolProgressChunk[]): { text: string; stderr: boolean }[] {
+  const rows: { text: string; stderr: boolean }[] = [];
+  let cur = { text: "", stderr: false };
+  let open = false;
+  for (const c of chunks) {
+    const parts = c.text.replace(/\r\n/g, "\n").split("\n");
+    parts.forEach((part, i) => {
+      if (i > 0) {
+        rows.push(cur);
+        cur = { text: "", stderr: false };
+      }
+      cur.text += part;
+      if (part && c.stream === "stderr") cur.stderr = true;
+      open = true;
+    });
+  }
+  if (open && cur.text !== "") rows.push(cur);
+  return rows;
+}
+
+/** The sandbox (workspace executor) isn't answering for this run (`session.sandbox`). When the
+ *  notice names a tool id, only that run shows it. */
+export function sandboxDown(sandbox: Pick<SandboxHealth, "answering" | "toolId">, toolId?: string): boolean {
+  if (sandbox.answering) return false;
+  return !sandbox.toolId || toolId === undefined || sandbox.toolId === toolId;
+}
+
+/** "attempt 2 · next try in 5s". */
+export function sandboxDetail(s: Pick<SandboxHealth, "attempt" | "nextRetryAt">, now: number): string | null {
+  const parts: string[] = [];
+  if (s.attempt !== null) parts.push(`attempt ${s.attempt}`);
+  if (s.nextRetryAt !== null) {
+    const secs = Math.ceil((s.nextRetryAt - now) / 1000);
+    parts.push(secs > 0 ? `next try in ${secs}s` : "trying again now");
+  }
+  return parts.length ? parts.join(" · ") : null;
 }

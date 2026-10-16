@@ -15,7 +15,10 @@ function tool(toolId: string, toolName: string, input: Record<string, unknown>, 
 function session(parts: ToolPart[], over: Partial<CodingSession> = {}): CodingSession {
   const msg = { id: "m1", handler: "chat", input: { text: "fix it" }, output: null, status: "running", disposition: null, turnNumber: 1, parts, error: null, acceptedAt: 1, startedAt: 1, endedAt: null } as unknown as Message;
   const root = { agentId: "root", parentId: null, agentKey: null, workflowId: null, lifecycle: "running", unavailable: null, agentStatus: "busy", messages: [msg], states: {} } as unknown as AgentNode;
-  const pending: PendingApproval[] = parts.filter((p) => p.state === "awaiting_approval").map((part) => ({ agentId: "root", messageId: "m1", part }));
+  const risk: Record<string, string> = { edit_file: "workspace_edit", run_command: "shell", git_commit: "shell" };
+  const pending: PendingApproval[] = parts
+    .filter((p) => p.state === "awaiting_approval")
+    .map((part) => ({ agentId: "root", messageId: "m1", part, riskClass: risk[part.toolName] ?? null, rememberAllowed: risk[part.toolName] === "workspace_edit" }));
   return {
     sessionId: "s1",
     rootAgentId: "root",
@@ -29,6 +32,12 @@ function session(parts: ToolPart[], over: Partial<CodingSession> = {}): CodingSe
     pendingApprovals: pending,
     sends: [],
     sendFor: () => undefined,
+    toolProgress: {},
+    toolProgressChunks: {},
+    sandbox: { answering: true, attempt: null, nextRetryAt: null, reason: null, toolId: null },
+    runIds: {},
+    runId: null,
+    runIdFor: () => null,
     plan: { goal: "", items: [{ text: "Reproduce the failing test", status: "done" }, { text: "Fix it", status: "in_progress" }] },
     changes: { files: [{ path: "refund_service/refunds.py", status: "modified", added: 1, removed: 1, tool_id: "e0" }], commits: [] },
     workspace: { last_command: "pytest -q", last_exit_code: 1, commands_run: 1 },
@@ -134,7 +143,13 @@ describe("Workbench and recovery", () => {
     expect(html).toContain("Saved in Temporal:");
     expect(html).toContain("the test run&#x27;s output so far");
     expect(html).toContain("for another worker to pick up the test run");
+    // No run id yet: the Workflow's page, and the link says so.
     expect(html).toContain('href="http://ui/namespaces/default/workflows/s1"');
+    expect(html).toContain("Open the Workflow in Temporal UI");
+    const withRun = { ...down, runIdFor: (w: string) => (w === "s1" ? "run-9" : null) } as CodingSession;
+    const deep = renderToStaticMarkup(<WorkerBanner session={withRun} temporalUiTemplate="http://ui/namespaces/default/workflows/{workflow_id}" />);
+    expect(deep).toContain('href="http://ui/namespaces/default/workflows/s1/run-9/pending-activities"');
+    expect(deep).toContain("Open the pending Activity in Temporal UI");
   });
 
   it("renders the divider", () => {

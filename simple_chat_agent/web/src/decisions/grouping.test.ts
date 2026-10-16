@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { PendingApproval, SendRecord, ToolPart } from "../session";
-import { alwaysApproveReason, canAlwaysApprove } from "./describe";
+import { alwaysApproveReason } from "./describe";
 import {
   answersFrom,
   approveAllTargets,
@@ -17,7 +17,11 @@ import {
 } from "./grouping";
 import { groupTitle, stackHeading } from "./labels";
 
+// What the facade sets from config (tool_risk_classes, remember_allowed_classes).
+const CONFIG: Record<string, string> = { edit_file: "workspace_edit", write_file: "workspace_edit", run_command: "shell", git_commit: "shell" };
+
 function pending(toolId: string, toolName: string, input: Record<string, unknown>, agentId = "root"): PendingApproval {
+  const riskClass = CONFIG[toolName] ?? "external_side_effect";
   const part: ToolPart = {
     type: "tool",
     toolId,
@@ -31,7 +35,7 @@ function pending(toolId: string, toolName: string, input: Record<string, unknown
     evaluations: [],
     callback: null,
   };
-  return { agentId, messageId: "m1", part };
+  return { agentId, messageId: "m1", part, riskClass, rememberAllowed: riskClass === "workspace_edit" };
 }
 
 const edit = (id: string, path: string) => itemOf(pending(id, "edit_file", { path, old_string: "a", new_string: "b" }));
@@ -80,12 +84,21 @@ describe("grouping and folding", () => {
     ]);
   });
 
-  it("offers Always approve on file-edit groups only", () => {
+  it("offers Always approve where the facade allows it (file-edit groups only)", () => {
     const s = buildStack([edit("e1", "a.py"), pytest("c1"), itemOf(pending("g1", "git_commit", { message: "m" }))], new Map());
-    const live = s.groups.map((g) => canAlwaysApprove(g.risk));
+    const live = s.groups.map((g) => g.rememberAllowed);
     expect(live).toEqual([true, false, false]);
     expect(alwaysApproveReason(s.groups[1]!.risk)).toBe("Commits and shell commands need a yes each time");
     expect(alwaysApproveReason(s.groups[2]!.risk)).toBe("Commits and shell commands need a yes each time");
+  });
+});
+
+describe("risk class from the facade", () => {
+  it("doesn't offer Always approve while config hasn't loaded", () => {
+    const raw = pending("e1", "edit_file", { path: "a.py" });
+    const item = itemOf({ agentId: raw.agentId, messageId: raw.messageId, part: raw.part, riskClass: null });
+    expect(item).toMatchObject({ risk: null, rememberAllowed: false });
+    expect(buildStack([item], new Map()).groups[0]!.rememberAllowed).toBe(false);
   });
 });
 

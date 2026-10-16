@@ -14,7 +14,7 @@ import { DiffView } from "./DiffView";
 import {
   COMMAND_TOOLS,
   exitBadge,
-  ProgressLog,
+  RunClock,
   reattachFor,
   runLines,
   SANDBOX_DOWN,
@@ -287,13 +287,16 @@ function useNow(active: boolean): number {
 }
 
 function TerminalPanel({ session, runs, facts }: { session: CodingSession; runs: LocatedTool[]; facts: WorkspaceFacts }) {
-  const log = useRef(new ProgressLog()).current;
-  for (const r of runs) log.observe(r.part.toolId, r.part.progress, r.part.state);
+  const log = useRef(new RunClock()).current;
+  for (const r of runs) log.observe(r.part.toolId, r.part.state);
 
   const worker = session.telemetry.worker;
-  const down = sandboxDown(worker);
-  const anyRunning = runs.some((r) => r.part.state === "running" || r.part.state === "approved");
-  const now = useNow(anyRunning && worker.answering);
+  const sandbox = session.sandbox;
+  const isRunning = (r: LocatedTool) => r.part.state === "running" || r.part.state === "approved";
+  const anyRunning = runs.some(isRunning);
+  // The sandbox notice may name a tool that isn't a command (a file read): say it above.
+  const sandboxOnRun = runs.some((r) => isRunning(r) && sandboxDown(sandbox, r.part.toolId));
+  const now = useNow(anyRunning && (worker.answering || !sandbox.answering));
 
   if (runs.length === 0) {
     return (
@@ -310,17 +313,19 @@ function TerminalPanel({ session, runs, facts }: { session: CodingSession; runs:
 
   const view = (r: LocatedTool) => {
     const first = log.startedAt(r.part.toolId);
-    const running = r.part.state === "running" || r.part.state === "approved";
+    const running = isRunning(r);
+    const down = sandboxDown(sandbox, r.part.toolId);
     const badge = exitBadge(r.part, {
       workerAnswering: worker.answering,
       elapsedMs: running && first !== null ? now - first : null,
       sandboxDown: down,
     });
     const lines = runLines(r.part, {
-      live: log.text(r.part.toolId),
+      live: session.toolProgressChunks[r.part.toolId] ?? [],
       workerAnswering: worker.answering,
       pausedAt: hms(worker.since),
-      sandboxDown: down,
+      sandbox: down ? sandbox : null,
+      now,
       reattach: reattachFor(r, session.telemetry.recoveries),
     });
     return { badge, lines, running };
@@ -329,9 +334,9 @@ function TerminalPanel({ session, runs, facts }: { session: CodingSession; runs:
   const now0 = view(latest);
   return (
     <>
-      {down && (
+      {!sandbox.answering && !sandboxOnRun && (
         <p className="wb-sandbox" role="status">
-          {SANDBOX_DOWN}
+          {SANDBOX_DOWN.replace("the command", "the call")}
         </p>
       )}
       <div className="wb-term-head">

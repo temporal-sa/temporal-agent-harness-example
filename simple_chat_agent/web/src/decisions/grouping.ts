@@ -10,7 +10,7 @@
 //   Approve all: you approve only what you saw.
 
 import type { PendingApproval, SendPhase, SendRecord } from "../session";
-import { canonical, riskClass, type RiskClass } from "./describe";
+import { canonical, type Risk } from "./describe";
 
 export interface ApprovalItem {
   toolId: string;
@@ -18,7 +18,9 @@ export interface ApprovalItem {
   input: Record<string, unknown>;
   agentId: string;
   messageId: string;
-  risk: RiskClass;
+  /** From the facade (config): the call's class, and whether "Always approve" applies. */
+  risk: Risk;
+  rememberAllowed: boolean;
 }
 
 export function itemOf(p: PendingApproval): ApprovalItem {
@@ -28,7 +30,8 @@ export function itemOf(p: PendingApproval): ApprovalItem {
     input: p.part.input,
     agentId: p.agentId,
     messageId: p.messageId,
-    risk: riskClass(p.part.toolName, p.part.evaluations),
+    risk: p.riskClass ?? null,
+    rememberAllowed: p.rememberAllowed === true,
   };
 }
 
@@ -68,7 +71,9 @@ export interface Fold {
 
 export interface Group {
   toolName: string;
-  risk: RiskClass;
+  risk: Risk;
+  /** Every call in the group allows "Always approve" (one tool, so one class). */
+  rememberAllowed: boolean;
   folds: Fold[];
   /** Tool ids still waiting, in arrival order. */
   waitingIds: string[];
@@ -96,7 +101,7 @@ export function buildStack(items: readonly ApprovalItem[], answers: ReadonlyMap<
   for (const item of items) {
     let g = groups.get(item.toolName);
     if (!g) {
-      g = { toolName: item.toolName, risk: item.risk, folds: [], waitingIds: [], total: 0 };
+      g = { toolName: item.toolName, risk: item.risk, rememberAllowed: item.rememberAllowed, folds: [], waitingIds: [], total: 0 };
       groups.set(item.toolName, g);
     }
     const key = foldKey(item);
@@ -108,6 +113,7 @@ export function buildStack(items: readonly ApprovalItem[], answers: ReadonlyMap<
     }
     f.items.push(item);
     g.total++;
+    g.rememberAllowed &&= item.rememberAllowed;
     if (!isAnswered(answers.get(item.toolId))) {
       f.waiting.push(item);
       g.waitingIds.push(item.toolId);
