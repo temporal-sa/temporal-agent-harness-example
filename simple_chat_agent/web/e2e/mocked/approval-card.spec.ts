@@ -5,9 +5,9 @@
 import type { Locator, Page } from "@playwright/test";
 
 import { expect, test } from "../support/fixtures";
-import { turn, xWorker } from "../support/frames";
+import { approvalRequested, approvalResolved, ev, openTurn, toolRequested, turn, xWorker } from "../support/frames";
 import { openScripted, sessionId } from "../support/open";
-import { DEMO_PROMPT, stacked, working } from "../support/scenarios";
+import { DEMO_PROMPT, PYTEST, stacked, working } from "../support/scenarios";
 
 const stackCard = (page: Page) => page.getByRole("region", { name: /tool calls? (is|are) waiting$|^All answered$/ });
 const approveAll = (page: Page) => stackCard(page).getByRole("button", { name: /^Approve all \d+$/ });
@@ -115,5 +115,76 @@ test.describe("at 320", () => {
     await expect(details).toHaveAttribute("aria-expanded", "false");
     await details.click();
     await expect(banner).toContainText("Waiting:");
+  });
+});
+
+// -- Auto mode: the judge's checking state ----------------------------------------------------
+
+test.describe("Auto mode: a call the judge is checking", () => {
+  test.use({ viewport: { width: 1366, height: 768 } });
+
+  const input = { command: PYTEST };
+  const started = (root: ReturnType<typeof turn>) => [
+    toolRequested(root, "tool-judged", "run_command", input),
+    approvalRequested(root, "tool-judged", "run_command", input),
+    ev(root, "auto_approval_evaluation_started", { tool_id: "tool-judged", tool_name: "run_command", evaluation_id: "eval-1", evaluator: "llm_judge" }),
+  ];
+  const ended = (root: ReturnType<typeof turn>, verdict: "approve" | "escalate") =>
+    ev(root, "auto_approval_evaluation_ended", {
+      tool_id: "tool-judged",
+      tool_name: "run_command",
+      evaluation_id: "eval-1",
+      evaluator: "llm_judge",
+      verdict,
+      reason: verdict === "approve" ? "judge llm: runs the project's tests" : "judge llm: unclear; escalated to a human.",
+      details: { confidence: verdict === "approve" ? 0.94 : 0.6, criteria_set: "shell" },
+    });
+
+  /** Records whether an approval card ever appeared, however briefly. */
+  async function watchForCard(page: Page) {
+    await page.evaluate(() => {
+      const w = window as unknown as { __cardSeen: boolean };
+      w.__cardSeen = !!document.querySelector("section.dc-card");
+      new MutationObserver(() => {
+        if (document.querySelector("section.dc-card")) w.__cardSeen = true;
+      }).observe(document.body, { childList: true, subtree: true });
+    });
+    return () => page.evaluate(() => (window as unknown as { __cardSeen: boolean }).__cardSeen);
+  }
+
+  test("started → approved: a quiet checking line, and the approval card never shows", async ({ page, mockApi }) => {
+    const api = await mockApi();
+    const id = sessionId("judge-approves");
+    const root = turn(1, "msg-1");
+    await openScripted(page, api, openTurn(root, DEMO_PROMPT), { session_id: id, posture: "auto" });
+    await expect(page.getByText(DEMO_PROMPT)).toBeVisible();
+    const cardSeen = await watchForCard(page);
+
+    await api.push(id, started(root));
+    await expect(page.getByText(`The judge is checking run_command ${PYTEST}…`)).toBeVisible();
+    await expect(page.getByText(/need approval|Needs approval/)).toHaveCount(0);
+
+    await api.push(id, [ended(root, "approve"), approvalResolved(root, "tool-judged", "run_command", true, false, "judge llm: runs the project's tests")]);
+    await expect(page.getByText(`The judge is checking run_command ${PYTEST}…`)).toHaveCount(0);
+    expect(await cardSeen(), "the approval card never appeared").toBe(false);
+  });
+
+  test("started → escalated: the call joins the approval card", async ({ page, mockApi }) => {
+    const api = await mockApi();
+    const id = sessionId("judge-escalates");
+    const root = turn(1, "msg-1");
+    await openScripted(page, api, openTurn(root, DEMO_PROMPT), { session_id: id, posture: "auto" });
+    await expect(page.getByText(DEMO_PROMPT)).toBeVisible();
+    const cardSeen = await watchForCard(page);
+
+    await api.push(id, started(root));
+    await expect(page.getByText(`The judge is checking run_command ${PYTEST}…`)).toBeVisible();
+    expect(await cardSeen(), "no card while the judge checks").toBe(false);
+
+    await api.push(id, [ended(root, "escalate")]);
+    const card = page.getByRole("region", { name: "Needs approval" });
+    await expect(card).toBeVisible();
+    await expect(card.getByRole("button", { name: "Approve", exact: true })).toBeVisible();
+    await expect(page.getByText(`The judge is checking run_command ${PYTEST}…`)).toHaveCount(0);
   });
 });

@@ -23,6 +23,19 @@ export interface ApprovalItem {
   rememberAllowed: boolean;
 }
 
+/**
+ * The Auto-mode judge is still deciding this call (the facade's `judging`: its latest evaluation
+ * is running). Such a call isn't waiting on a person yet, so it stays off the approval card (no
+ * count, no pink) until the judge escalates or fails; a judge approval settles it and it never
+ * reaches the card. Not the tool's raw state: the harness keeps a call `evaluating` even after
+ * an escalation. Postures without a judge never judge, so nothing changes there.
+ */
+export function isChecking(p: PendingApproval): boolean {
+  if (typeof p.judging === "boolean") return p.judging;
+  const latest = p.part.evaluations[p.part.evaluations.length - 1];
+  return latest?.status === "running";
+}
+
 export function itemOf(p: PendingApproval): ApprovalItem {
   return {
     toolId: p.part.toolId,

@@ -18,7 +18,7 @@ function session(parts: ToolPart[], over: Partial<CodingSession> = {}): CodingSe
   const risk: Record<string, string> = { edit_file: "workspace_edit", run_command: "shell", git_commit: "shell" };
   const pending: PendingApproval[] = parts
     .filter((p) => p.state === "awaiting_approval")
-    .map((part) => ({ agentId: "root", messageId: "m1", part, riskClass: risk[part.toolName] ?? null, rememberAllowed: risk[part.toolName] === "workspace_edit" }));
+    .map((part) => ({ agentId: "root", messageId: "m1", part, riskClass: risk[part.toolName] ?? null, rememberAllowed: risk[part.toolName] === "workspace_edit", judging: false, evaluation: null }));
   return {
     sessionId: "s1",
     rootAgentId: "root",

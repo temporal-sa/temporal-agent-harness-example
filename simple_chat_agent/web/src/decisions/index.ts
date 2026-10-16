@@ -3,7 +3,8 @@
 export { DecisionDock, ApprovalCard, PAUSED_LINE } from "./DecisionDock";
 export { JudgeCard, JudgeCards, type JudgeCardProps, type JudgeCardsProps } from "./JudgeCard";
 export { StopCards, latestStop } from "./StopCards";
+export { JudgeChecking, checkingLine } from "./JudgeChecking";
 export { judgeView, judgeViews, type JudgeView } from "./judge";
-export { buildStack, reconcile, answersFrom, type Stack, type Group, type Fold, type ApprovalItem } from "./grouping";
+export { buildStack, reconcile, answersFrom, isChecking, type Stack, type Group, type Fold, type ApprovalItem } from "./grouping";
 // Send-state chips live in recovery/; re-exported for convenience.
 export { SendStateTrail } from "../recovery/SendStateTrail";

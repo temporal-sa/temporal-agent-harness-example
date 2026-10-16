@@ -104,6 +104,23 @@
   padding: .5rem .7rem; resize: vertical; min-height: 2.6rem; border-radius: 0;
 }
 
+/* Calls the judge is still checking: quiet, no pink, above the approval card. */
+.dc-checking { list-style: none; margin: 0; padding: 0; display: grid; gap: .2rem; }
+.dc-checking .row {
+  display: flex; flex-wrap: wrap; gap: .3rem .6rem; align-items: center; padding: .3rem .6rem; font-size: .8rem;
+  color: var(--slate-300); border-left: 2px solid var(--slate-500);
+}
+.dc-checking .what { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dc-checking .badge { font-size: .75rem; }
+.dc-checking .yourself summary { cursor: pointer; font-family: var(--mono); font-size: .75rem; color: var(--indigo-200); }
+.dc-checking .yourself summary:focus-visible { outline: none; box-shadow: var(--focus); }
+.dc-checking .yourself[open] { flex-basis: 100%; }
+.dc-checking .yourself .acts { display: inline-flex; gap: .5rem; margin-top: .3rem; }
+.dc-checking .btn.small { font-size: .78rem; }
+@media (max-width: 600px) {
+  .dc-checking .yourself summary, .dc-checking .btn { min-height: 44px; display: inline-flex; align-items: center; }
+}
+
 /* Judge evaluation cards, inline in the transcript */
 .dc-judge {
   border: 1px solid var(--border); border-left: 2px solid var(--green); background: rgba(31, 241, 165, .04); padding: .55rem .8rem;

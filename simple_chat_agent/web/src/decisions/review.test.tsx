@@ -19,7 +19,7 @@ function tool(toolId: string, toolName: string, input: Record<string, unknown>):
 }
 
 function waiting(parts: ToolPart[], agentId = "root"): PendingApproval[] {
-  return parts.map((part) => ({ agentId, messageId: "m1", part, riskClass: RISK[part.toolName] ?? null, rememberAllowed: RISK[part.toolName] === "workspace_edit" }));
+  return parts.map((part) => ({ agentId, messageId: "m1", part, riskClass: RISK[part.toolName] ?? null, rememberAllowed: RISK[part.toolName] === "workspace_edit", judging: false, evaluation: null }));
 }
 
 function sent(toolId: string, approved = true): SendRecord {

@@ -29,6 +29,7 @@ import {
   EMPTY_CARD,
   groupTargets,
   isAnswered,
+  isChecking,
   itemOf,
   reconcile,
   type Answer,
@@ -38,12 +39,15 @@ import {
   type Group,
 } from "./grouping";
 import { answeredText, groupTitle, SAME, stackHeading } from "./labels";
+import { JudgeChecking } from "./JudgeChecking";
 import { StopCards } from "./StopCards";
 import "./decisions.css";
 
 export function DecisionDock({ session }: DecisionDockProps) {
   return (
     <div className="dc-dock">
+      {/* Above the card, so rows coming and going never move the card's buttons. */}
+      <JudgeChecking session={session} />
       <ApprovalCard session={session} />
       <StopCards session={session} />
     </div>
@@ -65,7 +69,8 @@ interface DeclineTarget {
 }
 
 export function ApprovalCard({ session }: { session: CodingSession }) {
-  const pending = useMemo(() => session.pendingApprovals.map(itemOf), [session.pendingApprovals]);
+  // Calls the judge is still checking aren't on the card (they show as quiet rows above it).
+  const pending = useMemo(() => session.pendingApprovals.filter((p) => !isChecking(p)).map(itemOf), [session.pendingApprovals]);
   const answers = useMemo(() => answersFrom(session.sends), [session.sends]);
   // Arrivals are held while the pointer or keyboard focus is in the card, so nothing moves
   // under either (owner decision B). "Show now" lets them join at once.
