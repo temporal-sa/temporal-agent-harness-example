@@ -12,7 +12,7 @@
 // root stream position by one and carries `event_offset = resume_offset - 1`; our x_* frames sit
 // at the position of the frame before them and carry no event_offset (agent_telemetry.py).
 //
-//   node e2e/support/mock-server.mjs   (E2E_MOCK_PORT, default 5179)
+//   node e2e/support/mock-server.mjs   (E2E_MOCK_PORT, default 5179; E2E_WEB_DIST, default web/dist)
 
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
@@ -20,7 +20,8 @@ import { extname, join, normalize, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const DIST = resolve(here, "../../dist");
+// E2E_WEB_DIST: serve another build (e.g. one made from a clean checkout).
+const DIST = resolve(process.env.E2E_WEB_DIST || resolve(here, "../../dist"));
 const PORT = Number(process.env.E2E_MOCK_PORT ?? 5179);
 
 const TYPES = {

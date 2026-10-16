@@ -16,7 +16,8 @@ import { defineConfig, devices } from "@playwright/test";
 const MOCK_PORT = Number(process.env.E2E_MOCK_PORT ?? 5179);
 const LIVE = process.env.E2E_LIVE === "1";
 // Build once before serving, unless told the dist is fresh.
-const build = process.env.E2E_SKIP_BUILD === "1" ? "" : "npm run build && ";
+// E2E_WEB_DIST points both projects at a build made elsewhere (and skips this one).
+const build = process.env.E2E_SKIP_BUILD === "1" || process.env.E2E_WEB_DIST ? "" : "npm run build && ";
 
 export default defineConfig({
   testDir: "e2e",
@@ -65,7 +66,7 @@ export default defineConfig({
     command: `${build}node e2e/support/mock-server.mjs`,
     url: `http://127.0.0.1:${MOCK_PORT}/__mock/health`,
     reuseExistingServer: !process.env.CI,
-    env: { E2E_MOCK_PORT: String(MOCK_PORT) },
+    env: { E2E_MOCK_PORT: String(MOCK_PORT), ...(process.env.E2E_WEB_DIST ? { E2E_WEB_DIST: process.env.E2E_WEB_DIST } : {}) },
     stdout: "ignore",
     stderr: "pipe",
     timeout: 120_000,

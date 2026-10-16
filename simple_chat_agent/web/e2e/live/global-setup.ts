@@ -14,7 +14,7 @@ export default async function globalSetup(): Promise<void> {
   ] as const) {
     if (!(await httpOk(url).catch(() => false))) throw new Error(`${what} isn't answering; start the local stack (make dev-stack)`);
   }
-  if (process.env.E2E_SKIP_BUILD !== "1") execSync("npm run build", { cwd: WEB, stdio: "ignore" });
+  if (process.env.E2E_SKIP_BUILD !== "1" && !process.env.E2E_WEB_DIST) execSync("npm run build", { cwd: WEB, stdio: "ignore" });
 
   const run = `${Date.now().toString(36)}${randomBytes(2).toString("hex")}`;
   const taskQueue = `e2e-${run}`;
@@ -25,7 +25,9 @@ export default async function globalSetup(): Promise<void> {
   let portB = await freePort();
   while (portB === portA) portB = await freePort();
 
-  const auth = (user: string) => ({ SIMPLE_CHAT_LOCAL_AUTH_USERNAME: user, SIMPLE_CHAT_LOCAL_AUTH_PASSWORD: password });
+  // E2E_WEB_DIST: have the APIs serve another build (the API's SIMPLE_CHAT_WEB_DIST).
+  const dist = process.env.E2E_WEB_DIST ? { SIMPLE_CHAT_WEB_DIST: process.env.E2E_WEB_DIST } : {};
+  const auth = (user: string) => ({ SIMPLE_CHAT_LOCAL_AUTH_USERNAME: user, SIMPLE_CHAT_LOCAL_AUTH_PASSWORD: password, ...dist });
   const apiA = make("api-a", "dev-api", { API_PORT: String(portA), TASK_QUEUE: taskQueue }, auth(userA));
   const apiB = make("api-b", "dev-api", { API_PORT: String(portB), TASK_QUEUE: taskQueue }, auth(userB));
   const baseA = `http://127.0.0.1:${portA}`;
