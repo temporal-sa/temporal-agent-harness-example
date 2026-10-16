@@ -101,6 +101,22 @@ class CodingSessions:
         self._state.settings.update({k: v[:2000] for k, v in item.items()})
         return self._state.settings
 
+    # Signal versions of the mutations: the API sends these (with signal-with-start), so a
+    # change lands in history even while no worker is running. The Updates stay for operators
+    # and tests that want the resulting list back.
+
+    @workflow.signal(name="register_session_signal")
+    async def register_session_signal(self, record: SessionRecord) -> None:
+        await self.register_session(record)
+
+    @workflow.signal(name="rename_session_signal")
+    async def rename_session_signal(self, request: RenameRequest) -> None:
+        await self.rename_session(request)
+
+    @workflow.signal(name="remove_session_signal")
+    async def remove_session_signal(self, session_id: str) -> None:
+        await self.remove_session(session_id)
+
     @workflow.update
     async def compact(self) -> None:
         """Operator action: start a fresh run carrying the same state."""

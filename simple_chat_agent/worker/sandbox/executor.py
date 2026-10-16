@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import codecs
 import errno
 import hashlib
 import hmac
@@ -80,6 +81,19 @@ class ExecuteRequest(BaseModel):
     )
     network: bool = True
     stdin: str | None = Field(default=None, max_length=MAX_STDIN_CHARS)
+
+
+MAX_LOG_RESPONSE_BYTES = 256 * 1024
+
+
+class ExecuteLogRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_id: str = Field(min_length=1, max_length=512)
+    execution_id: str = Field(min_length=1, max_length=200)
+    stream: Literal["stdout", "stderr", "both"] = "both"
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=MAX_LOG_RESPONSE_BYTES, ge=1, le=MAX_LOG_RESPONSE_BYTES)
 
 
 class ExecuteCancelRequest(BaseModel):
@@ -247,6 +261,9 @@ class _Job:
     cancel_requested: asyncio.Event = field(default_factory=asyncio.Event)
     wakeup: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Future[None] | None = None
+    # The running process's captures, for /execute/log while the job runs.
+    stdout_capture: "_CapturedOutput | None" = None
+    stderr_capture: "_CapturedOutput | None" = None
 
     def append(self, event: dict[str, Any]) -> None:
         seq = self.next_seq
@@ -1398,6 +1415,7 @@ async def _run_process(
     process: asyncio.subprocess.Process | None = None
     stdout = _CapturedOutput(MAX_CAPTURE_CHARS)
     stderr = _CapturedOutput(MAX_CAPTURE_CHARS)
+    job.stdout_capture, job.stderr_capture = stdout, stderr
     stream_budget = _StreamBudget(MAX_STREAM_CHARS)
     timed_out = False
     stop_type: str | None = None
@@ -1526,6 +1544,100 @@ def _stopped_payload(
     }
 
 
+@app.post("/execute/log")
+async def execute_log(
+    request: ExecuteLogRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Read a job's stored output by execution_id (PRD S7), paged.
+
+    Scoped to the workspace: state lives under the workspace's own key, and live jobs are
+    keyed by (workspace, execution_id), so an id from another workspace is a 404, the
+    same as an unknown or expired one.
+
+    - ``stream``: ``stdout`` and ``stderr`` are the captured streams, each up to
+      MAX_CAPTURE_CHARS. ``both`` is the two interleaved in arrival order when the replay
+      buffer still holds the whole run (``interleaved: true``); otherwise stdout followed
+      by stderr under a ``[stderr]`` header.
+    - ``offset``/``limit`` count characters. A response carries at most ``limit``
+      characters and at most 256 KB of UTF-8. ``next_offset`` is where to continue; it is
+      null once everything is read and the job has finished. While the job runs, read
+      again from ``next_offset`` to follow it.
+    """
+    _authorize(authorization)
+    if not _SAFE_EXECUTION_ID.fullmatch(request.execution_id):
+        raise HTTPException(status_code=422, detail="Invalid execution_id.")
+    workspace_key = _workspace_key(request.workspace_id)
+    job = _jobs.get((workspace_key, request.execution_id))
+    if job is not None and job.result is None:
+        stdout = job.stdout_capture.text if job.stdout_capture else ""
+        stderr = job.stderr_capture.text if job.stderr_capture else ""
+        truncated = bool(
+            (job.stdout_capture and job.stdout_capture.truncated)
+            or (job.stderr_capture and job.stderr_capture.truncated)
+        )
+        events = [event for _, event, _ in list(job.events)]
+        result: dict[str, Any] = {"exit_code": None}
+        finished = False
+    else:
+        state_path = _state_path(workspace_key, request.execution_id)
+        cached = _load_cached_result(state_path)
+        if cached is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "not_found",
+                    "message": "No output is retained for this execution in this workspace.",
+                },
+            )
+        result = cached
+        stdout = str(cached.get("stdout") or "")
+        stderr = str(cached.get("stderr") or "")
+        truncated = bool(cached.get("stdout_truncated") or cached.get("stderr_truncated"))
+        events = _load_cached_events(state_path)
+        finished = True
+
+    interleaved = False
+    if request.stream == "stdout":
+        text = stdout
+    elif request.stream == "stderr":
+        text = stderr
+    else:
+        complete = (
+            not truncated
+            and (not events or events[0].get("seq") == 0)
+            and not result.get("stream_truncated")
+        )
+        streamed = [e for e in events if e.get("kind") in ("stdout", "stderr")]
+        if complete and (streamed or not (stdout or stderr)):
+            text = "".join(str(e.get("payload", {}).get("text", "")) for e in streamed)
+            interleaved = True
+        else:
+            text = stdout + (f"\n[stderr]\n{stderr}" if stderr else "")
+
+    chunk = text[request.offset : request.offset + request.limit]
+    encoded = chunk.encode("utf-8", errors="replace")
+    if len(encoded) > MAX_LOG_RESPONSE_BYTES:
+        chunk = encoded[:MAX_LOG_RESPONSE_BYTES].decode("utf-8", errors="ignore")
+    end = min(request.offset, len(text)) + len(chunk)
+    more = end < len(text)
+    return {
+        "ok": True,
+        "execution_id": request.execution_id,
+        "stream": request.stream,
+        "offset": request.offset,
+        "text": chunk,
+        "total_chars": len(text),
+        "next_offset": end if (more or not finished) else None,
+        "finished": finished,
+        "exit_code": result.get("exit_code"),
+        "timed_out": bool(result.get("timed_out")),
+        "error_type": result.get("type"),
+        "truncated_at_capture": truncated,
+        "interleaved": interleaved,
+    }
+
+
 @app.post("/execute/cancel")
 async def execute_cancel(
     request: ExecuteCancelRequest,
@@ -1559,11 +1671,15 @@ async def _read_output(
 ) -> None:
     if reader is None:
         return
+    # Incremental: a multibyte character split across two reads must not become U+FFFD.
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     while True:
         chunk = await reader.read(READ_CHUNK_BYTES)
-        if not chunk:
+        text = decoder.decode(chunk, final=not chunk)
+        if not chunk and not text:
             return
-        text = chunk.decode("utf-8", errors="replace")
+        if not text:
+            continue
         capture.append(text)
         streamed = stream_budget.take(text)
         if streamed:
@@ -1581,6 +1697,8 @@ async def _read_output(
                     },
                 }
             )
+        if not chunk:
+            return
 
 
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:

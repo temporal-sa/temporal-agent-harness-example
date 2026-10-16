@@ -1,9 +1,15 @@
-"""P0 step 0.8: run the Node harness-client contract check against our agent API.
+"""P0 step 0.8 / P2 step 2.1a: run the Node harness-client contract check against our agent API.
 
-    .venv/bin/python tests/contract/run_contract.py
+    .venv/bin/python tests/contract/run_contract.py              # the real API app (default)
+    .venv/bin/python tests/contract/run_contract.py --app dev    # the P0 agent dev app
 
-Starts a dev worker and the agent dev app on a fresh task queue and Redis prefix, runs
+Starts a dev worker and the API on a fresh task queue and Redis prefix, runs
 ``node harness-client/contract.mjs <base>``, tears both down and exits with node's exit code.
+
+``--app real`` serves ``uvicorn simple_chat_agent.api.main:app`` with local auth (throwaway
+credentials and JWT secret, a scratch SQLite store) and the agent routes on the worker's task
+queue (``CODING_AGENT_TASK_QUEUE``); the node script logs in through the local login route
+and uses the session cookie. ``--app dev`` serves the dev app with its ``X-Test-User`` header.
 Needs the local Temporal dev server (TEMPORAL_TEST_ADDRESS, default 127.0.0.1:7244), Redis
 (SIMPLE_CHAT_REDIS_URL, default redis://127.0.0.1:6390/0), the sandbox executor and the keys in
 .env.local. Run ``npm ci`` in tests/contract/harness-client once first.
@@ -11,8 +17,11 @@ Needs the local Temporal dev server (TEMPORAL_TEST_ADDRESS, default 127.0.0.1:72
 
 from __future__ import annotations
 
+import argparse
 import os
+import secrets
 import socket
+import tempfile
 import subprocess
 import sys
 import threading
@@ -93,6 +102,9 @@ def stop(proc: subprocess.Popen[str] | None) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--app", choices=("real", "dev"), default="real")
+    args = parser.parse_args()
     if not (CLIENT_DIR / "node_modules" / "@temporalio" / "agent-harness-client").exists():
         print("run `npm ci` in tests/contract/harness-client first", file=sys.stderr)
         return 2
@@ -106,26 +118,49 @@ def main() -> int:
     port = free_port()
     python = sys.executable
 
+    # The node script gets no provider keys: it only talks HTTP to our API.
+    node_env = {k: v for k, v in os.environ.items() if not k.endswith("_API_KEY")}
+    scratch = tempfile.TemporaryDirectory(prefix="contract-")
+    if args.app == "real":
+        username, password = "contract", secrets.token_urlsafe(12)
+        # The API process holds no LLM keys (P2 decision 2); the worker gets them.
+        api_env = {k: v for k, v in env.items() if not k.endswith("_API_KEY")}
+        api_env.update(
+            SIMPLE_CHAT_AUTH_MODE="local",
+            SIMPLE_CHAT_LOCAL_AUTH_ENABLED="1",
+            SIMPLE_CHAT_LOCAL_AUTH_USERNAME=username,
+            SIMPLE_CHAT_LOCAL_AUTH_PASSWORD=password,
+            SIMPLE_CHAT_JWT_SECRET=secrets.token_urlsafe(32),
+            SIMPLE_CHAT_DB_PATH=os.path.join(scratch.name, "app.sqlite3"),
+            TEMPORAL_ADDRESS=env.get("TEMPORAL_TEST_ADDRESS", "127.0.0.1:7244"),
+            CODING_AGENT_TASK_QUEUE=task_queue,
+        )
+        api_cmd = [python, "-m", "uvicorn", "simple_chat_agent.api.main:app", "--host", "127.0.0.1",
+                   "--port", str(port), "--log-level", "warning"]
+        ready_path = "/api/auth/config"
+        node_env["CONTRACT_LOGIN"] = f"{username}:{password}"
+    else:
+        api_env = env
+        api_cmd = [python, "-m", "simple_chat_agent.api.agent_dev_app", "--port", str(port), "--task-queue", task_queue]
+        ready_path = "/api/agent/status/none"
+        node_env.pop("CONTRACT_LOGIN", None)
+
     worker = api = None
     try:
         worker = subprocess.Popen(
             [python, "-m", "simple_chat_agent.agent.dev_worker", "--task-queue", task_queue],
             cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=sys.stderr, text=True,
         )
-        api = subprocess.Popen(
-            [python, "-m", "simple_chat_agent.api.agent_dev_app", "--port", str(port), "--task-queue", task_queue],
-            cwd=ROOT, env=env, stdout=sys.stderr, stderr=sys.stderr, text=True,
-        )
+        api = subprocess.Popen(api_cmd, cwd=ROOT, env=api_env, stdout=sys.stderr, stderr=sys.stderr, text=True)
         wait_for_line(worker, "worker ready", READY_TIMEOUT)
         base = f"http://127.0.0.1:{port}"
-        wait_for_http(api, f"{base}/api/agent/status/none", READY_TIMEOUT)
-        print(f"[contract] worker and API ready (task queue {task_queue}, port {port})", file=sys.stderr)
-        # The node script gets no provider keys: it only talks HTTP to our API.
-        node_env = {k: v for k, v in os.environ.items() if not k.endswith("_API_KEY")}
+        wait_for_http(api, f"{base}{ready_path}", READY_TIMEOUT)
+        print(f"[contract] worker and {args.app} API ready (task queue {task_queue}, port {port})", file=sys.stderr)
         return subprocess.run(["node", "contract.mjs", base], cwd=CLIENT_DIR, env=node_env).returncode
     finally:
         stop(api)
         stop(worker)
+        scratch.cleanup()
 
 
 if __name__ == "__main__":

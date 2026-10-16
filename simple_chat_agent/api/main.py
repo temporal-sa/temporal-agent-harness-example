@@ -29,6 +29,7 @@ from agent_harness.providers.claude import (
     MIN_THINKING_BUDGET_TOKENS,
 )
 from simple_chat_agent import TASK_QUEUE
+from simple_chat_agent.api.agent_routes import AgentApi
 from simple_chat_agent.api.anthropic_models import (
     EFFORT_ORDER,
     default_effort,
@@ -127,6 +128,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await stream_broker.close()
+        await _agent_api.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -571,6 +573,12 @@ app.include_router(
         )
     )
 )
+
+# The coding agent's routes (P2): the harness client's HTTP contract plus sessions, config,
+# uploads and tool output, behind the same catalog / local auth as everything else.
+_agent_api = AgentApi(current_user=lambda request: _current_user(request))
+app.state.agent_api = _agent_api
+app.include_router(_agent_api.router(app_store=_store), prefix="/api/agent")
 
 
 def main() -> None:

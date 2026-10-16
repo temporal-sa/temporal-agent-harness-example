@@ -1,16 +1,20 @@
-// P0 step 0.8: the official @temporalio/agent-harness-client (0.1.0, unpatched) against our
-// agent API routes (simple_chat_agent/api/agent_routes.py).
+// P0 step 0.8 / P2 step 2.1a: the official @temporalio/agent-harness-client (0.1.0,
+// unpatched) against our agent API routes (simple_chat_agent/api/agent_routes.py).
 //
-//     node contract.mjs http://127.0.0.1:<port>
+//     node contract.mjs http://127.0.0.1:<port>                  # dev app (X-Test-User)
+//     CONTRACT_LOGIN=user:password node contract.mjs <base>      # real app, local login
 //
-// Creates a session with a raw fetch (our create body is ours, not the harness's), then drives
-// it entirely through the client: AgentSessionCore + HttpTransport + PlainSessionState.
-// Prints a JSON summary; exits 0 on success, 1 on failure.
+// Creates and lists the session through HttpTransport itself (startSession / listSessions,
+// the harness CreateSessionRequest shape), then drives it entirely through the client:
+// AgentSessionCore + HttpTransport + PlainSessionState. Prints a JSON summary; exits 0 on
+// success, 1 on failure.
 
 import {
   AgentSessionCore,
+  HttpError,
   HttpTransport,
   PlainSessionState,
+  startSession,
   waitingCalls
 } from "@temporalio/agent-harness-client";
 
@@ -19,7 +23,9 @@ if (!base) {
   console.error("usage: node contract.mjs http://127.0.0.1:<port>");
   process.exit(2);
 }
-const USER = { "X-Test-User": "alice" };
+const LOGIN = process.env.CONTRACT_LOGIN ?? "";
+// Set in main(): the dev app's test header, or the real app's session cookie.
+let USER = { "X-Test-User": "alice" };
 const TIMEOUT_MS = Number(process.env.CONTRACT_TIMEOUT_MS ?? 240_000);
 
 const summary = { ok: false, checks: {}, session_id: null };
@@ -55,19 +61,67 @@ function waitFor(state, predicate, what, timeoutMs = TIMEOUT_MS) {
 const toolParts = (state) =>
   state.messages.flatMap((m) => m.parts.filter((p) => p.type === "tool"));
 
-async function main() {
-  // 1. Create the session (raw fetch: our POST /sessions body is app-specific).
-  const created = await fetch(`${base}/api/agent/sessions`, {
+async function login() {
+  const [username, ...rest] = LOGIN.split(":");
+  const response = await fetch(`${base}/api/auth/local/login`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...USER },
-    body: JSON.stringify({ model: { provider: "anthropic", model: "claude-haiku-5-5", effort: "low" } })
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password: rest.join(":") })
   });
-  if (!created.ok) throw new Error(`create session: ${created.status} ${await created.text()}`);
-  const { session_id: sessionId } = await created.json();
+  if (!response.ok) throw new Error(`local login: ${response.status} ${await response.text()}`);
+  const cookie = (response.headers.getSetCookie?.() ?? [response.headers.get("set-cookie") ?? ""])
+    .map((c) => c.split(";")[0])
+    .filter(Boolean)
+    .join("; ");
+  if (!cookie) throw new Error("local login set no cookie");
+  return { Cookie: cookie };
+}
+
+async function expectHttpError(what, promise, status, code) {
+  try {
+    await promise;
+    check(what, false, "no error");
+  } catch (error) {
+    const ok = error instanceof HttpError && error.status === status && error.code === code;
+    check(what, ok, ok ? undefined : `${error.status} ${error.code} ${error.message}`);
+  }
+}
+
+async function main() {
+  summary.mode = LOGIN ? "real-app-local-login" : "dev-app";
+  if (LOGIN) USER = await login();
+
+  // 1. Create and list the session through HttpTransport (the harness CreateSessionRequest).
+  const transport = new HttpTransport({ baseUrl: `${base}/api/agent/`, headers: USER });
+  const created = await startSession(transport, { workflowType: "CodingAgent" }, {
+    data: { model: { provider: "anthropic", model: "claude-haiku-5-5", effort: "low" }, title: "contract" }
+  });
+  const sessionId = created.workflow_id;
   summary.session_id = sessionId;
+  check(
+    "create_summary_shape",
+    typeof sessionId === "string" &&
+      created.agent_workflow_type === "CodingAgent" &&
+      typeof created.created_at === "number" &&
+      created.label === "contract" &&
+      created.closed === false,
+    JSON.stringify(created)
+  );
+  const listed = await transport.listSessions();
+  check("list_has_session", listed.some((s) => s.workflow_id === sessionId && s.label === "contract"), listed.length);
+
+  // Harness error bodies reach the client as HttpError codes.
+  const anonymous = new HttpTransport({ baseUrl: `${base}/api/agent/` });
+  await expectHttpError("unauthenticated_401", anonymous.listSessions(), 401, "unauthorized");
+  await expectHttpError("unknown_session_404", transport.agentStatus("coding-agent-0000000000000000"), 404, "not_found");
+  await expectHttpError(
+    "unknown_agent_422",
+    transport.createSession({ agent_workflow_type: "NoSuchAgent" }),
+    422,
+    "unknown_agent"
+  );
 
   // 2. The client's session over our routes.
-  const transport = new HttpTransport({ baseUrl: `${base}/api/agent/`, headers: USER });
   const state = new PlainSessionState();
   let lastConnection = null;
   state.subscribe(() => {

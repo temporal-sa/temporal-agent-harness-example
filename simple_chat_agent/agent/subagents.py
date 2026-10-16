@@ -21,7 +21,15 @@ with workflow.unsafe.imports_passed_through():
     from temporal_agent_harness.harness.agent_workflow import AgentWorkflowRunner
 
     from simple_chat_agent.agent import harness_ext
-    from simple_chat_agent.agent.contracts import ModelChoice
+    from simple_chat_agent.agent.contracts import (  # message models live in contracts (key-free)
+        Evidence,
+        Findings,
+        Issue,
+        ModelChoice,
+        Question,
+        Review,
+        ReviewRequest,
+    )
     from simple_chat_agent.agent.runtime import CODING_AGENT, CodingDeps, fast_model_for, model_settings
     from simple_chat_agent.agent.tools.workspace import WORKSPACE_TOOLS
 
@@ -36,51 +44,6 @@ class SubagentInit(BaseModel):
     owner_id: str = ""
     session_id: str = ""
     model: ModelChoice = Field(default_factory=ModelChoice)
-
-
-class Question(BaseModel):
-    """A question about the codebase for the explorer to answer from the files."""
-
-    question: str = Field(description="What to find out. Be specific.")
-    paths: list[str] = Field(default_factory=list, description="Where to start looking, if known.")
-
-
-class Evidence(BaseModel):
-    """One place in the code that supports the answer."""
-
-    path: str
-    line: int | None = None
-    note: str
-
-
-class Findings(BaseModel):
-    """The explorer's answer, with the code that supports it."""
-
-    answer: str
-    evidence: list[Evidence] = Field(default_factory=list)
-
-
-class ReviewRequest(BaseModel):
-    """Ask the reviewer to review the workspace's current uncommitted diff."""
-
-    focus: str = Field("", description="What to pay most attention to, if anything.")
-
-
-class Issue(BaseModel):
-    """One problem the reviewer found."""
-
-    severity: str = Field(description="blocker, major or minor")
-    path: str
-    line: int | None = None
-    comment: str
-
-
-class Review(BaseModel):
-    """The reviewer's verdict on the diff."""
-
-    verdict: str = Field(description="approve or request_changes")
-    summary: str
-    issues: list[Issue] = Field(default_factory=list)
 
 
 EXPLORER_INSTRUCTIONS = """\

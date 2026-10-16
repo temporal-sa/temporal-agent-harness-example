@@ -166,3 +166,51 @@ class FrontDoorApproval(BaseModel):
     approved: bool
     reason: str | None = None
     remember: bool = False
+
+
+# -- Subagent message models (key-free, so the API can describe subagent interfaces) --
+
+
+class Question(BaseModel):
+    """A question about the codebase for the explorer to answer from the files."""
+
+    question: str = Field(description="What to find out. Be specific.")
+    paths: list[str] = Field(default_factory=list, description="Where to start looking, if known.")
+
+
+class Evidence(BaseModel):
+    """One place in the code that supports the answer."""
+
+    path: str
+    line: int | None = None
+    note: str
+
+
+class Findings(BaseModel):
+    """The explorer's answer, with the code that supports it."""
+
+    answer: str
+    evidence: list[Evidence] = Field(default_factory=list)
+
+
+class ReviewRequest(BaseModel):
+    """Ask the reviewer to review the workspace's current uncommitted diff."""
+
+    focus: str = Field("", description="What to pay most attention to, if anything.")
+
+
+class Issue(BaseModel):
+    """One problem the reviewer found."""
+
+    severity: str = Field(description="blocker, major or minor")
+    path: str
+    line: int | None = None
+    comment: str
+
+
+class Review(BaseModel):
+    """The reviewer's verdict on the diff."""
+
+    verdict: str = Field(description="approve or request_changes")
+    summary: str
+    issues: list[Issue] = Field(default_factory=list)

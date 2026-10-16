@@ -1118,6 +1118,132 @@ class GitSafetyInProcessTests(_GitSafetyScenarios, _ToolServerEnv, unittest.Isol
         return await environment.run(_activity_body(tool), *args, _tool_ctx("t"))
 
 
+class ExecutionLogTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
+    """POST /execute/log and read_execution_log (P2 step 2.5, PRD S7)."""
+
+    async def asyncSetUp(self) -> None:
+        self.start_server(self)
+        self.workspace("ws-1")
+        self.workspace("ws-2")
+
+    async def run_job(self, command: str, execution_id: str, workspace: str = "ws-1") -> dict[str, Any]:
+        result, _ = await ws._stream_execute(
+            {"workspace_id": workspace, "execution_id": execution_id, "command": command,
+             "cwd": "/workspace", "timeout_seconds": 60, "network": False}
+        )
+        return result
+
+    async def test_finished_job_streams_and_interleaving(self) -> None:
+        await self.run_job("echo out1; sleep 0.05; echo err1 >&2; sleep 0.05; echo out2; exit 3", "log:fin")
+        both = await ws.read_execution_log("ws-1", "log:fin")
+        self.assertEqual(both["text"], "out1\nerr1\nout2\n")
+        self.assertTrue(both["interleaved"])
+        self.assertTrue(both["finished"])
+        self.assertEqual(both["exit_code"], 3)
+        self.assertIsNone(both["next_offset"])
+        self.assertFalse(both["truncated_at_capture"])
+        out = await ws.read_execution_log("ws-1", "log:fin", stream="stdout")
+        err = await ws.read_execution_log("ws-1", "log:fin", stream="stderr")
+        self.assertEqual((out["text"], err["text"]), ("out1\nout2\n", "err1\n"))
+
+    async def test_both_falls_back_to_sections_when_the_replay_buffer_dropped_events(self) -> None:
+        with patch.object(ex, "JOB_REPLAY_BUFFER_EVENTS", 2):
+            await self.run_job(
+                "for i in 1 2 3 4 5; do echo o$i; sleep 0.02; done; echo e >&2", "log:dropped"
+            )
+        both = await ws.read_execution_log("ws-1", "log:dropped")
+        self.assertFalse(both["interleaved"])
+        self.assertEqual(both["text"], "o1\no2\no3\no4\no5\n\n[stderr]\ne\n")
+
+    async def test_running_job_returns_output_so_far_then_the_rest(self) -> None:
+        job = asyncio.ensure_future(self.run_job("echo first; sleep 1.5; echo second", "log:run"))
+        deadline = time.monotonic() + 5
+        page: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            with contextlib.suppress(ws.ExecutionLogNotFound):  # until the job registers
+                page = await ws.read_execution_log("ws-1", "log:run")
+                if page["text"]:
+                    break
+            await asyncio.sleep(0.05)
+        self.assertEqual(page["text"], "first\n")
+        self.assertFalse(page["finished"])
+        self.assertIsNone(page["exit_code"])
+        self.assertEqual(page["next_offset"], 6)
+        await job
+        rest = await ws.read_execution_log("ws-1", "log:run", offset=page["next_offset"])
+        self.assertEqual(rest["text"], "second\n")
+        self.assertTrue(rest["finished"])
+        self.assertEqual(rest["exit_code"], 0)
+        self.assertIsNone(rest["next_offset"])
+
+    async def test_ids_are_scoped_to_the_workspace(self) -> None:
+        await self.run_job("echo secret", "log:scoped", workspace="ws-1")
+        self.assertEqual((await ws.read_execution_log("ws-1", "log:scoped"))["text"], "secret\n")
+        for workspace_id, execution_id in (("ws-2", "log:scoped"), ("ws-1", "log:unknown"),
+                                           ("ws-1", "../../etc/passwd")):
+            with self.subTest(workspace_id=workspace_id, execution_id=execution_id):
+                with self.assertRaises(ws.ExecutionLogNotFound):
+                    await ws.read_execution_log(workspace_id, execution_id)
+        # A running job is scoped the same way.
+        job = asyncio.ensure_future(self.run_job("echo hi; sleep 1", "log:live-scoped"))
+        await asyncio.sleep(0.3)
+        with self.assertRaises(ws.ExecutionLogNotFound):
+            await ws.read_execution_log("ws-2", "log:live-scoped")
+        await job
+
+    async def test_multibyte_output_split_across_reads_is_not_mangled(self) -> None:
+        # 4096-byte reads split 3-byte characters; the capture and stream must stay intact.
+        result = await self.run_job("python3 -c \"import sys; sys.stdout.write('€' * 5000)\"", "log:utf8")
+        self.assertEqual(result["stdout"], "€" * 5000)
+        log = await ws.read_execution_log("ws-1", "log:utf8")
+        self.assertEqual(log["text"], "€" * 5000)
+        self.assertTrue(log["interleaved"])
+
+    async def test_paging_by_chars_and_bytes(self) -> None:
+        await self.run_job("python3 -c \"print('x' * 999)\"", "log:page")
+        pages, offset = [], 0
+        while offset is not None:
+            page = await ws.read_execution_log("ws-1", "log:page", stream="stdout", offset=offset, limit=300)
+            self.assertLessEqual(len(page["text"]), 300)
+            pages.append(page["text"])
+            offset = page["next_offset"]
+        self.assertEqual("".join(pages), "x" * 999 + "\n")
+        self.assertEqual(len(pages), 4)
+        past_end = await ws.read_execution_log("ws-1", "log:page", stream="stdout", offset=5000)
+        self.assertEqual((past_end["text"], past_end["next_offset"]), ("", None))
+
+        # 3-byte characters: a full-size page is cut at 256 KB of UTF-8, not 256K chars.
+        await self.run_job("python3 -c \"print('€' * 99000)\"", "log:bytes")
+        first = await ws.read_execution_log("ws-1", "log:bytes", stream="stdout")
+        self.assertLessEqual(len(first["text"].encode()), ex.MAX_LOG_RESPONSE_BYTES)
+        self.assertEqual(first["next_offset"], len(first["text"]))
+        second = await ws.read_execution_log("ws-1", "log:bytes", stream="stdout", offset=first["next_offset"])
+        self.assertEqual(first["text"] + second["text"], "€" * 99000 + "\n")
+        self.assertIsNone(second["next_offset"])
+
+    async def test_auth_is_required(self) -> None:
+        import httpx
+
+        await self.run_job("echo hi", "log:auth")
+        url = os.environ["WORKSPACE_EXECUTOR_URL"] + "/execute/log"
+        body = {"workspace_id": "ws-1", "execution_id": "log:auth"}
+        async with httpx.AsyncClient() as client:
+            for headers in ({}, {"Authorization": "Bearer wrong"}, {"Authorization": TOKEN}):
+                with self.subTest(headers=headers):
+                    response = await client.post(url, json=body, headers=headers)
+                    self.assertEqual(response.status_code, 401)
+                    self.assertNotIn("hi", response.text)
+        # (The in-process server shares os.environ, so swap the client's header instead.)
+        with patch.object(ws, "_executor_headers", lambda: {"Authorization": "Bearer wrong"}):
+            with self.assertRaises(ws.ExecutorRequestError):
+                await ws.read_execution_log("ws-1", "log:auth")
+
+    async def test_unreachable_executor(self) -> None:
+        with patch.dict("os.environ", {"WORKSPACE_EXECUTOR_URL": "http://127.0.0.1:9"}):
+            with self.assertRaises(ws.ExecutorRequestError):
+                await ws.read_execution_log("ws-1", "log:x")
+
+
 class FileToolsTests(_ToolServerEnv, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.start_server(self)
@@ -1301,6 +1427,29 @@ class LiveExecutorTests(unittest.IsolatedAsyncioTestCase):
             environment.info, workflow_id=self.workspace_id, activity_id=uuid.uuid4().hex
         )
         return await environment.run(agent.tool_activity(tool), *args, _tool_ctx("live"))
+
+    async def test_execution_log_for_a_run_command_result(self) -> None:
+        environment = ActivityEnvironment()
+        environment.info = dataclasses.replace(environment.info, workflow_id=self.workspace_id)
+        task = asyncio.ensure_future(environment.run(
+            ws.run_command_activity,
+            ws.RunCommandInput(workspace_id=self.workspace_id, tool_ctx=_tool_ctx("live-log"),
+                               command="echo first; echo oops >&2; sleep 1.5; echo second"),
+        ))
+        while "first" not in self.publisher.text:
+            await asyncio.sleep(0.05)
+        log_ref = ws._execution_id("run_command", self.workspace_id, environment.info.workflow_run_id, "live-log")
+        running = await ws.read_execution_log(self.workspace_id, log_ref)
+        self.assertFalse(running["finished"])
+        self.assertIn("first\n", running["text"])
+        result = await task
+        self.assertEqual(result.log_ref, log_ref)
+        done = await ws.read_execution_log(self.workspace_id, result.log_ref)
+        self.assertTrue(done["finished"])
+        self.assertEqual(done["text"], "first\noops\nsecond\n")
+        self.assertEqual(done["exit_code"], 0)
+        with self.assertRaises(ws.ExecutionLogNotFound):
+            await ws.read_execution_log(f"other-{self.workspace_id}", result.log_ref)
 
     async def test_plain_git_commit_from_a_command_has_an_identity(self) -> None:
         result, _ = await ws._stream_execute(self.body(
