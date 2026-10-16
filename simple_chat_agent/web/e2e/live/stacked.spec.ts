@@ -87,7 +87,7 @@ test("3e live: five gated calls, one card, answer one alone, Approve all the res
   expect(created.status(), await created.text()).toBe(200);
   const id = String((await created.json()).session_id);
   await page.goto(`${env.baseA}/app/?s=${encodeURIComponent(id)}`);
-  await expect(page.getByRole("button", { name: /^Trust safe tools/ })).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByRole("button", { name: /^Approvals: Trust safe tools/ })).toBeVisible({ timeout: 30_000 });
 
   const box = page.getByRole("textbox", { name: "Message" });
   await box.fill(PROMPT);

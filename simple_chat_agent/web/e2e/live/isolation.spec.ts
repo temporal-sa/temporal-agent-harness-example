@@ -34,7 +34,7 @@ test("3h isolation: user B can't see or open user A's session, and the other way
     const seenBefore = requestLog.seen.length;
     await pageB.goto(`${env.baseB}/app/?s=${encodeURIComponent(a)}`);
     // The API answers 404; the app shows its not-found page and nothing of A's session.
-    const notFound = pageB.getByRole("alert").filter({ has: pageB.getByRole("heading", { name: "No such session." }) });
+    const notFound = pageB.getByRole("alert").filter({ has: pageB.getByRole("heading", { name: "No such session" }) });
     await expect(notFound).toBeVisible();
     await expect(notFound).toContainText("It doesn't exist, or it belongs to someone else.");
     await expect(notFound.getByRole("link", { name: "Back to your sessions" })).toBeVisible();
@@ -47,7 +47,7 @@ test("3h isolation: user B can't see or open user A's session, and the other way
     expect(attaches, "B's page attached to A's session").toEqual([]);
     // The way back works.
     await notFound.getByRole("link", { name: "Back to your sessions" }).click();
-    await expect(pageB.getByRole("alert").filter({ hasText: "No such session." })).toHaveCount(0);
+    await expect(pageB.getByRole("alert").filter({ hasText: "No such session" })).toHaveCount(0);
     await expect(pageB).not.toHaveURL(/[?&]s=/);
     // The routes themselves answer 404 for the other user's session.
     for (const path of [`sessions/${a}`, `status/${a}`, `workflow-status/${a}`, `attach?session_id=${a}&from_offset=0`]) {

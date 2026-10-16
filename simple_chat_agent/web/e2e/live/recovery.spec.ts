@@ -46,7 +46,7 @@ test("3f recovery: crash during pytest → banner → divider → confirmed numb
   expect(bannerSeen).toBe(true);
 
   // The divider, "Checking…" until the bridge confirms it from history.
-  const divider = page.getByRole("region", { name: /^Recovered · worker lost/ });
+  const divider = page.getByRole("region", { name: /^(Another Worker took over · checking|Recovered · Worker lost)/ });
   await expect(divider).toBeVisible({ timeout: 120_000 });
   const firstText = (await divider.textContent()) ?? "";
   test.info().annotations.push({ type: "divider first seen", description: firstText.includes("Checking…") ? "Checking…" : "already confirmed" });

@@ -68,7 +68,7 @@ for (const size of SIZES) {
       await expect(page.getByRole("banner")).toBeVisible();
       await expect(page.getByRole("textbox", { name: "Message" })).toBeVisible();
       if (size.width >= 1600) {
-        await expect(page.getByRole("button", { name: "+ New demo session" })).toBeVisible();
+        await expect(page.getByRole("button", { name: "New demo session" })).toBeVisible();
       } else if (size.width > 600) {
         await expect(page.getByRole("button", { name: "New demo session" })).toBeVisible();
         await expect(page.getByRole("button", { name: "Show all sessions" })).toBeVisible();

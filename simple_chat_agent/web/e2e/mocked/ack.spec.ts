@@ -65,18 +65,18 @@ for (const slow of [false, true]) {
     test(`a model pick shows the new model at once (${when})`, async ({ page, mockApi }) => {
       const api = await mockApi({ postDelayMs: slow ? 1000 : 0 });
       await openScripted(page, api, idle(), { session_id: sessionId("ack-model") });
-      await page.getByRole("button", { name: /^Claude Sonnet 5\.5 · effort/ }).click();
+      await page.getByRole("button", { name: /^Model: Claude Sonnet 5\.5 · effort/ }).click();
       const menu = page.getByRole("menu", { name: "Model" });
       const r = await measureAck(page, menu.getByRole("menuitemradio", { name: /GPT-5\.5/ }), { selector: 'button[aria-haspopup="menu"]', text: "GPT-5.5" });
       report("Model pick → button shows GPT-5.5", r);
       expect(r.paintMs).toBeLessThan(BUDGET_MS);
-      await expect(page.getByRole("button", { name: /^GPT-5\.5 · effort/ })).toContainText(/Sending…|applies next turn/);
+      await expect(page.getByRole("button", { name: /^Model: GPT-5\.5 · effort/ })).toContainText(/Sending…|applies next turn/);
     });
 
     test(`a posture pick shows the new posture at once (${when})`, async ({ page, mockApi }) => {
       const api = await mockApi({ postDelayMs: slow ? 1000 : 0 });
       await openScripted(page, api, idle(), { session_id: sessionId("ack-posture"), posture: "trust_safe" });
-      await page.getByRole("button", { name: /^Trust safe tools/ }).click();
+      await page.getByRole("button", { name: /^Approvals: Trust safe tools/ }).click();
       const menu = page.getByRole("menu", { name: "Approvals" });
       const r = await measureAck(page, menu.getByRole("menuitemradio", { name: /Ask for everything/ }), { selector: 'button[aria-haspopup="menu"]', text: "Ask for everything" });
       report("Posture pick → button shows Ask for everything", r);

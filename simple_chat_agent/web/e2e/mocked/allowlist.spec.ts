@@ -24,16 +24,16 @@ test("the demo script's requests are all on the allowlist", async ({ page, mockA
   await page.getByRole("button", { name: "Sign in" }).click();
 
   // New demo session.
-  await page.getByRole("button", { name: "+ New demo session" }).first().click();
+  await page.getByRole("button", { name: "New demo session" }).first().click();
   await expect(page.getByRole("region", { name: "Needs approval" })).toBeVisible();
 
   // A message mid-turn (Enter queues it), the approval, model and posture.
   await page.getByRole("textbox", { name: "Message" }).fill("Then review the diff.");
   await page.getByRole("textbox", { name: "Message" }).press("Enter");
   await page.getByRole("region", { name: "Needs approval" }).getByRole("button", { name: "Approve", exact: true }).click();
-  await page.getByRole("button", { name: /^Claude Sonnet 5\.5 · effort/ }).click();
+  await page.getByRole("button", { name: /^Model: Claude Sonnet 5\.5 · effort/ }).click();
   await page.getByRole("menu", { name: "Model" }).getByRole("menuitemradio", { name: /GPT-5\.5/ }).click();
-  await page.getByRole("button", { name: /^Auto mode/ }).click();
+  await page.getByRole("button", { name: /^Approvals: Auto mode/ }).click();
   await page.getByRole("menu", { name: "Approvals" }).getByRole("menuitemradio", { name: /Trust safe tools/ }).click();
 
   // The full log of the test run (S7).
@@ -43,7 +43,7 @@ test("the demo script's requests are all on the allowlist", async ({ page, mockA
 
   // An upload.
   const chooser = page.waitForEvent("filechooser");
-  await page.getByRole("button", { name: "+ File" }).click();
+  await page.getByRole("button", { name: "Attach a file" }).click();
   await (await chooser).setFiles({ name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from("hello") });
   await expect(page.getByText("notes.txt · attached")).toBeVisible();
 

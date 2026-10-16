@@ -32,8 +32,8 @@ export async function newEmptySession(page: Page): Promise<string> {
   return id;
 }
 
-/** The composer's model button ("Claude Sonnet 5.5 ▾", "Claude Haiku 5.5 · effort low ▾"). */
-const modelButton = (page: Page) => page.locator("[data-slot=composer]").getByRole("button", { name: /^(Claude|GPT|Gemini|Model)/ });
+/** The composer's model button (accessible name "Model: Claude Haiku 5.5 · effort low …"). */
+const modelButton = (page: Page) => page.locator("[data-slot=composer]").getByRole("button", { name: /^Model:/ });
 
 /** Claude Haiku 5.5, effort low: the cheapest model in the catalog. */
 export async function pickHaikuLow(page: Page): Promise<void> {
@@ -51,11 +51,11 @@ export async function pickHaikuLow(page: Page): Promise<void> {
 }
 
 export async function pickPosture(page: Page, label: string): Promise<void> {
-  await page.getByRole("button", { name: /^(Ask for everything|Trust safe tools|Auto mode|Never ask)/ }).click();
+  await page.getByRole("button", { name: /^Approvals:/ }).click();
   const item = page.getByRole("menu", { name: "Approvals" }).getByRole("menuitemradio", { name: new RegExp(`^${label}`) });
   if ((await item.getAttribute("aria-checked")) !== "true") await item.click();
   else await page.keyboard.press("Escape");
-  await expect(page.getByRole("button", { name: new RegExp(`^${label}`) })).toBeVisible();
+  await expect(page.getByRole("button", { name: new RegExp(`^Approvals: ${label}`) })).toBeVisible();
 }
 
 export async function send(page: Page, text: string): Promise<void> {

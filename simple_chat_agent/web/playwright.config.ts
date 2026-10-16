@@ -1,7 +1,7 @@
 // Playwright for the product view (P3 step 3.5). Two projects:
 //
 //   mocked  the built app (web/dist) behind e2e/support/mock-server.mjs, every /api route
-//           mocked in the page; fast, no backend. Its timing checks (3b) run first as the
+//           mocked in the page; fast, no backend. Its timing checks (3b) run last as the
 //           `mocked-timing` project, alone.
 //   live    the real local stack (API + dev worker started by e2e/live/global-setup.ts on free
 //           ports and a unique task queue). Skipped unless E2E_LIVE=1.
@@ -38,8 +38,9 @@ export default defineConfig({
     screenshot: "only-on-failure",
   },
   projects: [
-    // The 100 ms acknowledgement checks (3b) run first and alone, so CPU contention from the
-    // other parallel tests can't skew the timings. `--project=mocked` runs them too.
+    // The 100 ms acknowledgement checks (3b) run alone, after the main mocked tests, so CPU
+    // contention can't skew the timings. They are `mocked`'s teardown project: `--project=mocked`
+    // runs them too, and a failure in either project never skips the other.
     {
       name: "mocked-timing",
       testDir: "e2e/mocked",
@@ -51,7 +52,7 @@ export default defineConfig({
       name: "mocked",
       testDir: "e2e/mocked",
       testIgnore: /ack\.spec\.ts$/,
-      dependencies: ["mocked-timing"],
+      teardown: "mocked-timing",
       use: { baseURL: `http://127.0.0.1:${MOCK_PORT}` },
     },
     {

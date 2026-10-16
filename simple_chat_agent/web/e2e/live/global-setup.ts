@@ -26,7 +26,7 @@ export default async function globalSetup(): Promise<void> {
   while (portB === portA) portB = await freePort();
 
   // E2E_WEB_DIST: have the APIs serve another build (the API's SIMPLE_CHAT_WEB_DIST).
-  const dist = process.env.E2E_WEB_DIST ? { SIMPLE_CHAT_WEB_DIST: process.env.E2E_WEB_DIST } : {};
+  const dist: Record<string, string> = process.env.E2E_WEB_DIST ? { SIMPLE_CHAT_WEB_DIST: process.env.E2E_WEB_DIST } : {};
   const auth = (user: string) => ({ SIMPLE_CHAT_LOCAL_AUTH_USERNAME: user, SIMPLE_CHAT_LOCAL_AUTH_PASSWORD: password, ...dist });
   const apiA = make("api-a", "dev-api", { API_PORT: String(portA), TASK_QUEUE: taskQueue }, auth(userA));
   const apiB = make("api-b", "dev-api", { API_PORT: String(portB), TASK_QUEUE: taskQueue }, auth(userB));

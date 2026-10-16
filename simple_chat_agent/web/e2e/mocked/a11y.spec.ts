@@ -124,7 +124,7 @@ test.describe("keyboard", () => {
   test("3k the composer's menus work from the keyboard", async ({ page, mockApi }) => {
     const api = await mockApi();
     await openScripted(page, api, working(), { session_id: sessionId("kbd-menu") });
-    const model = page.getByRole("button", { name: /^Claude Sonnet 5\.5 · effort/ });
+    const model = page.getByRole("button", { name: /^Model: Claude Sonnet 5\.5 · effort/ });
     await model.focus();
     await page.keyboard.press("Enter");
     const menu = page.getByRole("menu", { name: "Model" });
