@@ -32,6 +32,9 @@ wheels/
 # venv
 .env
 .env.litellm
+**/.env
+**/.env.*
+!**/.env.example
 .venv
 env/
 venv/
