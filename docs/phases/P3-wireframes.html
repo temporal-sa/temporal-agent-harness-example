@@ -284,6 +284,15 @@ h3 { font-weight: 500; font-size: 1rem; margin: 0; }
 .m-sheet { border-top: 1px solid var(--uv-light); background: rgba(13,13,16,.95); padding: .5em .8em; display: flex; gap: .5em; align-items: center; }
 .m-sheet .grab { font-family: var(--mono); font-size: .74em; font-weight: 500; padding: .55em .8em; border: 1px solid var(--uv-light); min-height: 44px; display: inline-flex; align-items: center; gap: .4em; }
 
+.stack { display: grid; gap: .3em; }
+.stack .grp { display: flex; gap: .55em; align-items: center; padding: .45em .6em; border: 1px solid var(--border); background: #111116; font-size: .88em; flex-wrap: wrap; }
+.stack .grp.open { border-color: var(--uv-light); }
+.stack .item { display: flex; gap: .55em; align-items: center; padding: .35em .6em .35em 1.6em; font-size: .82em; flex-wrap: wrap; }
+.stack .item.done { opacity: .6; }
+.stack .item .ok, .stack .item .no { font-family: var(--mono); width: 1.9em; height: 1.9em; display: grid; place-items: center; border: 1px solid var(--slate-500); }
+.stack .item .ok { color: var(--green); border-color: var(--green); }
+.stack .item .no { color: var(--slate-300); }
+.badge.leaving { color: var(--pink); }
 .callout { position: absolute; background: var(--yellow); color: var(--space-black); font-family: var(--mono); font-weight: 600; display: grid; place-items: center; z-index: 5; box-shadow: 0 0 0 3px rgba(20,20,20,.9); }
 .anno-on .callout { display: grid; }
 .anno-off .callout { display: none; }
@@ -873,11 +882,28 @@ files:   refund_service/refunds.py (+1 −1)</div>
       <div class="paused"><span class="dot you"></span>The agent is paused in Temporal and nothing is running.</div>
       <div class="acts"><span class="btn green small">Approve</span><span class="btn secondary small">Always approve file edits</span><span class="btn ghost small">Decline</span></div>
       <div class="why">Always approve lasts for this session and covers file edits only. You can undo it from the posture menu.</div></div>`],
-    ['Several calls at once', H`<div class="decision-card"><div class="top"><span class="badge edit">3 need approval</span><span class="t">Edit 3 files</span></div>
-      <div class="args">refund_service/refunds.py   +1 −1
-tests/test_refund.py        +14
-refund_service/money.py     +2 −2</div>
-      <div class="acts"><span class="btn green small">Approve all 3</span><span class="btn secondary small">Always approve file edits</span><span class="btn ghost small">Decline all</span><span class="s-spacer"></span><span class="hint">or answer each one ▾</span></div></div>`],
+    ['Stacked approvals · collapsed', H`<div class="decision-card"><div class="top"><span class="badge edit">5 need approval</span><span class="t">5 tool calls are waiting</span><span class="s-spacer"></span><span class="btn green small">Approve all 5</span></div>
+      <div class="stack">
+        <div class="grp"><span class="chev">▸</span><span class="badge edit">Edit</span><span>Edit 3 files</span><span class="s-spacer"></span><span class="btn green small">Approve 3</span><span class="btn ghost small">Decline 3</span></div>
+        <div class="grp"><span class="chev">▸</span><span class="badge shell">Shell</span><span>Run <span class="mono">pytest -q</span> <span class="hint">× 2, same command</span></span><span class="s-spacer"></span><span class="btn green small">Approve 2</span><span class="btn ghost small">Decline 2</span></div>
+      </div>
+      <div class="paused"><span class="dot you"></span>The agent is paused in Temporal and nothing is running.</div></div>`],
+    ['Stacked approvals · one group opened', H`<div class="decision-card"><div class="top"><span class="badge edit">5 need approval</span><span class="t">5 tool calls are waiting</span><span class="s-spacer"></span><span class="btn green small">Approve all 5</span></div>
+      <div class="stack">
+        <div class="grp open"><span class="chev">▾</span><span class="badge edit">Edit</span><span>Edit 3 files</span><span class="s-spacer"></span><span class="btn green small">Approve 3</span><span class="btn secondary small">Always approve file edits</span><span class="btn ghost small">Decline 3</span></div>
+        <div class="item"><span class="chev">▾</span><span class="mono">refund_service/refunds.py</span><span class="hint">+1 −1 · from main agent</span><span class="s-spacer"></span><span class="ok">✓</span><span class="no">✕</span></div>
+        <div class="diff" style="margin-left:1.6em;border:1px solid var(--border)"><div class="del">-  amount = order.total_cents if amount_cents is None else …</div><div class="add">+  amount = order.balance_cents if amount_cents is None else …</div></div>
+        <div class="item"><span class="chev">▸</span><span class="mono">tests/test_refund.py</span><span class="hint">+14 · from main agent</span><span class="s-spacer"></span><span class="ok">✓</span><span class="no">✕</span></div>
+        <div class="item done"><span class="chev">▸</span><span class="mono">refund_service/money.py</span><span class="hint">+2 −2</span><span class="s-spacer"></span><span class="badge leaving">Declined by you</span></div>
+        <div class="grp"><span class="chev">▸</span><span class="badge shell">Shell</span><span>Run <span class="mono">pytest -q</span> <span class="hint">× 2, same command</span></span><span class="s-spacer"></span><span class="btn green small">Approve 2</span><span class="btn ghost small">Decline 2</span></div>
+      </div>
+      <div class="hint">Answering one item takes it out of the group, and the counts update. Approve all and the group buttons only answer items still waiting.</div></div>`],
+    ['How calls are stacked', H`<div style="display:grid;gap:.5em;font-size:.88em;color:var(--indigo-100)">
+      <div>Calls waiting at the same time share one card, so the transcript never shows a wall of separate cards.</div>
+      <div>They group by tool. Calls with identical arguments fold into one row with "× n", for example two explorers asking to run the same test.</div>
+      <div>Each item can still be opened to read its full arguments or diff, then approved or declined on its own.</div>
+      <div>A call that arrives while the card is open joins its group with a brief highlight. The buttons don't move under your cursor.</div>
+      <div>Approve all sends one answer per call through the same Signal path, so each one shows its own Sending → Accepted state.</div></div>`],
     ['Shell command · Ask for everything', H`<div class="decision-card"><div class="top"><span class="badge shell">Needs approval</span><span class="t">Run a command</span></div>
       <div class="args">$ pytest -q</div>
       <div class="acts"><span class="btn green small">Approve</span><span class="btn ghost small" style="opacity:.45">Always approve</span><span class="btn ghost small">Decline</span></div>
