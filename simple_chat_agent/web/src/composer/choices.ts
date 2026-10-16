@@ -74,3 +74,26 @@ export function alwaysApprovedText(tools: readonly string[], config: Pick<AgentC
   for (const t of tools) parts.add(config?.tool_risk_classes?.[t] === "workspace_edit" ? "file edits" : t);
   return [...parts].join(", ");
 }
+
+/**
+ * What the composer offers. "waiting": the turn is open only because a call waits for you, so
+ * the composer reads as idle (the card says nothing is running); Stop stays as a button but
+ * isn't bound to Escape.
+ */
+export type ComposerMode = "idle" | "running" | "waiting";
+
+export function composerMode(s: { agentStatus: "idle" | "busy"; status: string; pendingApprovals: readonly unknown[] }): ComposerMode {
+  if (s.agentStatus !== "busy") return "idle";
+  return s.status === "waiting_for_you" && s.pendingApprovals.length > 0 ? "waiting" : "running";
+}
+
+/**
+ * Whether Escape stops the turn: only while it runs, and only when focus is in the composer
+ * or the transcript, never in a dialog, a menu or the decision card, and never when the key
+ * was already used to close something.
+ */
+export function escapeStops(mode: ComposerMode, target: Element | null, alreadyHandled: boolean): boolean {
+  if (mode !== "running" || alreadyHandled || !target) return false;
+  if (target.closest('[role="dialog"], [aria-modal="true"], [role="menu"], [data-slot="decisions"]')) return false;
+  return target.closest('.composer, [data-slot="transcript"]') !== null;
+}

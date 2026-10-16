@@ -35,6 +35,9 @@ describe("meters: not reported vs 0", () => {
     const v = meterValues(telemetry([usage("u1", { input_tokens: 1000, output_tokens: 0, cache_read_tokens: 0 })]));
     expect(v.tokens).toBe("1k in / 0 out");
     expect(v.cache).toBe("0%");
+    // A reported 0 is neutral, without the discount note (UX review m8).
+    expect(v.cacheTone).toBe("neutral");
+    expect(v.cacheNote).toBe("nothing read from cache yet");
   });
 
   it("marks a single missing side as not reported", () => {
@@ -72,7 +75,7 @@ describe("meters: work kept hero", () => {
     const v = meterValues(telemetry([rec(true)]));
     expect(v.hero).toBe("6 model calls · 18.2k tokens · 9 tool calls");
     const html = renderToStaticMarkup(<MetersStrip telemetry={telemetry([rec(true)])} modelLabel={null} />);
-    expect(html).toContain("Work kept after worker loss (this session)");
+    expect(html).toContain("Work kept after Worker loss (this session)");
   });
 });
 
@@ -83,5 +86,39 @@ describe("formatTokens", () => {
     expect(formatTokens(18_200)).toBe("18.2k");
     expect(formatTokens(250_000)).toBe("250k");
     expect(formatTokens(1_250_000)).toBe("1.25M");
+  });
+});
+
+describe("meters: cache wording (UX review m8)", () => {
+  it("says no model calls yet before any call, in neutral", () => {
+    const v = meterValues(telemetry([]));
+    expect(v).toMatchObject({ cache: "no model calls yet", cacheTone: "neutral", cacheNote: null });
+    const html = renderToStaticMarkup(<MetersStrip telemetry={telemetry([])} modelLabel={null} />);
+    expect(html).toContain('class="neutral">no model calls yet');
+    expect(html).not.toContain("billed at a discount");
+  });
+
+  it("says nothing was read from cache when the reads are 0", () => {
+    const html = renderToStaticMarkup(<MetersStrip telemetry={telemetry([usage("u1", { input_tokens: 1000, output_tokens: 10, cache_read_tokens: 0 })])} modelLabel={null} />);
+    expect(html).toContain('<dd class="neutral">0%</dd><dd class="sub">· nothing read from cache yet</dd>');
+    expect(html).not.toContain("billed at a discount");
+  });
+
+  it("is green with the discount note only when something came from cache", () => {
+    const v = meterValues(telemetry([usage("u1", { input_tokens: 1000, output_tokens: 10, cache_read_tokens: 500 })]));
+    expect(v).toMatchObject({ cache: "50%", cacheTone: "good", cacheNote: "billed at a discount" });
+  });
+});
+
+describe("meters: accessibility (UX review nits)", () => {
+  it("keeps a live region mounted from the start, so the first recovery is announced", () => {
+    const before = renderToStaticMarkup(<MetersStrip telemetry={telemetry([])} modelLabel={null} />);
+    expect(before).toContain('<span class="sr-only" aria-live="polite"></span>');
+  });
+
+  it("labels the compact strip as a group, and keeps the model label out of the list", () => {
+    const html = renderToStaticMarkup(<MetersStrip telemetry={telemetry([])} modelLabel="GPT-5.5 · OpenAI" />);
+    expect(html).toContain('class="meters-compact" role="group" aria-label="Session meters"');
+    expect(html).toMatch(/<\/dl><span class="spacer"><\/span><span class="model"/);
   });
 });

@@ -3,6 +3,8 @@ import { fillLink, type AgentConfig, type Me } from "../session";
 // The header's three views (PRD U7). Each carries its caption. A view that is off here is
 // shown disabled with the reason.
 
+export const NO_SESSION_REASON = "Open a session to link its Workflow.";
+
 interface ViewDef {
   name: string;
   caption: string;
@@ -16,12 +18,14 @@ export function viewDefs(config: AgentConfig | null, me: Me | null, sessionId: s
   const consoleHref = links?.console
     ? fillLink(links.console, sessionId) ?? (links.console.enabled ? "/console/" : null)
     : "/console/";
-  let temporalHref: string | null;
-  if (links?.temporal_ui) {
-    temporalHref = fillLink(links.temporal_ui, sessionId) ?? (links.temporal_ui.enabled ? me?.temporal_ui_workflows_url ?? null : null);
-  } else {
-    temporalHref = me?.temporal_ui_workflows_url ?? null;
-  }
+  // Enabled in config, but the link names one Workflow: with no session open there is none.
+  const temporalOn = links?.temporal_ui ? links.temporal_ui.enabled : me?.temporal_ui_workflows_url != null;
+  const temporalHref = links?.temporal_ui ? fillLink(links.temporal_ui, sessionId) : me?.temporal_ui_workflows_url ?? null;
+  const temporalReason = temporalOn
+    ? sessionId
+      ? null
+      : NO_SESSION_REASON
+    : links?.temporal_ui?.reason ?? "The Temporal UI isn't linked in this environment.";
   return [
     { name: "Product view", caption: "What your users see", href: null, current: true },
     {
@@ -34,7 +38,7 @@ export function viewDefs(config: AgentConfig | null, me: Me | null, sessionId: s
       name: "Temporal UI",
       caption: "The Workflow history",
       href: temporalHref,
-      reason: links?.temporal_ui?.reason ?? "The Temporal UI isn't linked in this environment.",
+      reason: temporalReason,
     },
   ];
 }

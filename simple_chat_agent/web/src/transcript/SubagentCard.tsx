@@ -7,6 +7,7 @@ import type { Message, SubagentPart, ToolPart } from "../session";
 import { useTranscript } from "./context";
 import { argPreview } from "./toolInfo";
 import { Markdown } from "./Markdown";
+import { ErrorNote } from "./ErrorNote";
 
 interface Evidence {
   path: string;
@@ -125,7 +126,7 @@ export function SubagentCard({ part }: { part: SubagentPart }) {
               ))}
           </div>
         )}
-        {message?.error && <div className="tool-error">{message.error}</div>}
+        {message?.error && <ErrorNote text="The subagent stopped with an error. The main agent carries on without its answer." detail={message.error} />}
         {node?.unavailable && <div className="live">{node.unavailable}</div>}
       </div>
       {review && <ReviewCard review={review} />}

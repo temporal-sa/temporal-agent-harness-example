@@ -183,7 +183,13 @@ export interface SendRecord {
   phase: SendPhase;
   /** When each phase was entered (ms since epoch, browser clock). */
   at: Partial<Record<SendPhase, number>>;
+  /** Raw failure text (server message, agent reason). Show `errorCopy(record)` instead. */
   error: string | null;
+  /** The API error code or x_rejected code, when there is one (feeds `errorCopy`). Optional
+   *  only so records built before it existed stay valid; the facade always sets it. */
+  errorCode?: string | null;
+  /** The HTTP status of a failed request (0: the app wasn't reachable). */
+  errorStatus?: number | null;
 }
 
 // -- telemetry folded from our x_* frames (simple_chat_agent/api/agent_telemetry.py) -------

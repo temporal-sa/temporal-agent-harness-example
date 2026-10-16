@@ -70,6 +70,12 @@ export function CodingSessionProvider({ children }: { children?: ReactNode }) {
 
 // -- the hook ----------------------------------------------------------------------------------
 
+interface LastError {
+  message: string;
+  code: string | null;
+  status: number | null;
+}
+
 let localIds = 0;
 const nextLocalId = () => `send-${Date.now().toString(36)}-${++localIds}`;
 
@@ -78,12 +84,17 @@ const asObject = <T,>(v: unknown): T | null => (typeof v === "object" && v !== n
 export function useCodingSession(sessionId: string, seed: SessionSeed = {}): CodingSession {
   const { reconnect } = useContext(ReconnectContext);
   // The core reports a failed submit through onError just before sendMessage resolves null.
-  const lastError = useRef<string | null>(null);
+  const lastError = useRef<LastError | null>(null);
   const h = useAgentSession({
     sessionId,
     transport,
     onError: (error: Error) => {
-      lastError.current = error.message;
+      const e = error as Error & { code?: unknown; status?: unknown };
+      lastError.current = {
+        message: error.message,
+        code: typeof e.code === "string" ? e.code : null,
+        status: typeof e.status === "number" ? e.status : error instanceof TypeError ? 0 : null,
+      };
     },
   });
   const latest = useRef(h);
@@ -169,8 +180,9 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
       lastError.current = null;
       const reply = await latest.current.sendMessage(handler, payload);
       const at = Date.now();
-      const error = lastError.current ?? "Couldn't send. Try again.";
-      const settle = (r: SendRecord) => (reply ? landed(r, at, reply.message_id) : advance(r, "failed", at, error));
+      const e = lastError.current as LastError | null;
+      const settle = (r: SendRecord) =>
+        reply ? landed(r, at, reply.message_id) : advance(r, "failed", at, e?.message ?? "Couldn't send.", { code: e?.code, status: e?.status });
       update(record.id, settle);
       return settle(record);
     },
@@ -191,8 +203,9 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
             reason: options.reason?.trim() ? options.reason.trim() : null,
           });
           const at = Date.now();
-          const error = lastError.current ?? "Couldn't send. Try again.";
-          const settle = (r: SendRecord) => (ok ? landed(r, at) : advance(r, "failed", at, error));
+          const e = lastError.current as LastError | null;
+          const settle = (r: SendRecord) =>
+            ok ? landed(r, at) : advance(r, "failed", at, e?.message ?? "Couldn't send.", { code: e?.code, status: e?.status });
           update(record.id, settle);
           return settle(record);
         }),

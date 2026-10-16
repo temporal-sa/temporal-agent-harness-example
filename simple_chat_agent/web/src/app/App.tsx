@@ -8,6 +8,7 @@ import { MetersStrip } from "../meters/MetersStrip";
 import {
   api,
   ApiError,
+  errorCopy,
   isUnreachable,
   summaryModel,
   useCodingSession,
@@ -19,6 +20,7 @@ import {
   type SessionSummary,
   type WorkbenchFocus,
 } from "../session";
+import { Dialog } from "../shell/Dialog";
 import { Header } from "../shell/Header";
 import { useMaxWidth, usePresenterMode } from "../shell/presenter";
 import { Rail, Sidebar, type SidebarProps } from "../shell/Sidebar";
@@ -93,7 +95,7 @@ function Shell({ me, auth, onUnreachable }: { me: Me; auth: AuthConfig; onUnreac
   const fail = useCallback(
     (err: unknown, fallback: string, set: (m: string) => void) => {
       if (isUnreachable(err)) onUnreachable();
-      else set(err instanceof Error && err.message ? err.message : fallback);
+      else set(errorCopy(err, fallback).text);
     },
     [onUnreachable],
   );
@@ -154,7 +156,7 @@ function Shell({ me, auth, onUnreachable }: { me: Me; auth: AuthConfig; onUnreac
       (err) => {
         if (!live) return;
         if (err instanceof ApiError && (err.status === 404 || err.status === 403)) {
-          setLookup({ id: selected, summary: null, missing: err.message || "No such session." });
+          setLookup({ id: selected, summary: null, missing: "No such session" });
         } else {
           fail(err, "Couldn't open that session. Try again.", (m) => setLookup({ id: selected, summary: null, missing: m }));
         }
@@ -288,7 +290,7 @@ function Layout({ parts, session, page = { kind: "landing" } }: { parts: ShellPa
       setDrawer(false);
       void parts.create("empty");
     },
-    footer: `Signed in as ${parts.me.username}${parts.auth.mode === "catalog" ? " through the catalog" : ""}`,
+    footer: footerText(parts.me.username, parts.auth.mode, parts.config?.session_ttl_days ?? null),
   };
 
   const title = parts.summary?.title ?? null;
@@ -332,8 +334,10 @@ function Layout({ parts, session, page = { kind: "landing" } }: { parts: ShellPa
     </div>
   );
 
+  const modal = drawer || (sheet !== null && !!session && phone);
   return (
     <div className="app">
+      <div className="app-frame" inert={modal}>
       <Header
         title={title}
         demo={demo}
@@ -349,24 +353,25 @@ function Layout({ parts, session, page = { kind: "landing" } }: { parts: ShellPa
         <div className="slot-side">{rail ? <Rail {...sideProps} onExpand={() => setDrawer(true)} /> : <Sidebar {...sideProps} />}</div>
 
         <main className="slot-main" id="main">
+          {/* Pinned above the transcript, so following new output never scrolls them away. */}
+          <div className="pinned-slot" data-slot="pinned">
+            {notices}
+            {session?.connection === "error" && (
+              <div className="notice" role="alert">
+                <span>Lost the live connection to this session. Nothing is lost in Temporal.</span>
+                <button type="button" className="btn secondary small" onClick={session.reconnect}>
+                  Reconnect
+                </button>
+              </div>
+            )}
+            {session?.connection === "reconnecting" && <div className="sys-line">Reconnecting…</div>}
+            {session && <WorkerBanner session={session} temporalUiTemplate={parts.config?.links?.temporal_ui?.url_template ?? null} />}
+          </div>
           {session && transcript ? (
-            <TranscriptPane value={transcript}>
-              {notices}
-              {session.connection === "error" && (
-                <div className="notice" role="alert">
-                  <span>Lost the live connection to this session. Nothing is lost in Temporal.</span>
-                  <button type="button" className="btn secondary small" onClick={session.reconnect}>
-                    Reconnect
-                  </button>
-                </div>
-              )}
-              {session.connection === "reconnecting" && <div className="sys-line">Reconnecting…</div>}
-              <WorkerBanner session={session} temporalUiTemplate={parts.config?.links?.temporal_ui?.url_template ?? null} />
-            </TranscriptPane>
+            <TranscriptPane value={transcript} />
           ) : (
             <div className="transcript-slot" data-slot="transcript">
               <div className="col">
-                {notices}
                 {page.kind === "landing" && <Landing creating={parts.creating} onCreate={parts.create} />}
                 {page.kind === "opening" && <p className="hint">Opening the session…</p>}
                 {page.kind === "missing" && <NotFound message={page.message} onBack={() => parts.select(null)} />}
@@ -405,48 +410,50 @@ function Layout({ parts, session, page = { kind: "landing" } }: { parts: ShellPa
           {session && !phone ? <Workbench session={session} variant="panel" focus={focus} initialTab={focus ? "changes" : undefined} /> : null}
         </div>
       </div>
+      </div>
 
       {drawer && (
-        <>
-          <div className="drawer-scrim" onClick={() => setDrawer(false)} aria-hidden="true" />
-          <div className="drawer" role="dialog" aria-modal="true" aria-label="Sessions and views">
-            <div className="drawer-head">
-              <span className="brand">
-                <span className="brand-mark" aria-hidden="true">
-                  T
-                </span>
-                Coding agent
+        <Dialog className="drawer" label="Sessions and views" onClose={() => setDrawer(false)}>
+          <div className="drawer-head">
+            <span className="brand">
+              <span className="brand-mark" aria-hidden="true">
+                T
               </span>
-              <span className="spacer" />
-              <button type="button" className="btn ghost small" onClick={() => setDrawer(false)} autoFocus>
-                Close
-              </button>
-            </div>
-            <div style={{ display: "grid", gridTemplateRows: "minmax(0,1fr) auto", minHeight: 0 }}>
-              <Sidebar {...sideProps} />
-              <ViewLinks views={views} className="drawer-views" />
-            </div>
+              Coding agent
+            </span>
+            <span className="spacer" />
+            <button type="button" className="btn ghost small" onClick={() => setDrawer(false)}>
+              Close
+            </button>
           </div>
-        </>
+          <div style={{ display: "grid", gridTemplateRows: "minmax(0,1fr) auto", minHeight: 0 }}>
+            <Sidebar {...sideProps} />
+            <ViewLinks views={views} className="drawer-views" />
+          </div>
+        </Dialog>
       )}
 
       {sheet && session && phone && (
-        <>
-          <div className="drawer-scrim" onClick={() => setSheet(null)} aria-hidden="true" />
-          <div className="sheet" role="dialog" aria-modal="true" aria-label="Workbench">
-            <div className="drawer-head">
-              <span>Workbench</span>
-              <span className="spacer" />
-              <button type="button" className="btn ghost small" onClick={() => setSheet(null)} autoFocus>
-                Close
-              </button>
-            </div>
-            <Workbench session={session} variant="sheet" focus={focus} initialTab={sheet ?? "changes"} />
+        <Dialog className="sheet" label="Workbench" onClose={() => setSheet(null)}>
+          <div className="drawer-head">
+            <span>Workbench</span>
+            <span className="spacer" />
+            <button type="button" className="btn ghost small" onClick={() => setSheet(null)}>
+              Close
+            </button>
           </div>
-        </>
+          <Workbench session={session} variant="sheet" focus={focus} initialTab={sheet ?? "changes"} />
+        </Dialog>
       )}
     </div>
   );
+}
+
+/** "Signed in through the catalog · sessions are kept 15 days" (wireframe sidebar footer). */
+export function footerText(username: string, mode: string, ttlDays: number | null): string {
+  const who = mode === "catalog" ? `Signed in as ${username} through the catalog` : `Signed in as ${username}`;
+  if (ttlDays === null || !(ttlDays > 0)) return who;
+  return `${who} · sessions are kept ${ttlDays} ${ttlDays === 1 ? "day" : "days"}`;
 }
 
 function runningCommand(session: CodingSession): boolean {
@@ -485,7 +492,13 @@ function Landing({ creating, onCreate }: { creating: "demo" | "empty" | null; on
       <p>A demo session starts the agent in a small refund service with one failing test. Ask it to find the cause, fix it, run the tests and commit.</p>
       <div className="acts">
         <button type="button" className="btn primary" disabled={creating !== null} onClick={() => void onCreate("demo")}>
-          {creating === "demo" ? "Setting up the demo…" : "+ New demo session"}
+          {creating === "demo" ? (
+            "Setting up the demo…"
+          ) : (
+            <>
+              <span aria-hidden="true">+ </span>New demo session
+            </>
+          )}
         </button>
         <button type="button" className="btn ghost" disabled={creating !== null} onClick={() => void onCreate("empty")}>
           {creating === "empty" ? "Starting…" : "New empty session"}

@@ -63,7 +63,7 @@ describe("Transcript", () => {
       message([], { id: "s2", handler: "set_posture", input: { posture: "auto" } }),
       message([call(), tool("read_file"), call("running"), text("half a thought")], { id: "m2", output: { text: "", interrupted: true } }),
     ]);
-    expect(html).toContain("Model changed to gpt-5.5 (openai) · applies from the next turn");
+    expect(html).toContain("Model changed to gpt-5.5 (openai) · applies from this turn");
     expect(html).toContain("Approvals: Auto mode");
     expect(html).toContain("Discarded: the reply after you pressed Stop (3 words)");
     expect(html).not.toContain("half a thought");
@@ -82,5 +82,22 @@ describe("Transcript", () => {
       message([], { id: "f1", handler: "forget_always_allowed", input: {}, output: { ok: true, detail: "These ask again: edit_file, write_file.", forgotten: ["edit_file", "write_file"] } }),
     ]);
     expect(html).toContain("These ask again: edit_file, write_file.");
+  });
+
+  it("words failures plainly and keeps the raw text behind Details (UX review M9)", () => {
+    const html = render([
+      message([call(), tool("run_command", { state: "failed", error: "ApplicationError: ExecutorUnavailable(503)" })], { status: "error", error: "Traceback: KeyError 'x'" }),
+      message([], { id: "s9", handler: "set_model", status: "error", error: "model_not_allowed: openai:gpt-9" }),
+    ]);
+    expect(html).toContain("The agent couldn&#x27;t finish this message.");
+    expect(html).toContain("<summary>Details</summary><pre>Traceback: KeyError &#x27;x&#x27;</pre>");
+    expect(html).toContain("The call failed. The agent sees the error and decides what to do next.");
+    expect(html).toContain("Couldn&#x27;t change the model to");
+    expect(html).not.toContain("model_not_allowed: openai:gpt-9</div>");
+  });
+
+  it("capitalizes Worker in the lost-attempt fold (UX review m12)", () => {
+    const html = render([message([call("running"), text("partial words"), call(), text("final")])]);
+    expect(html).toContain("Attempt 1 (Worker lost)");
   });
 });

@@ -26,8 +26,10 @@ export function StatusPill({ status }: { status: SessionStatus }) {
 }
 
 /** The sidebar's square for a session's status, with the status as its accessible name. */
-export function StatusDot({ status, closed = false }: { status: SessionStatus | null; closed?: boolean }) {
+export function StatusDot({ status, closed = false, decorative = false }: { status: SessionStatus | null; closed?: boolean; decorative?: boolean }) {
   const cls = closed ? "closed" : status === "running" ? "run" : status === "worker_unresponsive" ? "wait" : status === "waiting_for_you" ? "you" : "";
   const label = closed ? "Ended" : status ? STATUS_TEXT[status] : "Not open";
+  // The square repeats a status the row spells out; with `decorative` it stays out of the way.
+  if (decorative) return <span className={`dot ${cls}`} aria-hidden="true" />;
   return <span className={`dot ${cls}`} role="img" aria-label={label} title={label} />;
 }

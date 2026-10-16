@@ -111,6 +111,8 @@ export interface AgentConfig extends AgentCatalog {
   remember_allowed_classes?: string[];
   risk_classes?: string[];
   default_tool_risk_class?: string;
+  /** How long sessions are kept (days). */
+  session_ttl_days?: number;
 }
 
 export const getAgentConfig = () => request<AgentConfig>(`${AGENT_API_BASE}config`);

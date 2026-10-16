@@ -1,5 +1,5 @@
 import type { SessionStatus, SessionSummary } from "../session";
-import { StatusDot } from "./StatusPill";
+import { STATUS_TEXT, StatusDot } from "./StatusPill";
 
 export interface SidebarProps {
   sessions: SessionSummary[] | null;
@@ -26,6 +26,18 @@ export function relativeTime(epochSeconds: number, now = Date.now()): string {
   return new Date(epochSeconds * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
+/** The row's second line. The status is spelled out (not only the square's color) when known. */
+export function rowCaption(s: SessionSummary, status: SessionStatus | null, model: string): string {
+  const state = s.closed ? "Ended" : status ? STATUS_TEXT[status] : null;
+  return [state, model, relativeTime(s.created_at)].filter(Boolean).join(" · ");
+}
+
+/** The rail button's name: the title, then the status when known. */
+export function railLabel(s: SessionSummary, status: SessionStatus | null): string {
+  const state = s.closed ? "Ended" : status ? STATUS_TEXT[status] : null;
+  return state ? `${s.title} (${state})` : s.title;
+}
+
 function rowStatus(s: SessionSummary, p: SidebarProps): SessionStatus | null {
   return s.session_id === p.currentId ? p.currentStatus : null;
 }
@@ -34,7 +46,13 @@ export function Sidebar(p: SidebarProps) {
   return (
     <aside className="side" aria-label="Sessions">
       <button type="button" className="btn primary" onClick={p.onNewDemo} disabled={p.creating !== null}>
-        {p.creating === "demo" ? "Setting up the demo…" : "+ New demo session"}
+        {p.creating === "demo" ? (
+          "Setting up the demo…"
+        ) : (
+          <>
+            <span aria-hidden="true">+ </span>New demo session
+          </>
+        )}
       </button>
       <button type="button" className="btn ghost" onClick={p.onNewEmpty} disabled={p.creating !== null}>
         {p.creating === "empty" ? "Starting…" : "New empty session"}
@@ -59,11 +77,9 @@ function SessionList(p: SidebarProps) {
             aria-current={s.session_id === p.currentId ? "page" : undefined}
             onClick={() => p.onSelect(s.session_id)}
           >
-            <StatusDot status={rowStatus(s, p)} closed={s.closed} />
+            <StatusDot status={rowStatus(s, p)} closed={s.closed} decorative />
             <span className="t">{s.title}</span>
-            <small>
-              {p.modelName(s)} · {relativeTime(s.created_at)}
-            </small>
+            <small>{rowCaption(s, rowStatus(s, p), p.modelName(s))}</small>
           </button>
         </li>
       ))}
@@ -77,7 +93,7 @@ export function Rail(p: SidebarProps & { onExpand(): void }) {
   return (
     <aside className="rail-side" aria-label="Sessions">
       <button type="button" className="btn primary rail-new" onClick={p.onNewDemo} disabled={p.creating !== null} aria-label="New demo session" title="New demo session">
-        +
+        <span aria-hidden="true">+</span>
       </button>
       <ul className="sess">
         {(p.sessions ?? []).slice(0, 12).map((s) => (
@@ -86,11 +102,11 @@ export function Rail(p: SidebarProps & { onExpand(): void }) {
               type="button"
               className="rail-btn"
               aria-current={s.session_id === p.currentId ? "page" : undefined}
-              aria-label={s.title}
-              title={s.title}
+              aria-label={railLabel(s, rowStatus(s, p))}
+              title={railLabel(s, rowStatus(s, p))}
               onClick={() => p.onSelect(s.session_id)}
             >
-              <StatusDot status={rowStatus(s, p)} closed={s.closed} />
+              <StatusDot status={rowStatus(s, p)} closed={s.closed} decorative />
             </button>
           </li>
         ))}

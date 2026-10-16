@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { ApiError, type ToolPart } from "../session";
 import { DiffView, JudgeCards } from "../app/slots";
 import { useTranscript } from "./context";
+import { ErrorNote } from "./ErrorNote";
 import { argPreview, commandSummary, decisionBadge, miniDiff, pathsOf, toolBadge, type MiniDiff } from "./toolInfo";
 
 function useElapsed(running: boolean): number | null {
@@ -38,7 +39,7 @@ function StateBadge({ part, elapsed }: { part: ToolPart; elapsed: number | null 
     case "approved":
     case "running":
     case "awaiting_callback":
-      if (!workerAnswering) return <span className="exit wait">waiting for a worker{elapsed !== null ? ` · ${clock(elapsed)}` : ""}</span>;
+      if (!workerAnswering) return <span className="exit wait">waiting for a Worker{elapsed !== null ? ` · ${clock(elapsed)}` : ""}</span>;
       return <span className="exit run">running{elapsed !== null ? ` ${clock(elapsed)}` : ""}</span>;
     case "failed":
       return <span className="badge error">Failed</span>;
@@ -149,7 +150,9 @@ export function ToolRow({ part, nested = false }: { part: ToolPart; nested?: boo
         {liveLine && <div className="live">{liveLine}</div>}
         {diff && <DiffBlock diff={diff} path={paths[0] ?? ""} />}
         {part.state === "denied" && part.approval?.reason && <div className="live">Your reason: {part.approval.reason}</div>}
-        {part.state === "failed" && part.error && <div className="tool-error">{part.error}</div>}
+        {part.state === "failed" && part.error && (
+          <ErrorNote text="The call failed. The agent sees the error and decides what to do next." detail={part.error} />
+        )}
         {paths.length > 0 && (
           <div className="chips">
             {paths.slice(0, MAX_CHIPS).map((p) => (

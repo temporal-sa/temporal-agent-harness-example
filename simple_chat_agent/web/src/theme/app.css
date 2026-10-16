@@ -73,7 +73,8 @@ code, .mono { font-family: var(--mono); font-weight: 500; letter-spacing: -.02em
 .pill { flex-shrink: 0; font-size: .7em; padding: .25em .6em; }
 .pill.wait { background: var(--yellow); }
 .pill.idle { background: transparent; color: var(--slate-300); border: 1px solid var(--slate-500); }
-.pill.you { background: linear-gradient(255deg, #ff6bff 0%, #b664ff 100%); color: var(--off-white); }
+/* Dark text on the pink gradient: off-white on it measured 2.3–3.2:1 (UX review M5). */
+.pill.you { background: linear-gradient(255deg, #ff6bff 0%, #b664ff 100%); color: var(--space-black); }
 @media (prefers-reduced-motion: no-preference) { .pill { transition: background-color .2s, color .2s; } }
 
 .views { display: flex; gap: .2em; flex-shrink: 0; }
@@ -117,7 +118,11 @@ a.view:hover { border-color: var(--slate-500); }
 html[data-presenter="on"] .body { grid-template-columns: var(--rail-w) minmax(0, 1fr) var(--bench-w); }
 
 .slot-side { grid-area: side; min-height: 0; }
-.slot-main { grid-area: main; min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr) auto auto; }
+.slot-main { grid-area: main; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto auto; }
+.pinned-slot { display: grid; justify-items: center; gap: .5em; padding: 0 1.6em; }
+.pinned-slot:not(:empty) { padding-top: .8em; padding-bottom: .4em; border-bottom: 1px solid var(--border); background: var(--space-black); position: relative; z-index: 1; }
+.pinned-slot > * { width: 100%; max-width: 46em; }
+.app-frame { display: contents; }
 .slot-bench { grid-area: bench; min-height: 0; border-left: 1px solid var(--border); background: rgba(13, 13, 16, .72); display: grid; }
 .slot-sheet { display: none; }
 
@@ -208,8 +213,8 @@ html[data-presenter="on"] .body { grid-template-columns: var(--rail-w) minmax(0,
 
 /* ---------- Phone: one column, workbench as a bottom sheet ---------- */
 @media (max-width: 600px) {
-  .app { height: auto; min-height: 100dvh; overflow: visible; display: flex; flex-direction: column; }
-  .top { gap: .6em; padding: .4em .6em; position: sticky; top: 0; z-index: 10; }
+  .app { height: 100dvh; overflow: hidden; display: flex; flex-direction: column; }
+  .top { gap: .6em; padding: .4em .6em; }
   .menu-btn { display: grid; }
   .top .brand, .top .views, .top .toggle { display: none; }
   .meters-full { display: none; }
@@ -217,12 +222,15 @@ html[data-presenter="on"] .body { grid-template-columns: var(--rail-w) minmax(0,
   .meters-compact b { color: var(--off-white); font-weight: 500; }
   .meters-compact b.g { color: var(--green); }
   .meters-compact .nr { color: var(--slate-300); }
-  .body, .body.rail, html[data-presenter="on"] .body { display: flex; flex-direction: column; flex: 1; }
+  .body, .body.rail, html[data-presenter="on"] .body { display: flex; flex-direction: column; flex: 1; min-height: 0; }
   .slot-side, .slot-bench { display: none; }
-  .slot-main { flex: 1; display: grid; grid-template-rows: minmax(0, 1fr) auto auto auto; }
-  .transcript-slot { overflow: visible; padding: .9em .8em 0; }
+  .slot-main { flex: 1; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto auto; }
+  .pinned-slot { padding: 0 .6em; }
+  .pinned-slot:not(:empty) { padding-top: .5em; }
+  .decision-slot { max-height: 45dvh; overflow-y: auto; }
+  .transcript-slot { overflow-y: auto; padding: .9em .8em 0; }
   .decision-slot { padding: 0 .6em; }
-  .composer-slot { padding: .5em .6em .7em; position: sticky; bottom: 0; background: rgba(13, 13, 16, .95); }
+  .composer-slot { padding: .5em .6em .7em; background: rgba(13, 13, 16, .95); }
   .slot-sheet { display: flex; gap: .5em; align-items: center; border-top: 1px solid var(--uv-light); background: rgba(13, 13, 16, .95); padding: .5em .8em; }
   .sheet-grab { font-family: var(--mono); font-size: .74em; font-weight: 500; padding: .55em .8em; border: 1px solid var(--uv-light); min-height: 44px; display: inline-flex; align-items: center; gap: .4em; }
   .btn, .toggle, .stop, .sess-row, .view { min-height: 44px; }
@@ -373,3 +381,29 @@ button.path:hover { border-color: var(--uv-light); }
 
 .msg-files { list-style: none; margin: .5em 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: .35em; justify-content: flex-end; }
 .msg-files .path { max-width: 100%; overflow-wrap: anywhere; }
+
+/* Meters stay on one line (UX review m9): the model label gives way first. */
+.meters { flex-wrap: nowrap; }
+.meter-list { flex-wrap: nowrap; flex-shrink: 0; }
+.meters .model { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.meter dd.neutral, .meters-compact b.neutral { color: var(--slate-300); }
+@media (max-width: 1600px) { .meter-list { gap: 1.6em; } }
+
+/* Failures: plain copy, raw text behind Details (UX review M9). Red marks a real failure. */
+.error-note { border-left: 2px solid var(--red); padding: .4em .8em; font-size: .85em; color: var(--indigo-100); display: grid; gap: .3em; }
+.error-note summary { cursor: pointer; color: var(--slate-300); font-size: .9em; }
+.error-note pre { margin: .3em 0 0; font-family: var(--mono); font-size: .85em; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--slate-300); }
+
+/* Explorer questions wrap to two lines instead of being cut off where there's room. */
+.subagent .head .q { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+
+@media (max-width: 600px) {
+  :is(.transcript-slot, .composer-slot) summary { min-height: 44px; display: flex; align-items: center; }
+  /* The composer's controls stay on one row at 320 px (wireframe Frame 6). */
+  .composer .bar { flex-wrap: nowrap; gap: .3em; }
+  .composer .bar .menu-root { min-width: 0; flex: 0 1 auto; }
+  .composer .bar .ctl { min-width: 44px; max-width: 100%; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .composer .bar > .ctl { flex: 0 0 auto; }
+  .composer .bar .ctl .note, .composer .bar .ctl-text { display: none; }
+  .composer .bar .split .btn { padding-inline: .5em; }
+}

@@ -20,9 +20,8 @@ export function Unreachable({ onRetry }: { onRetry(): void }) {
   return (
     <main className="page-state">
       <div className="card" role="alert">
-        <span className="pill idle">Offline</span>
         <h1>Can't reach the app</h1>
-        <p>Your sessions are safe in Temporal. We'll retry every {RETRY_SECONDS} seconds.</p>
+        <p>The app's API isn't answering. Workflows keep running in Temporal. Retrying every {RETRY_SECONDS} seconds.</p>
         <button type="button" className="btn secondary small" onClick={onRetry}>
           Retry now
         </button>

@@ -14,6 +14,11 @@ export interface MeterValues {
   tokensReported: boolean;
   cache: string;
   cacheReported: boolean;
+  /** "good": some input came from cache (green, billed at a discount); "neutral": nothing
+   *  did yet, or no calls yet; "nr": not reported. */
+  cacheTone: "good" | "neutral" | "nr";
+  /** Said after the figure when it needs it ("nothing read from cache yet"). */
+  cacheNote: string | null;
   cacheByProvider: string;
   recoveries: string;
 }
@@ -24,10 +29,12 @@ function tokensValue(t: UsageTotals): { text: string; reported: boolean } {
   return { text: `${tokensOrNotReported(t.input)} in / ${tokensOrNotReported(t.output)} out`, reported: true };
 }
 
-function cacheValue(t: UsageTotals): { text: string; reported: boolean } {
-  if (t.calls === 0) return { text: "–", reported: true };
+function cacheValue(t: UsageTotals): { text: string; reported: boolean; tone: MeterValues["cacheTone"]; note: string | null } {
+  if (t.calls === 0) return { text: "no model calls yet", reported: true, tone: "neutral", note: null };
   const text = percentOrNotReported(t.cacheShare);
-  return { text, reported: text !== NOT_REPORTED };
+  if (text === NOT_REPORTED) return { text, reported: false, tone: "nr", note: null };
+  if (!t.cacheRead) return { text, reported: true, tone: "neutral", note: "nothing read from cache yet" };
+  return { text, reported: true, tone: "good", note: "billed at a discount" };
 }
 
 /** What the strip shows, as text, so the "not reported" rule is testable without a DOM. */
@@ -52,6 +59,8 @@ export function meterValues(telemetry: SessionTelemetry): MeterValues {
     tokensReported: tokens.reported,
     cache: cache.text,
     cacheReported: cache.reported,
+    cacheTone: cache.tone,
+    cacheNote: cache.note,
     cacheByProvider,
     recoveries: String(recoveryTotals.count),
   };
@@ -59,36 +68,43 @@ export function meterValues(telemetry: SessionTelemetry): MeterValues {
 
 export function MetersStrip({ telemetry, modelLabel }: { telemetry: SessionTelemetry; modelLabel: string | null }) {
   const v = meterValues(telemetry);
+  const cacheClass = v.cacheTone === "good" ? "g" : v.cacheTone === "nr" ? "nr" : "neutral";
   return (
     <>
       <div className="meters meters-full">
-      <dl className="meter-list" aria-label="Session meters">
-        {v.hero !== null && (
-          <div className="meter hero">
-            <dt>Work kept after worker loss (this session)</dt>
-            <dd className={v.heroConfirmed ? undefined : "checking"} aria-live="polite">
-              {v.hero}
-            </dd>
+        <dl className="meter-list" aria-label="Session meters">
+          {v.hero !== null && (
+            <div className="meter hero">
+              <dt>Work kept after Worker loss (this session)</dt>
+              <dd className={v.heroConfirmed ? undefined : "checking"}>{v.hero}</dd>
+            </div>
+          )}
+          <div className="meter">
+            <dt>Session tokens</dt>
+            <dd className={v.tokensReported ? undefined : "nr"}>{v.tokens}</dd>
           </div>
-        )}
-        <div className="meter">
-          <dt>Session tokens</dt>
-          <dd className={v.tokensReported ? undefined : "nr"}>{v.tokens}</dd>
-        </div>
-        <div className="meter" title={v.cacheByProvider || undefined}>
-          <dt>Input read from provider cache</dt>
-          <dd className={v.cacheReported ? "g" : "nr"}>{v.cache}</dd>
-          {v.cacheReported && v.cache !== "–" && <dd className="sub">billed at a discount</dd>}
-        </div>
-        <div className="meter">
-          <dt>Recoveries</dt>
-          <dd>{v.recoveries}</dd>
-        </div>
-      </dl>
+          <div className="meter" title={v.cacheByProvider || undefined}>
+            <dt>Input read from provider cache</dt>
+            <dd className={cacheClass}>{v.cache}</dd>
+            {v.cacheNote && <dd className="sub">{v.cacheTone === "neutral" ? `· ${v.cacheNote}` : v.cacheNote}</dd>}
+          </div>
+          <div className="meter">
+            <dt>Recoveries</dt>
+            <dd>{v.recoveries}</dd>
+          </div>
+        </dl>
         <span className="spacer" />
-        {modelLabel && <span className="model">{modelLabel}</span>}
+        {modelLabel && (
+          <span className="model" title={modelLabel}>
+            {modelLabel}
+          </span>
+        )}
+        {/* Mounted from the start, so the first recovery is announced. */}
+        <span className="sr-only" aria-live="polite">
+          {v.hero !== null ? `Work kept after Worker loss: ${v.hero}` : ""}
+        </span>
       </div>
-      <div className="meters-compact" aria-label="Session meters">
+      <div className="meters-compact" role="group" aria-label="Session meters">
         {v.hero !== null && (
           <span>
             Kept <b className="g">{v.hero}</b>
@@ -98,7 +114,8 @@ export function MetersStrip({ telemetry, modelLabel }: { telemetry: SessionTelem
           <b className={v.tokensReported ? undefined : "nr"}>{v.tokens}</b>
         </span>
         <span>
-          <b className={v.cacheReported ? "g" : "nr"}>{v.cache}</b> cached
+          <b className={cacheClass}>{v.cache}</b>
+          {v.cacheTone !== "neutral" || v.cacheNote ? " cached" : ""}
         </span>
         <span>
           <b>{v.recoveries}</b> {v.recoveries === "1" ? "recovery" : "recoveries"}

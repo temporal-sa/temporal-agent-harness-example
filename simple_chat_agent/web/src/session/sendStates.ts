@@ -48,6 +48,8 @@ export function startRecord(
     phase: "sending",
     at: { sending: now },
     error: null,
+    errorCode: null,
+    errorStatus: null,
   };
 }
 
@@ -55,10 +57,23 @@ export function startRecord(
  * Move a record forward to `phase`, stamping every phase it skips with the same time. Never
  * moves backward, and a settled record (done or failed) doesn't change.
  */
-export function advance(record: SendRecord, phase: SendPhase, now: number, error: string | null = null): SendRecord {
+export function advance(
+  record: SendRecord,
+  phase: SendPhase,
+  now: number,
+  error: string | null = null,
+  why: { code?: string | null; status?: number | null } = {},
+): SendRecord {
   if (isSettled(record.phase)) return record;
   if (phase === "failed") {
-    return { ...record, phase, at: { ...record.at, failed: now }, error: error ?? "The request failed." };
+    return {
+      ...record,
+      phase,
+      at: { ...record.at, failed: now },
+      error: error ?? "The request failed.",
+      errorCode: why.code ?? null,
+      errorStatus: why.status ?? null,
+    };
   }
   if (ORDER[phase] <= ORDER[record.phase]) return record;
   const at = { ...record.at };
@@ -129,12 +144,12 @@ export function observe(records: readonly SendRecord[], view: StreamView, now: n
       const phase = part ? approvalPhase(part) : null;
       const rejected = r.toolId ? view.approvalRejection?.(r.toolId) : undefined;
       if (rejected && rejected.code === ALREADY_RESOLVED) updated = advance(r, "done", now);
-      else if (rejected && !phase) updated = advance(r, "failed", now, rejected.message);
+      else if (rejected && !phase) updated = advance(r, "failed", now, rejected.message, { code: rejected.code });
       else if (phase) updated = advance(r, phase, now);
     } else if (r.messageId) {
       const rejected = view.rejection(r.messageId);
       if (rejected) {
-        updated = advance(r, "failed", now, rejected.message);
+        updated = advance(r, "failed", now, rejected.message, { code: rejected.code });
       } else {
         const m = view.message(r.messageId);
         const phase = m ? messagePhase(m) : null;

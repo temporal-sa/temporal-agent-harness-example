@@ -8,10 +8,13 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { AgentConfig, Attachment, CodingSession, ModelChoice, Posture, SendRecord } from "../session";
 import { MAX_ATTACHMENTS } from "../session/derive";
+import { errorCopy } from "../session/errors";
 import { Menu } from "./Menu";
 import {
   alwaysApprovedText,
   choiceLabel,
+  composerMode,
+  escapeStops,
   effortsFor,
   modelName,
   pickerState,
@@ -26,6 +29,7 @@ interface Upload {
   state: "uploading" | "ready" | "failed";
   attachment?: Attachment;
   error?: string;
+  detail?: string | null;
 }
 
 function ModelPicker({ session, config }: { session: CodingSession; config: AgentConfig | null }) {
@@ -48,6 +52,7 @@ function ModelPicker({ session, config }: { session: CodingSession; config: Agen
   return (
     <Menu
       label="Model"
+      buttonLabel={`Model: ${choiceLabel(config, shown)}`}
       buttonClass={`ctl on${state.failed ? " bad" : ""}`}
       buttonContent={
         <>
@@ -130,6 +135,15 @@ function PostureMenu({ session, config }: { session: CodingSession; config: Agen
   const [clearId, setClearId] = useState<string | null>(null);
   const clearRecord = clearId ? session.sends.find((r) => r.id === clearId) : undefined;
   const clearing = clearId !== null && (!clearRecord || clearRecord.phase === "sending" || clearRecord.phase === "in_temporal");
+  // The menu stays open through Clear; the agent's reply replaces "Clearing…".
+  const clearMessage = clearRecord?.messageId ? session.messages.find((m) => m.id === clearRecord.messageId) : undefined;
+  const clearOut = clearMessage?.output as { detail?: unknown } | null | undefined;
+  const clearReply =
+    clearRecord?.phase === "failed"
+      ? errorCopy({ code: clearRecord.errorCode, status: clearRecord.errorStatus, message: clearRecord.error }, "Couldn't clear them. Try again.").text
+      : typeof clearOut?.detail === "string"
+        ? clearOut.detail
+        : null;
   async function clear() {
     setClearId("pending");
     const r = await session.forgetAlwaysAllowed();
@@ -145,6 +159,7 @@ function PostureMenu({ session, config }: { session: CodingSession; config: Agen
   return (
     <Menu
       label="Approvals"
+      buttonLabel={`Approvals: ${postureLabel(config, current)}`}
       buttonClass={`ctl${current === "auto" ? " auto" : ""}${failed ? " bad" : ""}`}
       buttonContent={
         <>
@@ -192,16 +207,18 @@ function PostureMenu({ session, config }: { session: CodingSession; config: Agen
                   role="menuitem"
                   className="link-btn"
                   disabled={clearing}
-                  onClick={() => {
-                    close();
-                    void clear();
-                  }}
+                  onClick={() => void clear()}
                 >
                   {clearing ? "Clearing…" : "Clear"}
                 </button>
               </>
             )}
           </div>
+          {clearReply && (
+            <div className="menu-foot hint" role="status">
+              {clearReply}
+            </div>
+          )}
           <div className="menu-foot hint">Applies to new tool calls. Calls already waiting stay with you.</div>
         </>
       )}
@@ -214,28 +231,31 @@ export function Composer({ session, config }: { session: CodingSession; config: 
   const [uploads, setUploads] = useState<Upload[]>([]);
   const [stopping, setStopping] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
-  const busy = session.agentStatus === "busy";
+  const mode = composerMode(session);
+  // "waiting" reads as idle: the card says nothing is running.
+  const busy = mode === "running";
+  const turnOpen = session.agentStatus === "busy";
   const typed = draft.trim().length > 0;
   const ready = uploads.filter((u) => u.state === "ready" && u.attachment).map((u) => u.attachment!);
   const uploading = uploads.some((u) => u.state === "uploading");
 
   useEffect(() => {
-    if (!busy) setStopping(false);
-  }, [busy]);
+    if (!turnOpen) setStopping(false);
+  }, [turnOpen]);
 
   function stop() {
-    if (!busy || stopping) return;
+    if (!turnOpen || stopping) return;
     setStopping(true);
     void session.interrupt();
   }
 
   useEffect(() => {
-    if (!busy) return;
+    if (mode !== "running") return;
     const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key === "Escape" && !e.defaultPrevented) stop();
+      if (e.key === "Escape" && escapeStops(mode, e.target instanceof Element ? e.target : document.activeElement, e.defaultPrevented)) stop();
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
   });
 
   function take(): string | null {
@@ -275,8 +295,8 @@ export function Composer({ session, config }: { session: CodingSession; config: 
         const attachment = await session.attach(file);
         setUploads((u) => u.map((x) => (x.key === key ? { ...x, state: "ready", attachment } : x)));
       } catch (err) {
-        const error = err instanceof Error ? err.message : "Upload failed.";
-        setUploads((u) => u.map((x) => (x.key === key ? { ...x, state: "failed", error } : x)));
+        const copy = errorCopy(err, "Couldn't attach this file. Try again.");
+        setUploads((u) => u.map((x) => (x.key === key ? { ...x, state: "failed", error: copy.text, detail: copy.detail } : x)));
       }
     }
     if (fileInput.current) fileInput.current.value = "";
@@ -299,8 +319,8 @@ export function Composer({ session, config }: { session: CodingSession; config: 
         {uploads.length > 0 && (
           <ul className="uploads" aria-label="Attachments">
             {uploads.map((u) => (
-              <li key={u.key} className={`path${u.state === "failed" ? " bad" : ""}`}>
-                {u.name} · {u.state === "uploading" ? "uploading…" : u.state === "ready" ? "attached" : `not attached: ${u.error}`}
+              <li key={u.key} className={`path${u.state === "failed" ? " bad" : ""}`} title={u.detail ?? undefined}>
+                {u.name} · {u.state === "uploading" ? "uploading…" : u.state === "ready" ? "attached" : `not attached. ${u.error}`}
                 <button type="button" className="link-btn" aria-label={`Remove ${u.name}`} onClick={() => setUploads((x) => x.filter((y) => y.key !== u.key))}>
                   ✕
                 </button>
@@ -311,8 +331,9 @@ export function Composer({ session, config }: { session: CodingSession; config: 
         <div className="bar">
           <ModelPicker session={session} config={config} />
           <PostureMenu session={session} config={config} />
-          <button type="button" className="ctl" onClick={() => fileInput.current?.click()} disabled={uploads.length >= MAX_ATTACHMENTS}>
-            + File
+          <button type="button" className="ctl" onClick={() => fileInput.current?.click()} disabled={uploads.length >= MAX_ATTACHMENTS} aria-label="Attach a file">
+            <span aria-hidden="true">+</span>
+            <span className="ctl-text"> File</span>
           </button>
           <input ref={fileInput} type="file" multiple hidden onChange={(e) => void onFiles(e.target.files)} />
           <span className="spacer" />
@@ -331,6 +352,11 @@ export function Composer({ session, config }: { session: CodingSession; config: 
                 Steer now
               </button>
             </span>
+          )}
+          {mode === "waiting" && (
+            <button type="button" className="btn ghost small" onClick={stop} disabled={stopping}>
+              {stopping ? "Stopping…" : "Stop"}
+            </button>
           )}
           {busy ? (
             <button type="button" className="stop" onClick={stop} disabled={stopping}>

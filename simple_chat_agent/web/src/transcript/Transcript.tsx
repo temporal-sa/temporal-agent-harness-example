@@ -2,12 +2,14 @@
 // Chat messages show the user's text and everything the agent did for it; control messages
 // (model, posture, steer, stop) show as short lines.
 
-import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import type { CodingSession, Message, SendRecord, TurnRecovery } from "../session";
 import { RecoveryDivider, SendStateTrail } from "../app/slots";
 import { TranscriptContext, useTranscript, type TranscriptContextValue } from "./context";
 import { buildItems, type Item } from "./items";
 import { StreamingMarkdown } from "./Markdown";
+import { ErrorNote } from "./ErrorNote";
+import { errorCopy } from "../session/errors";
 import { SubagentCard } from "./SubagentCard";
 import { Thinking } from "./Thinking";
 import { ToolGroup, ToolRow } from "./ToolRow";
@@ -101,7 +103,7 @@ function ItemView({ item, message, agentId }: { item: Item; message: Message; ag
         </div>
       );
     case "attempt":
-      return <Folded label={`Attempt ${item.attempt} (worker lost) · ${item.words} words of partial reply, replaced below`} text={item.text} />;
+      return <Folded label={`Attempt ${item.attempt} (Worker lost) · ${item.words} words of partial reply, replaced below`} text={item.text} />;
     case "discarded":
       return <Folded label={`Discarded: the reply after you pressed Stop (${item.words} words)`} text={item.text} />;
     case "recovery":
@@ -140,15 +142,19 @@ function ChatTurn({ message, recoveries }: { message: Message; recoveries: TurnR
       {/* A reply that never streamed (e.g. a checkpoint or an explained failure). */}
       {!hasText && finalText && <StreamingMarkdown text={finalText} streaming={false} />}
       {message.status === "error" && message.error && (
-        <div className="notice err" role="alert">
-          {message.error}
-        </div>
+        <ErrorNote alert text="The agent couldn't finish this message. Its work so far is kept in Temporal; send it again or ask for something else." detail={message.error} />
       )}
     </>
   );
 }
 
-function ControlLine({ message }: { message: Message }) {
+/** The model-change line: "applies from the next turn" until a later turn has started. */
+export function modelLine(name: string, failed: boolean, nextTurnStarted: boolean): string {
+  if (failed) return `Couldn't change the model to ${name}.`;
+  return `Model changed to ${name} · ${nextTurnStarted ? "applies from this turn" : "applies from the next turn"}`;
+}
+
+function ControlLine({ message, nextTurnStarted }: { message: Message; nextTurnStarted: boolean }) {
   const { session, modelLabel, postureLabel } = useTranscript();
   const input = (isObj(message.input) ? message.input : {}) as Record<string, unknown>;
   const record = session.sendFor({ messageId: message.id });
@@ -158,15 +164,15 @@ function ControlLine({ message }: { message: Message }) {
       const m = isObj(input.model) ? input.model : {};
       const name = modelLabel(String(m.provider ?? ""), String(m.model ?? ""));
       return (
-        <div className="sys-line">
-          {failed ? `Couldn't change the model to ${name}: ${message.error ?? ""}` : `Model changed to ${name} · applies from the next turn`}
+        <div className="sys-line" title={failed ? message.error ?? undefined : undefined}>
+          {modelLine(name, failed, nextTurnStarted)}
         </div>
       );
     }
     case "set_posture":
       return (
         <div className="sys-line">
-          {failed ? `Couldn't change approvals: ${message.error ?? ""}` : `Approvals: ${postureLabel(String(input.posture ?? ""))}`}
+          {failed ? "Couldn't change approvals. The previous setting still applies." : `Approvals: ${postureLabel(String(input.posture ?? ""))}`}
         </div>
       );
     case "steer":
@@ -186,7 +192,7 @@ function ControlLine({ message }: { message: Message }) {
       const out = isObj(message.output) ? message.output : null;
       const detail = typeof out?.detail === "string" ? out.detail : null;
       const text = failed
-        ? `Couldn't clear always-approved tools: ${message.error ?? ""}`
+        ? "Couldn't clear always-approved tools. They still apply."
         : message.status === "done"
           ? detail ?? "Always approve cleared."
           : "Clearing always-approved tools…";
@@ -212,8 +218,11 @@ export function Transcript() {
       {session.messages.length === 0 && session.unsent.length === 0 && (
         <p className="hint">Ask the agent to do something in its workspace.</p>
       )}
-      {session.messages.map((m) => {
-        if (m.handler !== "chat") return <ControlLine key={m.id} message={m} />;
+      {session.messages.map((m, i) => {
+        if (m.handler !== "chat") {
+          const nextTurnStarted = session.messages.slice(i + 1).some((n) => n.handler === "chat" && (n.startedAt !== null || n.status === "running" || n.status === "done"));
+          return <ControlLine key={m.id} message={m} nextTurnStarted={nextTurnStarted} />;
+        }
         let recs: TurnRecovery[] = [];
         if (m.turnNumber !== null && !placed.has(m.turnNumber)) {
           recs = recoveriesByTurn.get(m.turnNumber) ?? [];
@@ -238,7 +247,9 @@ function UnsentMessage({ message, session }: { message: Message; session: Coding
       </div>
       {message.status === "error" ? (
         <div className="notice err" role="alert">
-          Not sent: {message.error}
+          <span>
+            Not sent. {errorCopy(record ? { code: record.errorCode, status: record.errorStatus, message: record.error } : { message: message.error }, "Check your connection and try again.").text}
+          </span>
           <button type="button" className="btn ghost small" onClick={() => session.dismissUnsent(message.id)}>
             Dismiss
           </button>
@@ -252,7 +263,7 @@ function UnsentMessage({ message, session }: { message: Message; session: Coding
 
 /** The scrolling column. Follows new content unless the user has scrolled up, and then
  *  offers a way back. */
-export function TranscriptPane({ value, children }: { value: TranscriptContextValue; children?: ReactNode }) {
+export function TranscriptPane({ value }: { value: TranscriptContextValue }) {
   const scroller = useRef<HTMLDivElement>(null);
   const [following, setFollowing] = useState(true);
   const followingRef = useRef(true);
@@ -274,7 +285,6 @@ export function TranscriptPane({ value, children }: { value: TranscriptContextVa
     <TranscriptContext.Provider value={value}>
       <div className="transcript-slot" data-slot="transcript" ref={scroller} onScroll={onScroll} aria-live="off">
         <div className="col">
-          {children}
           <Transcript />
         </div>
         {!following && (

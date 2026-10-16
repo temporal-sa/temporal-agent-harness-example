@@ -6,11 +6,14 @@ import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode 
 
 export function Menu({
   label,
+  buttonLabel,
   buttonClass,
   buttonContent,
   children,
 }: {
   label: string;
+  /** The button's accessible name, e.g. "Model: GPT-5.5". */
+  buttonLabel?: string;
   buttonClass: string;
   buttonContent: ReactNode;
   children(close: () => void): ReactNode;
@@ -59,6 +62,7 @@ export function Menu({
         type="button"
         className={buttonClass}
         aria-haspopup="menu"
+        aria-label={buttonLabel}
         aria-expanded={open}
         aria-controls={open ? id : undefined}
         onClick={() => setOpen((v) => !v)}
