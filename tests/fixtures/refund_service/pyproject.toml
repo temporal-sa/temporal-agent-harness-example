@@ -1,0 +1,14 @@
+[project]
+name = "refund-service"
+version = "0.3.0"
+description = "Order refunds for the storefront."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

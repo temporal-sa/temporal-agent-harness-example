@@ -61,6 +61,9 @@ class CarriedState(BaseModel):
     recent_request_ids: list[str] = Field(default_factory=list)
     model: ModelChoice = Field(default_factory=ModelChoice)
     pending_model: ModelChoice | None = None
+    # Observable state (plan, changes, workspace) as JSON, restored into the new run.
+    observable: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    steer_queue: list[str] = Field(default_factory=list)
     # Front-door messages that arrived during the handoff; the next run admits them first.
     pending_messages: list[FrontDoorMessage] = Field(default_factory=list)
     # The remembered allow-list ("always allow") survives through AgentConfig.approval_policy,
@@ -74,6 +77,11 @@ class CodingAgentInit(BaseModel):
     session_id: str = ""
     model: ModelChoice = Field(default_factory=ModelChoice)
     posture: Posture = "trust_safe"
+    # Where the session runs (catalog rules are stricter) and which auto-mode judge it uses.
+    # Decided by the API at session start and carried as data, never read from the
+    # environment in workflow code.
+    environment: Literal["catalog", "local"] = "catalog"
+    judge: Literal["llm", "jev"] = "llm"
     workspace_id: str = ""
     depth: int = 0
     system_prompt: str | None = None
@@ -82,6 +90,8 @@ class CodingAgentInit(BaseModel):
     # test-only tools such as wait_seconds.
     force_continue_as_new_after_turns: int | None = None
     test_tools: bool = False
+    # Test hook: a low history-event cap to exercise the checkpoint (P1 step 1.8a).
+    test_history_event_cap: int | None = None
 
 
 class ChatMessage(BaseModel):
@@ -95,12 +105,27 @@ class ChatReply(BaseModel):
 
     text: str
     interrupted: bool = False
+    # Set when the turn stopped early to keep the workflow inside Temporal's history limits
+    # (PRD A20). The agent continues as new; the user says "continue" to carry on.
+    checkpoint: str | None = None
 
 
 class SetModel(BaseModel):
     """Switch provider and/or model. Applies from the next turn."""
 
     model: ModelChoice
+
+
+class SteerMessage(BaseModel):
+    """Guidance for the turn in progress, injected before the agent's next model call."""
+
+    text: str
+
+
+class SetPosture(BaseModel):
+    """Change how tool calls are approved. Applies to new calls; pending ones stay with you."""
+
+    posture: Posture
 
 
 class InterruptRequest(BaseModel):

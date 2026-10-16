@@ -19,19 +19,18 @@ from temporalio.exceptions import ApplicationError
 with workflow.unsafe.imports_passed_through():
     from pydantic_ai.capabilities import Hooks
     from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
-    from temporal_agent_harness.ai_sdks.pydantic_ai_harness import HarnessDeps
     from temporal_agent_harness.harness import agent
     from temporal_agent_harness.harness.agent_protocol import (
         AgentConfig,
         AgentMessage,
         MidTurn,
         ToolApprovalDecision,
-        ToolApprovalPolicy,
     )
     from temporal_agent_harness.harness.agent_workflow import AgentWorkflowRunner, MessageContext
     from temporalio.contrib.workflow_streams import WorkflowStream
 
-    from simple_chat_agent.agent import harness_ext
+    from simple_chat_agent.agent import approvals, context, harness_ext
+    from simple_chat_agent.agent.budget import HistoryBudget
     from simple_chat_agent.agent.contracts import (
         AGENT_WORKFLOW_TYPE,
         CARRIED_STATE_VERSION,
@@ -46,10 +45,32 @@ with workflow.unsafe.imports_passed_through():
         FrontDoorMessage,
         InterruptRequest,
         ModelChoice,
-        Posture,
         SetModel,
+        SetPosture,
+        SteerMessage,
     )
-    from simple_chat_agent.agent.runtime import CODING_AGENT, DEFAULT_MODEL, is_allowed_model, model_settings
+    from simple_chat_agent.agent.prompts import CODING_AGENT_INSTRUCTIONS
+    from simple_chat_agent.agent.runtime import (
+        CODING_AGENT,
+        DEFAULT_MODEL,
+        ENABLED_RESEARCH_TOOLS,
+        CodingDeps,
+        is_allowed_model,
+        model_settings,
+    )
+    from simple_chat_agent.agent.state import (
+        STATE_TOOLS,
+        ChangesState,
+        PlanState,
+        WorkspaceState,
+        fold_tool_result,
+    )
+    from simple_chat_agent.agent.subagents import (
+        MAX_CONCURRENT_SUBAGENTS,
+        SubagentInit,
+        subagent_tools,
+    )
+    from simple_chat_agent.agent.tools.artifacts import ARTIFACT_TOOLS
     from simple_chat_agent.agent.tools.workspace import TEST_TOOLS, WORKSPACE_TOOLS
 
 # Wake an idle session this often so a deploy can move it to the new version (PRD A18).
@@ -64,21 +85,16 @@ INTERRUPTED_TOOL_NOTE = (
 )
 
 
-def posture_policy(posture: Posture) -> ToolApprovalPolicy:
-    if posture == "ask_everything":
-        return ToolApprovalPolicy.always_require_human_approval()
-    if posture == "never_ask":
-        return ToolApprovalPolicy.dangerously_skip_all()
-    if posture == "auto":
-        return ToolApprovalPolicy.auto_mode(pre_approve_inherently_safe=True)
-    return ToolApprovalPolicy.allow_inherently_safe()
-
-
 # Versioning behavior comes from the worker's deployment config (PINNED by default), so the
 # same class also runs on an unversioned local worker.
 @workflow.defn(name=AGENT_WORKFLOW_TYPE)
 class CodingAgent:
     """A coding agent that works in one sandboxed workspace."""
+
+    # Observable state: the UI's Plan and Changes panels (PRD A13).
+    plan = agent.state(PlanState)
+    changes = agent.state(ChangesState)
+    workspace = agent.state(WorkspaceState)
 
     @workflow.init
     def __init__(self, config: AgentConfig, data: CodingAgentInit) -> None:
@@ -92,12 +108,28 @@ class CodingAgent:
                 f"understands (v{CARRIED_STATE_VERSION}); waiting for a compatible version"
             )
         self._data = data
+        # Restore observable state before the runner attaches it, so the first snapshot the
+        # new run publishes already holds it.
+        for name, ref in (("plan", self.plan), ("changes", self.changes), ("workspace", self.workspace)):
+            if name in carried.observable:
+                ref.set(type(ref.current).model_validate(carried.observable[name]))
+        self._steer: list[str] = list(carried.steer_queue)
         self._stream = WorkflowStream(prior_state=carried.stream_state)
+        criteria = approvals.default_criteria(data.environment)
+        if data.environment == "catalog":
+            # In the catalog the operator's criteria are the only criteria: a caller can't
+            # retarget, say, run_command to a class the judge may approve.
+            config = config.model_copy(update={"auto_approval_criteria": None})
         self._runner = AgentWorkflowRunner(
             config,
             stream=self._stream,
-            approval_policy_default=posture_policy(data.posture),
+            approval_policy_default=approvals.policy_for(data.posture, data.environment),
+            auto_approval_criteria_default=criteria,
+            # Always wired, so switching to auto mode mid-session works (the harness rejects
+            # an auto-mode policy without an evaluator).
+            auto_mode_evaluator=approvals.build_evaluator(data.environment, data.judge),
         )
+        harness_ext.guard_tool_approval(self._runner, self._limit_remember)
         harness_ext.restore_turn_counter(self._runner, carried.turn_counter)
         self._history: list[ModelMessage] = ModelMessagesTypeAdapter.validate_python(
             carried.conversation
@@ -115,6 +147,13 @@ class CodingAgent:
         self._interrupted = False
         self._snapshot: list[ModelMessage] | None = None
         self._rejected: list[dict[str, Any]] = []
+        self._signals_this_run = 0
+        self._checkpoint_requested = False
+        self._history_budget = (
+            HistoryBudget(max_events=data.test_history_event_cap, fraction=1.0)
+            if data.test_history_event_cap
+            else HistoryBudget()
+        )
 
         # Messages sent through the harness Update are refused while we hand off to the next
         # run; callers retry and reach the new run. The Signal front door buffers instead.
@@ -149,7 +188,8 @@ class CodingAgent:
         info = workflow.info()
         forced = self._data.force_continue_as_new_after_turns
         return (
-            info.is_continue_as_new_suggested()
+            self._checkpoint_requested
+            or info.is_continue_as_new_suggested()
             or info.is_target_worker_deployment_version_changed()
             or (forced is not None and self._turns_this_run >= forced)
         )
@@ -187,6 +227,12 @@ class CodingAgent:
             model=self._model,
             pending_model=self._pending_model,
             pending_messages=self._deferred,
+            observable={
+                "plan": self.plan.current.model_dump(mode="json"),
+                "changes": self.changes.current.model_dump(mode="json"),
+                "workspace": self.workspace.current.model_dump(mode="json"),
+            },
+            steer_queue=self._steer,
         )
         next_config = AgentConfig(
             approval_policy=self._runner.approval_policy,
@@ -223,6 +269,7 @@ class CodingAgent:
 
     @workflow.signal(name=ENQUEUE_MESSAGE_SIGNAL)
     async def enqueue_message(self, message: FrontDoorMessage) -> None:
+        self._signals_this_run += 1
         if self._is_duplicate(message.request_id):
             return
         if self._continuing:
@@ -232,13 +279,16 @@ class CodingAgent:
 
     @workflow.signal(name=ENQUEUE_APPROVAL_SIGNAL)
     async def enqueue_approval(self, approval: FrontDoorApproval) -> None:
+        self._signals_this_run += 1
         if self._is_duplicate(approval.request_id):
             return
-        decision = ToolApprovalDecision(
-            tool_id=approval.tool_id,
-            approved=approval.approved,
-            reason=approval.reason,
-            remember=approval.remember,
+        decision = self._limit_remember(
+            ToolApprovalDecision(
+                tool_id=approval.tool_id,
+                approved=approval.approved,
+                reason=approval.reason,
+                remember=approval.remember,
+            )
         )
         try:
             await harness_ext.admit_approval(self._runner, decision)
@@ -257,6 +307,17 @@ class CodingAgent:
             harness_ext.publish_rejection(
                 self._runner, message_id=message.request_id, reason=f"Not accepted: {exc.message}"
             )
+
+    def _limit_remember(self, decision: ToolApprovalDecision) -> ToolApprovalDecision:
+        """"Always allow" only for workspace edits (PRD A14): for shell, network and
+        external tools an approval applies to this one call."""
+        if not decision.remember:
+            return decision
+        tool = harness_ext.pending_tool_name(self._runner, decision.tool_id) or ""
+        risk = approvals.risk_class_for(tool, self._runner.auto_approval_criteria)
+        if approvals.remember_allowed(risk):
+            return decision
+        return decision.model_copy(update={"remember": False})
 
     def _is_duplicate(self, request_id: str) -> bool:
         if request_id in self._seen_requests:
@@ -282,10 +343,23 @@ class CodingAgent:
         self._interrupted = False
         self._snapshot = None
         self._run_turn_id = ctx.turn_id
-        task = asyncio.ensure_future(self._run_model(msg.text))
+        task = asyncio.ensure_future(self._run_turn(msg.text))
         self._run_task = task
         try:
             return ChatReply(text=await task)
+        except harness_ext.CheckpointNeeded as cp:
+            # Keep the work so far and hand off to a fresh run; the user continues from there.
+            if self._snapshot is not None:
+                self._history = harness_ext.close_with_note(
+                    self._snapshot,
+                    tool_note=INTERRUPTED_TOOL_NOTE,
+                    user_note="(The turn paused at a checkpoint. Continue when I say so.)",
+                )
+            self._checkpoint_requested = True
+            return ChatReply(
+                text="I paused here to start a fresh workflow run. Say \"continue\" to carry on.",
+                checkpoint=cp.reason,
+            )
         except BaseException as exc:
             # Cancelling the run surfaces as asyncio.CancelledError, as ActivityError("Activity
             # cancelled") from an in-flight activity, or as TurnInterrupted from the
@@ -305,27 +379,84 @@ class CodingAgent:
         finally:
             self._run_task = None
             self._run_turn_id = None
+            self._steer.clear()
+            # Subagents live for one turn: none outlive the turn that started them (and none
+            # may be running when the agent continues as new).
+            for subagent_id in harness_ext.active_subagent_ids(self._runner):
+                await self._runner.stop_subagent(subagent_id)
 
-    async def _run_model(self, text: str) -> str:
+    def _tools(self) -> list[Any]:
+        tools: list[Any] = [*WORKSPACE_TOOLS, *ENABLED_RESEARCH_TOOLS, *ARTIFACT_TOOLS, *STATE_TOOLS]
+        if self._data.depth == 0:
+            tools += subagent_tools(
+                task_queue=workflow.info().task_queue,
+                init=SubagentInit(
+                    workspace_id=self._workspace_id,
+                    owner_id=self._data.owner_id,
+                    session_id=self._data.session_id,
+                    model=self._model,
+                ),
+            )
+        if self._data.test_tools:
+            tools += TEST_TOOLS
+        return tools
+
+    def _before_tool(self, name: str) -> str | None:
+        if name.startswith("start_") and len(harness_ext.active_subagent_ids(self._runner)) >= MAX_CONCURRENT_SUBAGENTS:
+            return (
+                f"At most {MAX_CONCURRENT_SUBAGENTS} subagents can run at once. Use or stop "
+                "one that is running first."
+            )
+        return None
+
+    def _after_tool(self, name: str, tool_id: str, args: dict[str, Any], result: Any) -> None:
+        fold_tool_result(
+            self.changes, self.workspace, tool_name=name, tool_id=tool_id, args=args, result=result
+        )
+
+    async def _run_turn(self, text: str) -> str:
+        """One model run, with one retry on a context overflow using a tighter budget,
+        resumed from the last request so tools that already ran don't run again."""
+        budget = context.budget_for(self._model.registry_key)
+        try:
+            return await self._run_model(text, budget)
+        except BaseException as exc:
+            if self._interrupted or not context.is_context_overflow(exc) or self._snapshot is None:
+                raise
+            self._history = self._snapshot
+            return await self._run_model(None, context.tighter(budget))
+
+    async def _run_model(self, text: str | None, budget: Any) -> str:
         choice = self._model
         hooks = Hooks(
             before_model_request=self._before_model_request,
             after_model_request=self._after_model_request,
         )
         toolset = harness_ext.per_run_toolset(
-            [*WORKSPACE_TOOLS, *(TEST_TOOLS if self._data.test_tools else ())],
-            id="workspace",
-            injections={"workspace_id": self._workspace_id},
+            self._tools(),
+            id="coding",
+            injections={
+                "workspace_id": self._workspace_id,
+                "plan": self.plan,
+                "owner_id": self._data.owner_id,
+                "session_id": self._data.session_id or workflow.info().workflow_id,
+            },
             is_interrupted=lambda: self._interrupted,
+            before_call=self._before_tool,
+            on_result=self._after_tool,
         )
         result = await CODING_AGENT.run(
             text,
-            deps=HarnessDeps(runner=self._runner),
+            instructions=CODING_AGENT_INSTRUCTIONS,
+            deps=CodingDeps(
+                runner=self._runner, session_id=self._data.session_id, owner_id=self._data.owner_id
+            ),
             message_history=self._history,
             model=choice.registry_key,
             model_settings=model_settings(choice, session_id=self._data.session_id),
             toolsets=[toolset],
-            capabilities=[hooks],
+            # ContextFit before Hooks: the snapshot then holds the history as sent.
+            capabilities=[context.ContextFit(budget), hooks],
         )
         self._history = result.all_messages()
         return str(result.output)
@@ -334,12 +465,39 @@ class CodingAgent:
         if self._interrupted:
             # A tool result arrived after Stop; don't start another model call.
             raise harness_ext.TurnInterrupted()
+        info = workflow.info()
+        reason = self._history_budget.should_checkpoint(
+            history_length=info.get_current_history_length(),
+            history_size_bytes=info.get_current_history_size(),
+            signals=self._signals_this_run,
+        )
+        if reason is not None:
+            self._snapshot = list(request_context.messages)
+            raise harness_ext.CheckpointNeeded(reason)
         self._snapshot = list(request_context.messages)
+        self._deliver_steer(ctx)
         return request_context
 
     async def _after_model_request(self, ctx: Any, *, request_context: Any, response: Any) -> Any:
         self._snapshot = [*request_context.messages, response]
+        # Steer that arrived during this model call goes in before the next one (or redirects
+        # the run if this response would have ended it).
+        self._deliver_steer(ctx)
         return response
+
+    def _deliver_steer(self, ctx: Any) -> None:
+        if self._steer:
+            text = "\n\n".join(self._steer)
+            self._steer.clear()
+            ctx.enqueue(f"(The user adds, while you work:)\n{text}")
+
+    @agent.accepts(mid_turn=MidTurn.ACCEPT, model_callable=False)
+    async def steer(self, msg: SteerMessage) -> Ack:
+        """Guide the turn in progress. The text reaches the agent before its next model call."""
+        if self._run_task is None:
+            return Ack(ok=False, detail="Nothing is running; send a message instead.")
+        self._steer.append(msg.text)
+        return Ack(detail="Queued for the agent's next step.")
 
     @agent.accepts(mid_turn=MidTurn.ACCEPT, model_callable=False)
     async def set_model(self, msg: SetModel) -> Ack:
@@ -352,6 +510,20 @@ class CodingAgent:
             return Ack(detail=f"Now using {msg.model.registry_key}.")
         self._pending_model = msg.model
         return Ack(detail=f"Switching to {msg.model.registry_key} from the next turn.")
+
+    @agent.accepts(mid_turn=MidTurn.ACCEPT, model_callable=False)
+    async def set_posture(self, msg: SetPosture) -> Ack:
+        """Change how tool calls are approved. Applies to new calls; pending ones stay with you."""
+        try:
+            policy = approvals.policy_for(msg.posture, self._data.environment)
+        except ApplicationError as exc:
+            return Ack(ok=False, detail=exc.message)
+        # Keep "always allow" rules the user already gave (they are workspace-edit only).
+        for tool in self._runner.approval_policy.auto_approve_tools:
+            policy = policy.with_tool_allowed(tool)
+        self._runner.set_approval_policy(policy)
+        self._data = self._data.model_copy(update={"posture": msg.posture})
+        return Ack(detail=f"Approvals: {msg.posture.replace('_', ' ')}.")
 
     @agent.accepts(mid_turn=MidTurn.ACCEPT, model_callable=False)
     async def interrupt(self, msg: InterruptRequest) -> Ack:

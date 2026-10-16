@@ -17,6 +17,7 @@ import socket
 import stat as stat_module
 import subprocess
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import ExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -42,6 +43,11 @@ WORKSPACE_MODE = 0o700
 STATE_DIR_NAME = ".executor-state"
 DEFAULT_LIVE_HEALTH_INTERVAL_SECONDS = 30.0
 DEFAULT_MAX_ORPHAN_ZOMBIES = 8
+# Reattach (P1 A5): a running job outlives its HTTP stream. These bound what each job
+# keeps for a reattaching client, and how long it runs with nobody attached.
+JOB_REPLAY_BUFFER_CHARS = 128_000
+JOB_REPLAY_BUFFER_EVENTS = 2_048
+DEFAULT_ORPHAN_GRACE_SECONDS = 120.0
 _SAFE_EXECUTION_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 
 # /files/* limits (PRD §5 rule 5).
@@ -70,6 +76,13 @@ class ExecuteRequest(BaseModel):
     )
     network: bool = True
     stdin: str | None = Field(default=None, max_length=MAX_STDIN_CHARS)
+
+
+class ExecuteCancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_id: str = Field(min_length=1, max_length=512)
+    execution_id: str = Field(min_length=1, max_length=200)
 
 
 class _FileRequest(BaseModel):
@@ -192,8 +205,96 @@ class _WorkspaceLocks:
     files: _ReadWriteLock = field(default_factory=_ReadWriteLock)
 
 
+@dataclass
+class _Job:
+    """One /execute job, which outlives the HTTP stream that started it.
+
+    Lifecycle: ``queued`` (waiting for the workspace lock) -> ``running`` -> done
+    (``result`` set). Stream events are kept in a bounded replay buffer so a client that
+    reconnects with the same execution_id (an activity retried after a worker crash)
+    replays what it missed and then follows live. The oldest events are dropped first;
+    a subscriber that fell behind the buffer gets one ``dropped`` marker event. The final
+    result is held outside the buffer and is never dropped.
+    """
+
+    workspace_key: str
+    execution_id: str
+    fingerprint: str
+    state: Literal["queued", "running", "done"] = "queued"
+    events: deque[tuple[int, dict[str, Any], int]] = field(default_factory=deque)
+    buffered_chars: int = 0
+    next_seq: int = 0
+    result: dict[str, Any] | None = None
+    subscribers: int = 0
+    detached_at: float = field(default_factory=time.monotonic)
+    launched: bool = False
+    cancel_requested: asyncio.Event = field(default_factory=asyncio.Event)
+    wakeup: asyncio.Event = field(default_factory=asyncio.Event)
+    task: asyncio.Future[None] | None = None
+
+    def append(self, event: dict[str, Any]) -> None:
+        seq = self.next_seq
+        self.next_seq += 1
+        event = {**event, "seq": seq}
+        payload = event.get("payload")
+        text = payload.get("text") if isinstance(payload, dict) else None
+        chars = (len(text) if isinstance(text, str) else 0) + 64
+        self.events.append((seq, event, chars))
+        self.buffered_chars += chars
+        while len(self.events) > 1 and (
+            self.buffered_chars > JOB_REPLAY_BUFFER_CHARS
+            or len(self.events) > JOB_REPLAY_BUFFER_EVENTS
+        ):
+            _, _, dropped = self.events.popleft()
+            self.buffered_chars -= dropped
+        self._wake()
+
+    def finish(self, result: dict[str, Any]) -> None:
+        self.result = result
+        self.state = "done"
+        self._wake()
+
+    def orphaned(self) -> bool:
+        return (
+            self.subscribers == 0
+            and time.monotonic() - self.detached_at > _orphan_grace_seconds()
+        )
+
+    def _wake(self) -> None:
+        # Broadcast: every subscriber waits on the event it captured before reading.
+        previous, self.wakeup = self.wakeup, asyncio.Event()
+        previous.set()
+
+
+def _orphan_grace_seconds() -> float:
+    return max(
+        1.0,
+        float(
+            os.environ.get(
+                "WORKSPACE_EXECUTOR_ORPHAN_GRACE_SECONDS",
+                str(DEFAULT_ORPHAN_GRACE_SECONDS),
+            )
+        ),
+    )
+
+
+def _request_fingerprint(request: ExecuteRequest) -> str:
+    material = json.dumps(
+        [
+            request.command,
+            _normalize_cwd(request.cwd),
+            request.timeout_seconds,
+            request.network,
+            request.stdin,
+        ]
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
 app = FastAPI(title="Agent workspace executor", docs_url=None, redoc_url=None)
 _workspace_locks: dict[str, _WorkspaceLocks] = {}
+# Live (queued or running) jobs by (workspace_key, execution_id).
+_jobs: dict[tuple[str, str], _Job] = {}
 _workspace_locks_guard = asyncio.Lock()
 _concurrency = asyncio.Semaphore(
     max(1, int(os.environ.get("WORKSPACE_EXECUTOR_MAX_CONCURRENT", "4")))
@@ -298,8 +399,9 @@ async def execute(
     if not _SAFE_EXECUTION_ID.fullmatch(request.execution_id):
         raise HTTPException(status_code=422, detail="Invalid execution_id.")
 
+    events = _execute_events(request)
     return StreamingResponse(
-        _encode_events(_execute_events(request)),
+        _encode_events(events),
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-store"},
     )
@@ -979,87 +1081,238 @@ def main() -> None:
     )
 
 
-async def _execute_events(request: ExecuteRequest) -> AsyncIterator[dict[str, Any]]:
+def _execute_events(request: ExecuteRequest) -> AsyncIterator[dict[str, Any]]:
+    """Open (or reattach to) the job for ``request.execution_id`` and stream its events.
+
+    Not a generator itself: the lookup and job creation run synchronously, with no await
+    between "is there a live job / cached result?" and "register a new job", so two
+    concurrent requests with one execution_id can never start two processes. A mismatched
+    request for a live execution_id raises HTTPException(409) here, before streaming.
+    """
     workspace_key = _workspace_key(request.workspace_id)
-    workspace_dir = _workspace_dir(workspace_key)
-    state_path = _state_path(workspace_key, request.execution_id)
-    locks = await _workspace_locks_for(workspace_key)
-
-    # See _WorkspaceLocks: commands exclude file mutations, not file reads.
-    async with _concurrency, locks.exec:
-        cached = _load_cached_result(state_path)
-        if cached is not None:
-            cached["cached"] = True
-            yield {"kind": "start", "payload": _start_payload(request, workspace_key)}
-            yield {"kind": "result", "payload": cached}
-            return
-
-        workspace_dir.mkdir(mode=WORKSPACE_MODE, parents=True, exist_ok=True)
-        workspace_dir.chmod(WORKSPACE_MODE)
-        before = _workspace_snapshot(workspace_dir)
-        yield {"kind": "start", "payload": _start_payload(request, workspace_key)}
-
-        command = _sandbox_command(request, workspace_dir)
-        started_at = time.monotonic()
-        process: asyncio.subprocess.Process | None = None
-        stdout = _CapturedOutput(MAX_CAPTURE_CHARS)
-        stderr = _CapturedOutput(MAX_CAPTURE_CHARS)
-        stream_budget = _StreamBudget(MAX_STREAM_CHARS)
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        timed_out = False
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdin=(
-                    asyncio.subprocess.PIPE
-                    if request.stdin is not None
-                    else asyncio.subprocess.DEVNULL
-                ),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_launcher_env(),
-                start_new_session=True,
+    key = (workspace_key, request.execution_id)
+    job = _jobs.get(key)
+    if job is not None:
+        if job.fingerprint != _request_fingerprint(request):
+            raise HTTPException(
+                status_code=409,
+                detail="execution_id is already running a different command.",
             )
-            if request.stdin is not None and process.stdin is not None:
-                process.stdin.write(request.stdin.encode("utf-8"))
-                await process.stdin.drain()
-                process.stdin.close()
+        return _subscribe(job, request, attached=True)
 
-            readers = [
-                asyncio.create_task(
-                    _read_output(process.stdout, "stdout", stdout, stream_budget, queue)
+    state_path = _state_path(workspace_key, request.execution_id)
+    cached = _load_cached_result(state_path)
+    if cached is not None:
+        cached["cached"] = True
+        return _replay_cached(request, workspace_key, cached)
+    if _started_marker(state_path).exists():
+        # The process started under an executor that has since restarted: the job and its
+        # result are gone. Running it again would run the command twice.
+        return _replay_cached(
+            request,
+            workspace_key,
+            {
+                "workspace": workspace_key,
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+                "timed_out": False,
+                "files_changed": {"created": [], "modified": [], "deleted": []},
+                "error": (
+                    "The sandbox restarted while this command was running, so its "
+                    "result was lost. It may have partly run; check the workspace "
+                    "before running it again."
                 ),
-                asyncio.create_task(
-                    _read_output(process.stderr, "stderr", stderr, stream_budget, queue)
-                ),
-            ]
-            wait_task = asyncio.create_task(process.wait())
-            deadline = started_at + request.timeout_seconds
-            next_progress = started_at + PROGRESS_INTERVAL_SECONDS
+                "type": "WorkspaceJobLost",
+            },
+        )
 
-            while not wait_task.done():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    timed_out = True
-                    await _terminate_process(process)
-                    break
+    job = _Job(
+        workspace_key=workspace_key,
+        execution_id=request.execution_id,
+        fingerprint=_request_fingerprint(request),
+    )
+    _jobs[key] = job
+    job.task = asyncio.ensure_future(_run_job(job, request, state_path))
+    job.task.add_done_callback(lambda _: _settle_job(job, request))
+    return _subscribe(job, request, attached=False)
 
-                queue_wait = asyncio.create_task(queue.get())
-                done, _ = await asyncio.wait(
-                    {wait_task, queue_wait},
-                    timeout=min(remaining, max(0.05, next_progress - time.monotonic())),
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if queue_wait in done:
-                    yield queue_wait.result()
-                else:
-                    queue_wait.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await queue_wait
 
-                if time.monotonic() >= next_progress and not wait_task.done():
-                    yield {
+def _settle_job(job: "_Job", request: ExecuteRequest) -> None:
+    """Finish a job whose task never ran its own cleanup (cancelled before it started)."""
+    if job.result is None:
+        _jobs.pop((job.workspace_key, job.execution_id), None)
+        job.finish(_stopped_payload(request, job, "WorkspaceShellCancelled"))
+
+
+async def _replay_cached(
+    request: ExecuteRequest, workspace_key: str, result: dict[str, Any]
+) -> AsyncIterator[dict[str, Any]]:
+    yield {"kind": "start", "payload": _start_payload(request, workspace_key)}
+    yield {"kind": "result", "payload": result}
+
+
+async def _subscribe(
+    job: "_Job", request: ExecuteRequest, *, attached: bool
+) -> AsyncIterator[dict[str, Any]]:
+    """Replay the job's buffered events, then follow it live until its result.
+
+    A subscriber that disconnects (worker crash, cancelled activity) leaves the job
+    running; a later request with the same execution_id reattaches. A job with no
+    subscriber for the orphan grace period is stopped (see _run_job).
+    """
+    job.subscribers += 1
+    try:
+        yield {
+            "kind": "start",
+            "payload": {
+                **_start_payload(request, job.workspace_key),
+                "execution_id": job.execution_id,
+                "attached": attached,
+                "state": job.state,
+                "next_seq": job.next_seq,
+            },
+        }
+        cursor = 0
+        while True:
+            wakeup = job.wakeup
+            first = job.events[0][0] if job.events else job.next_seq
+            if cursor < first:
+                yield {
+                    "kind": "dropped",
+                    "payload": {
+                        "dropped_events": first - cursor,
+                        "message": (
+                            f"[{first - cursor} earlier output chunk(s) dropped from "
+                            "the replay buffer]"
+                        ),
+                    },
+                }
+                cursor = first
+            for seq, event, _ in list(job.events):
+                if seq >= cursor:
+                    yield event
+                    cursor = seq + 1
+            if job.result is not None and cursor >= job.next_seq:
+                yield {"kind": "result", "payload": job.result}
+                return
+            await wakeup.wait()
+    finally:
+        job.subscribers -= 1
+        if job.subscribers == 0:
+            job.detached_at = time.monotonic()
+
+
+async def _run_job(job: "_Job", request: ExecuteRequest, state_path: Path) -> None:
+    result: dict[str, Any] | None = None
+    store = False
+    try:
+        locks = await _workspace_locks_for(job.workspace_key)
+        # See _WorkspaceLocks: commands exclude file mutations, not file reads.
+        async with _concurrency, locks.exec:
+            if job.cancel_requested.is_set():
+                result = _stopped_payload(request, job, "WorkspaceShellCancelled")
+                store = True
+            elif job.orphaned():
+                result = _stopped_payload(request, job, "WorkspaceShellAbandoned")
+                store = True
+            else:
+                job.state = "running"
+                result, store = await _run_process(job, request, state_path)
+    except asyncio.CancelledError:
+        result = _stopped_payload(request, job, "WorkspaceShellCancelled")
+        store = job.launched
+        raise
+    except Exception as err:  # noqa: BLE001 - reported to every subscriber
+        result = {
+            "error": f"Workspace sandbox failed to start: {err}",
+            "type": "WorkspaceSandboxError",
+            "workspace": job.workspace_key,
+        }
+        store = job.launched
+    finally:
+        if result is None:
+            result = _stopped_payload(request, job, "WorkspaceSandboxError")
+        if store:
+            with suppress(OSError):
+                _store_cached_result(state_path, result)
+        # Cache first, then unregister: a request that misses _jobs finds the cache.
+        _jobs.pop((job.workspace_key, job.execution_id), None)
+        job.finish(result)
+
+
+async def _run_process(
+    job: "_Job", request: ExecuteRequest, state_path: Path
+) -> tuple[dict[str, Any], bool]:
+    workspace_dir = _workspace_dir(job.workspace_key)
+    workspace_dir.mkdir(mode=WORKSPACE_MODE, parents=True, exist_ok=True)
+    workspace_dir.chmod(WORKSPACE_MODE)
+    before = _workspace_snapshot(workspace_dir)
+
+    command = _sandbox_command(request, workspace_dir)
+    started_at = time.monotonic()
+    process: asyncio.subprocess.Process | None = None
+    stdout = _CapturedOutput(MAX_CAPTURE_CHARS)
+    stderr = _CapturedOutput(MAX_CAPTURE_CHARS)
+    stream_budget = _StreamBudget(MAX_STREAM_CHARS)
+    timed_out = False
+    stop_type: str | None = None
+    cancel_wait = asyncio.ensure_future(job.cancel_requested.wait())
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=(
+                asyncio.subprocess.PIPE
+                if request.stdin is not None
+                else asyncio.subprocess.DEVNULL
+            ),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_launcher_env(),
+            start_new_session=True,
+        )
+        job.launched = True
+        _mark_started(state_path)
+        if request.stdin is not None and process.stdin is not None:
+            process.stdin.write(request.stdin.encode("utf-8"))
+            await process.stdin.drain()
+            process.stdin.close()
+
+        readers = [
+            asyncio.create_task(
+                _read_output(process.stdout, "stdout", stdout, stream_budget, job)
+            ),
+            asyncio.create_task(
+                _read_output(process.stderr, "stderr", stderr, stream_budget, job)
+            ),
+        ]
+        wait_task = asyncio.create_task(process.wait())
+        deadline = started_at + request.timeout_seconds
+        next_progress = started_at + PROGRESS_INTERVAL_SECONDS
+
+        while not wait_task.done():
+            now = time.monotonic()
+            if now >= deadline:
+                timed_out = True
+                await _terminate_process(process)
+                break
+            if job.cancel_requested.is_set():
+                stop_type = "WorkspaceShellCancelled"
+                await _terminate_process(process)
+                break
+            if job.orphaned():
+                stop_type = "WorkspaceShellAbandoned"
+                await _terminate_process(process)
+                break
+            await asyncio.wait(
+                {wait_task, cancel_wait},
+                timeout=max(0.05, min(1.0, deadline - now, next_progress - now)),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if time.monotonic() >= next_progress and not wait_task.done():
+                job.append(
+                    {
                         "kind": "progress",
                         "payload": {
                             "elapsed_seconds": round(time.monotonic() - started_at, 3),
@@ -1067,46 +1320,83 @@ async def _execute_events(request: ExecuteRequest) -> AsyncIterator[dict[str, An
                             "stderr_chars": stderr.original_chars,
                         },
                     }
-                    next_progress = time.monotonic() + PROGRESS_INTERVAL_SECONDS
+                )
+                next_progress = time.monotonic() + PROGRESS_INTERVAL_SECONDS
 
-            if not wait_task.done():
-                with suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(wait_task, timeout=TERMINATE_GRACE_SECONDS)
-            await asyncio.gather(*readers, return_exceptions=True)
-            while not queue.empty():
-                yield queue.get_nowait()
+        if not wait_task.done():
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(wait_task, timeout=TERMINATE_GRACE_SECONDS)
+        await asyncio.gather(*readers, return_exceptions=True)
 
-            exit_code = process.returncode
-            after = _workspace_snapshot(workspace_dir)
-            result = _result_payload(
-                request=request,
-                workspace_key=workspace_key,
-                exit_code=exit_code,
-                stdout=stdout,
-                stderr=stderr,
-                stream_budget=stream_budget,
-                timed_out=timed_out,
-                elapsed_seconds=time.monotonic() - started_at,
-                before=before,
-                after=after,
-            )
-            _store_cached_result(state_path, result)
-            yield {"kind": "result", "payload": result}
-        except asyncio.CancelledError:
-            if process is not None:
-                await _terminate_process(process)
-            raise
-        except Exception as err:
-            if process is not None:
-                await _terminate_process(process)
-            yield {
-                "kind": "result",
-                "payload": {
-                    "error": f"Workspace sandbox failed to start: {err}",
-                    "type": "WorkspaceSandboxError",
-                    "workspace": workspace_key,
-                },
-            }
+        after = _workspace_snapshot(workspace_dir)
+        result = _result_payload(
+            request=request,
+            workspace_key=job.workspace_key,
+            exit_code=process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            stream_budget=stream_budget,
+            timed_out=timed_out,
+            elapsed_seconds=time.monotonic() - started_at,
+            before=before,
+            after=after,
+        )
+        if stop_type is not None:
+            result.update(_stop_error(stop_type))
+        return result, True
+    except BaseException:
+        if process is not None:
+            await _terminate_process(process)
+        raise
+    finally:
+        cancel_wait.cancel()
+
+
+def _stop_error(stop_type: str) -> dict[str, str]:
+    grace = _orphan_grace_seconds()
+    messages = {
+        "WorkspaceShellCancelled": "Command was cancelled.",
+        "WorkspaceShellAbandoned": (
+            f"Command was stopped: no client was attached for {grace:g} seconds."
+        ),
+        "WorkspaceSandboxError": "Workspace sandbox stopped unexpectedly.",
+    }
+    return {"error": messages[stop_type], "type": stop_type}
+
+
+def _stopped_payload(
+    request: ExecuteRequest, job: "_Job", stop_type: str
+) -> dict[str, Any]:
+    return {
+        "workspace": job.workspace_key,
+        "cwd": _normalize_cwd(request.cwd),
+        "command": request.command,
+        "network": request.network,
+        "exit_code": None,
+        "stdout": "",
+        "stderr": "",
+        "timed_out": False,
+        "elapsed_seconds": 0.0,
+        "files_changed": {"created": [], "modified": [], "deleted": []},
+        **_stop_error(stop_type),
+    }
+
+
+@app.post("/execute/cancel")
+async def execute_cancel(
+    request: ExecuteCancelRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Stop a running or queued job. Idempotent; unknown or finished ids are a no-op."""
+    _authorize(authorization)
+    job = _jobs.get((_workspace_key(request.workspace_id), request.execution_id))
+    if job is None:
+        return {"ok": True, "state": "not_running"}
+    job.cancel_requested.set()
+    if job.state == "queued" and job.task is not None:
+        # Waiting on the workspace lock: nothing to terminate, just stop waiting.
+        job.task.cancel()
+    return {"ok": True, "state": "cancelling"}
 
 
 async def _encode_events(events: AsyncIterator[dict[str, Any]]) -> AsyncIterator[bytes]:
@@ -1121,7 +1411,7 @@ async def _read_output(
     name: str,
     capture: "_CapturedOutput",
     stream_budget: "_StreamBudget",
-    queue: asyncio.Queue[dict[str, Any]],
+    job: "_Job",
 ) -> None:
     if reader is None:
         return
@@ -1133,7 +1423,7 @@ async def _read_output(
         capture.append(text)
         streamed = stream_budget.take(text)
         if streamed:
-            await queue.put(
+            job.append(
                 {
                     "kind": name,
                     "payload": {
@@ -1536,6 +1826,16 @@ def _load_cached_result(path: Path) -> dict[str, Any] | None:
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _started_marker(state_path: Path) -> Path:
+    return state_path.with_suffix(".started")
+
+
+def _mark_started(state_path: Path) -> None:
+    marker = _started_marker(state_path)
+    marker.parent.mkdir(mode=WORKSPACE_MODE, parents=True, exist_ok=True)
+    marker.touch()
 
 
 def _store_cached_result(path: Path, result: dict[str, Any]) -> None:

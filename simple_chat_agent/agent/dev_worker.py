@@ -23,7 +23,11 @@ from temporal_agent_harness.plugin import AgentHarnessPlugin
 from simple_chat_agent.agent.harness_ext import payload_storage
 
 from simple_chat_agent.agent.runtime import CODING_AGENT
-from simple_chat_agent.agent.tools.workspace import TEST_TOOLS, WORKSPACE_TOOLS
+from simple_chat_agent.agent.approvals import APPROVAL_ACTIVITIES
+from simple_chat_agent.agent.tools.artifacts import ARTIFACT_TOOLS
+from simple_chat_agent.agent.tools.research import RESEARCH_TOOLS
+from simple_chat_agent.agent.tools.workspace import TEST_TOOLS, WORKSPACE_ACTIVITIES, WORKSPACE_TOOLS
+from simple_chat_agent.agent.subagents import SUBAGENT_WORKFLOWS
 from simple_chat_agent.agent.workflow import CodingAgent
 
 
@@ -36,13 +40,14 @@ async def main() -> None:
         os.environ.get("TEMPORAL_TEST_ADDRESS", "127.0.0.1:7244"),
         namespace=os.environ.get("TEMPORAL_NAMESPACE", "default"),
         plugins=[PydanticAIPlugin(), AgentHarnessPlugin(
-            tools=[*WORKSPACE_TOOLS, *TEST_TOOLS], large_payload_offload=payload_storage()
+            tools=[*WORKSPACE_TOOLS, *TEST_TOOLS, *RESEARCH_TOOLS, *ARTIFACT_TOOLS], large_payload_offload=payload_storage()
         )],
     )
     worker = Worker(
         client,
         task_queue=args.task_queue,
-        workflows=[CodingAgent],
+        workflows=[CodingAgent, *SUBAGENT_WORKFLOWS],
+        activities=[*WORKSPACE_ACTIVITIES, *APPROVAL_ACTIVITIES],
         plugins=[AgentPlugin(CODING_AGENT)],
         identity=args.identity,
         max_heartbeat_throttle_interval=timedelta(seconds=1),

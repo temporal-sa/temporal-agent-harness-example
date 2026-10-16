@@ -1,0 +1,43 @@
+# Local-development image for the workspace executor (simple_chat_agent.worker.sandbox.executor).
+#
+# Build from the repo root:
+#   docker build -f simple_chat_agent/worker/sandbox/Dockerfile.executor -t agent-executor:dev .
+# Run instructions (privileges Bubblewrap needs, env vars): see README.md in this directory.
+#
+# The executor needs only fastapi, uvicorn and pydantic, plus the sandbox tools below. It
+# must never hold model-provider or integration keys (PRD §5 rule 6); its startup self-test
+# refuses to report healthy if it sees any.
+FROM python:3.12-slim
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        bash \
+        bubblewrap \
+        ca-certificates \
+        git \
+        ripgrep \
+        tini \
+        util-linux \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir "fastapi==0.136.1" "uvicorn==0.47.0" "pydantic==2.13.4" \
+    && groupadd --gid 65532 sandbox \
+    && useradd --uid 65532 --gid 65532 --create-home --home-dir /home/sandbox sandbox \
+    && mkdir /workspace /workspaces \
+    && chown 65532:65532 /workspace /workspaces
+
+WORKDIR /app
+# Only the executor's package path; the package __init__ files import nothing heavy.
+COPY simple_chat_agent/__init__.py simple_chat_agent/__init__.py
+COPY simple_chat_agent/worker/__init__.py simple_chat_agent/worker/__init__.py
+COPY simple_chat_agent/worker/sandbox/__init__.py simple_chat_agent/worker/sandbox/executor.py simple_chat_agent/worker/sandbox/
+
+ENV PYTHONUNBUFFERED=1 \
+    WORKSPACE_EXECUTOR_HOST=0.0.0.0 \
+    WORKSPACE_EXECUTOR_PORT=8082 \
+    WORKSPACE_EXECUTOR_ROOT=/workspaces
+
+USER 65532:65532
+EXPOSE 8082
+# tini reaps the Bubblewrap children (the /healthz zombie check depends on it).
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python", "-m", "simple_chat_agent.worker.sandbox.executor"]

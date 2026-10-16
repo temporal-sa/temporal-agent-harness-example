@@ -52,13 +52,15 @@ async def connect() -> Any:
 
     from simple_chat_agent.agent.harness_ext import payload_storage
 
+    from simple_chat_agent.agent.tools.artifacts import ARTIFACT_TOOLS
+    from simple_chat_agent.agent.tools.research import RESEARCH_TOOLS
     from simple_chat_agent.agent.tools.workspace import TEST_TOOLS, WORKSPACE_TOOLS
 
     return await Client.connect(
         ADDRESS,
         namespace="default",
         plugins=[PydanticAIPlugin(), AgentHarnessPlugin(
-            tools=[*WORKSPACE_TOOLS, *TEST_TOOLS], large_payload_offload=payload_storage()
+            tools=[*WORKSPACE_TOOLS, *TEST_TOOLS, *RESEARCH_TOOLS, *ARTIFACT_TOOLS], large_payload_offload=payload_storage()
         )],
     )
 
@@ -69,12 +71,17 @@ async def running_worker(client: Any, task_queue: str) -> AsyncIterator[Any]:
     from temporalio.worker import Worker
 
     from simple_chat_agent.agent.runtime import CODING_AGENT
+    from simple_chat_agent.agent.subagents import SUBAGENT_WORKFLOWS
     from simple_chat_agent.agent.workflow import CodingAgent
+
+    from simple_chat_agent.agent.approvals import APPROVAL_ACTIVITIES
+    from simple_chat_agent.agent.tools.workspace import WORKSPACE_ACTIVITIES
 
     worker = Worker(
         client,
         task_queue=task_queue,
-        workflows=[CodingAgent],
+        workflows=[CodingAgent, *SUBAGENT_WORKFLOWS],
+        activities=[*WORKSPACE_ACTIVITIES, *APPROVAL_ACTIVITIES],
         plugins=[AgentPlugin(CODING_AGENT)],
         max_heartbeat_throttle_interval=timedelta(seconds=1),
         default_heartbeat_throttle_interval=timedelta(seconds=1),
@@ -89,6 +96,7 @@ async def start_session(client: Any, task_queue: str, **init: Any) -> Any:
     from simple_chat_agent.agent.contracts import AGENT_WORKFLOW_TYPE, CodingAgentInit
 
     workflow_id = f"p0-{uuid.uuid4().hex[:10]}"
+    init.setdefault("environment", "local")
     data = CodingAgentInit(session_id=workflow_id, workspace_id=workflow_id, **init)
     return await client.start_workflow(
         AGENT_WORKFLOW_TYPE,

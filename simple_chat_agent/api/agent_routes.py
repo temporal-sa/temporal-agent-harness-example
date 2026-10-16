@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Literal
@@ -35,20 +36,26 @@ from simple_chat_agent.agent.contracts import (
     FrontDoorApproval,
     FrontDoorMessage,
     ModelChoice,
+    Posture,
 )
+from simple_chat_agent.agent.approvals import configured_judge_backend
 from simple_chat_agent.agent.model_registry import is_allowed
 from simple_chat_agent.api.agent_bridge import Bridge
 from simple_chat_agent.api.agent_store import AgentStore
 
 KEEPALIVE_SECONDS = 15.0
+
+
+def agent_environment() -> str:
+    """``catalog`` (default, stricter approval rules) or ``local`` for development."""
+    return "local" if os.environ.get("AGENT_ENVIRONMENT", "catalog").strip().lower() == "local" else "catalog"
 NO_STORE = {"Cache-Control": "no-store"}
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
 
 
 class CreateSession(BaseModel):
     model: ModelChoice = Field(default_factory=ModelChoice)
-    # "auto" needs the judge, which arrives in P1; until then it isn't offered.
-    posture: Literal["ask_everything", "trust_safe", "never_ask"] = "trust_safe"
+    posture: Posture = "trust_safe"
 
 
 class SubmitMessage(BaseModel):
@@ -99,7 +106,11 @@ def create_agent_router(
             workspace_id=session_id,
             model=body.model,
             posture=body.posture,
+            environment=agent_environment(),
+            judge=configured_judge_backend(),
         )
+        if body.posture == "never_ask" and data.environment == "catalog":
+            return _error(422, "posture_not_allowed", "\"Never ask\" isn't available here.")
         # Ownership first: a crash after starting the workflow must not orphan it.
         await store.set_owner(session_id, uid)
         client = await temporal()

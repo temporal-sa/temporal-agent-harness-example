@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import typing
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import timedelta
 from typing import Any
 
+from pydantic import BaseModel
 from pydantic_ai import FunctionToolset, Tool
 from pydantic_ai.durable_exec.temporal import TemporalAgent
 from pydantic_ai.exceptions import ModelHTTPError
@@ -44,6 +46,7 @@ from temporal_agent_harness.ai_sdks.pydantic_ai_harness import (
 )
 from temporal_agent_harness.harness.agent_protocol import (
     SEND_AGENT_MESSAGE_UPDATE,
+    TOOL_APPROVAL_UPDATE,
     AgentMessage,
     MidTurn,
     ModelInteractionStarted,
@@ -145,17 +148,56 @@ class HeartbeatingModel(WrapperModel):
         model_request_parameters: ModelRequestParameters,
         run_context: RunContext[Any] | None = None,
     ) -> AsyncIterator[StreamedResponse]:
+        session_id, owner_id = _spend_ids(run_context)
+        guard = _spend_guard() if activity.in_activity() and session_id else None
+        if guard is not None:
+            # Hard caps (PRD A21): checked before every model call, fail closed.
+            await guard.check(session_id, owner_id)
         async with _heartbeating():
             try:
                 async with self.wrapped.request_stream(
                     messages, model_settings, model_request_parameters, run_context
                 ) as response:
-                    yield response
+                    try:
+                        yield response
+                    finally:
+                        if guard is not None:
+                            usage = stream_usage(response)
+                            await guard.record(
+                                session_id,
+                                owner_id,
+                                getattr(usage, "input_tokens", 0) or 0,
+                                getattr(usage, "output_tokens", 0) or 0,
+                            )
             except ModelHTTPError as exc:
                 raise _classify(exc) from exc
 
 
+_SPEND_GUARD: Any = None
+
+
+def _spend_guard() -> Any:
+    """One SpendGuard per worker process (activity side only)."""
+    global _SPEND_GUARD
+    if _SPEND_GUARD is None:
+        from simple_chat_agent.agent.budget import spend_guard_from_env
+
+        _SPEND_GUARD = spend_guard_from_env()
+    return _SPEND_GUARD
+
+
+def _spend_ids(run_context: RunContext[Any] | None) -> tuple[str, str]:
+    deps = getattr(run_context, "deps", None)
+    return getattr(deps, "session_id", "") or "", getattr(deps, "owner_id", "") or ""
+
+
 def _classify(exc: ModelHTTPError) -> Exception:
+    from simple_chat_agent.agent import context
+
+    if context.is_context_overflow(exc):
+        # Keep overflow distinguishable from other 400s: the workflow retries it once with
+        # a tighter history budget (PRD A17).
+        return context.context_overflow_error(exc)
     status = exc.status_code
     if 400 <= status < 500 and status not in _RETRYABLE_4XX:
         return ApplicationError(
@@ -279,6 +321,8 @@ def per_run_toolset(
     id: str,
     injections: dict[str, Any] | None = None,
     is_interrupted: Callable[[], bool] = lambda: False,
+    before_call: Callable[[str], str | None] | None = None,
+    on_result: Callable[[str, str, dict[str, Any], Any], None] | None = None,
 ) -> FunctionToolset[Any]:
     """Adapt harness tools into a FunctionToolset that may be passed to ``run(toolsets=...)``.
 
@@ -292,13 +336,17 @@ def per_run_toolset(
     cancelled tool activity raises (Temporal reports workflow-side activity cancellation as
     ActivityError, not CancelledError). After the user interrupts, that would let the turn
     carry on. Here a failure while ``is_interrupted()`` re-raises as CancelledError.
+
+    ``before_call(name)`` may refuse a call by returning the text the model sees instead
+    (e.g. a concurrency limit). ``on_result(name, tool_id, args, result)`` runs in the
+    workflow after a successful call (e.g. to update observable state).
     """
     adapted: list[Tool[Any]] = []
     for tool in tools:
         name, description, schema = _tool_schema(tool)
         adapted.append(
             Tool.from_schema(
-                _invoker(tool, name, injections, is_interrupted),
+                _invoker(tool, name, injections, is_interrupted, before_call, on_result),
                 name=name,
                 description=description,
                 json_schema=schema,
@@ -314,21 +362,60 @@ def _invoker(
     name: str,
     injections: dict[str, Any] | None,
     is_interrupted: Callable[[], bool],
+    before_call: Callable[[str], str | None] | None,
+    on_result: Callable[[str, str, dict[str, Any], Any], None] | None,
 ) -> Callable[..., Awaitable[Any]]:
+    # Pydantic AI flattens a tool whose only parameter is a model: the model sends that
+    # model's fields as top-level arguments. Re-wrap them so run_tool binds the parameter.
+    # (The harness's own adapter has the same gap; filed upstream.)
+    single_arg = Tool(tool, takes_ctx=False).function_schema.single_arg_name
+    # Pydantic AI hands tools JSON-shaped arguments. Activity tools are coerced by Temporal's
+    # converter on the way into the activity, but inline tools would see plain dicts, so
+    # coerce parameters annotated with a pydantic model here.
+    model_params = {
+        pname: ann
+        for pname, ann in typing.get_type_hints(tool).items()
+        if isinstance(ann, type) and issubclass(ann, BaseModel)
+    }
+
     async def invoke(ctx: RunContext[Any], **kwargs: Any) -> Any:
         runner = _runner_from_ctx(ctx, tool_name=name)
+        if single_arg:
+            kwargs = {single_arg: kwargs}
+        for pname, model in model_params.items():
+            if isinstance(kwargs.get(pname), dict):
+                kwargs[pname] = model.model_validate(kwargs[pname])
+        if before_call is not None:
+            refusal = before_call(name)
+            if refusal:
+                return refusal
         try:
-            return await runner.run_tool(ctx.tool_call_id, tool, injections=injections, **kwargs)
+            result = await runner.run_tool(ctx.tool_call_id, tool, injections=injections, **kwargs)
         except Exception as exc:  # noqa: BLE001 - mirror the harness adapter, except on interrupt
             if is_interrupted():
                 raise asyncio.CancelledError(f"{name} stopped by the user") from exc
             return f"Tool {name!r} failed: {exc}"
+        if on_result is not None:
+            on_result(name, ctx.tool_call_id or "", kwargs, result)
+        # Result models carry structured fields (for state and the UI) and a compact __str__
+        # written for the model; send the model the compact text.
+        if isinstance(result, BaseModel) and type(result).__str__ is not BaseModel.__str__:
+            return str(result)
+        return result
 
     return invoke
 
 
 class TurnInterrupted(Exception):
     """Raised in workflow code to stop a turn the user interrupted."""
+
+
+class CheckpointNeeded(Exception):
+    """Raised before a model call that would take the run too close to a history limit."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def is_cancellation(exc: BaseException) -> bool:
@@ -369,12 +456,24 @@ def publish_rejection(runner: AgentWorkflowRunner, *, message_id: str, reason: s
 def payload_storage() -> Any:
     """Large-payload offload shared by worker, API and tests (PRD §3: 256 KB threshold).
 
-    Local disk for development; P1 switches the catalog to S3 (the stores must match across
-    every process that reads or writes payloads).
+    S3 when ``SIMPLE_CHAT_S3_BUCKET`` is set (the catalog), using the app's existing S3 driver
+    so every process reads the same claims; local disk otherwise. Every process that reads or
+    writes this namespace's payloads must use the same store.
     """
+    threshold = int(os.environ.get("AGENT_PAYLOAD_OFFLOAD_BYTES", str(256 * 1024)))
+    if os.environ.get("SIMPLE_CHAT_S3_BUCKET", "").strip() or os.environ.get(
+        "SIMPLE_CHAT_REQUIRE_SHARED_STORAGE", ""
+    ).lower() in {"1", "true"}:
+        from temporalio.converter import ExternalStorage
+
+        from simple_chat_agent.common.external_storage import simple_chat_data_converter
+
+        shared = simple_chat_data_converter().external_storage
+        assert shared is not None
+        return ExternalStorage(drivers=shared.drivers, payload_size_threshold=threshold)
     from temporal_agent_harness.utils.large_payload import local_payload_storage
 
-    return local_payload_storage(payload_size_threshold=256 * 1024)
+    return local_payload_storage(payload_size_threshold=threshold)
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +559,11 @@ def is_quiescent(runner: AgentWorkflowRunner) -> bool:
     )
 
 
+def active_subagent_ids(runner: AgentWorkflowRunner) -> list[str]:
+    """Ids of the subagents this agent is driving (``_WorkflowStatus.active_subagents``)."""
+    return [info.subagent_id for info in runner._status.active_subagents()]
+
+
 def is_closed(runner: AgentWorkflowRunner) -> bool:
     """Whether ``close`` was signalled (``AgentWorkflowRunner._closed``)."""
     return runner._closed
@@ -519,6 +623,28 @@ def stream_base(stream: WorkflowStream) -> int:
 def agent_id(runner: AgentWorkflowRunner) -> str:
     """The runner's short agent id (``AgentWorkflowRunner._agent_id``)."""
     return runner._agent_id
+
+
+def pending_tool_name(runner: AgentWorkflowRunner, tool_id: str) -> str | None:
+    """The tool a pending approval is for (``_WorkflowStatus.approval_entry``)."""
+    entry = runner._status.approval_entry(tool_id)
+    return entry.tool_name if entry is not None else None
+
+
+def guard_tool_approval(
+    runner: AgentWorkflowRunner,
+    adjust: Callable[[ToolApprovalDecision], ToolApprovalDecision],
+) -> None:
+    """Re-register the harness ``tool_approval`` Update so every decision passes through
+    ``adjust`` first (used to drop "always allow" for tools where it isn't permitted). The
+    Signal front door applies the same ``adjust``."""
+
+    async def handler(decision: ToolApprovalDecision) -> Any:
+        return await runner._handle_tool_approval(adjust(decision))
+
+    workflow.set_update_handler(
+        TOOL_APPROVAL_UPDATE, handler, validator=runner._validate_tool_approval
+    )
 
 
 def guard_send_agent_message(

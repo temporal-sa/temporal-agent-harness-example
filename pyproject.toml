@@ -21,6 +21,6 @@ dependencies = [
     "trafilatura>=2.0.0",
     "uvicorn>=0.47.0",
     "sse-starlette>=3.4.4",
-    "temporal-agent-harness[code-mode,pydantic-ai]==0.7.0",
+    "temporal-agent-harness[code-mode,pydantic-ai,typesafe]==0.7.0",
     "pydantic-ai-slim[anthropic,google,openai,temporal]==2.14.1",
 ]
