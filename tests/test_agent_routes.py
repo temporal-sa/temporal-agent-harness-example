@@ -1682,6 +1682,38 @@ class ProductViewConfigTests(AgentRoutesTestBase):
         # Ownership is checked first: a foreign session is a 404, not a posture error.
         self.assertEqual(self.set_posture(sid, "never_ask", headers=B).status_code, 404)
 
+    def test_tool_risk_classes_come_from_the_agent_rulebook(self) -> None:
+        from simple_chat_agent.agent import approvals
+
+        for environment in ("catalog", "local"):
+            c = self.config(AGENT_ENVIRONMENT=environment)
+            criteria = approvals.default_criteria(environment)
+            classes = c["tool_risk_classes"]
+            self.assertEqual(set(classes), set(criteria.tools))
+            for name, risk in classes.items():
+                self.assertEqual(risk, approvals.risk_class_for(name, criteria), name)
+                self.assertIn(risk, c["risk_classes"])
+            self.assertEqual(c["risk_classes"], ["read_only", "workspace_edit", "shell", "network", "external_side_effect"])
+            self.assertEqual(c["default_tool_risk_class"], "external_side_effect")
+            self.assertEqual(c["remember_allowed_classes"], ["workspace_edit"])
+        # Spot checks the UI relies on.
+        self.assertEqual(classes["edit_file"], "workspace_edit")
+        self.assertEqual(classes["run_command"], "shell")
+        self.assertEqual(classes["git_commit"], "shell")
+        self.assertEqual(classes["fetch_url"], "network")
+        self.assertEqual(classes["explorer_investigate"], "read_only")
+
+    def test_tool_risk_classes_follow_the_rulebook(self) -> None:
+        # No copy in the API: a change to the agent's table shows up in config as is.
+        from simple_chat_agent.agent import approvals
+
+        with mock.patch.dict(approvals.TOOL_RISK_CLASSES, {"brand_new_tool": "network"}), mock.patch.object(
+            approvals, "REMEMBER_ALLOWED_CRITERIA", frozenset({"workspace_edit", "read_only"})
+        ):
+            c = self.config()
+        self.assertEqual(c["tool_risk_classes"]["brand_new_tool"], "network")
+        self.assertEqual(c["remember_allowed_classes"], ["read_only", "workspace_edit"])
+
     def test_session_retention(self) -> None:
         c = self.config()
         self.assertEqual((c["session_ttl_days"], c["session_ttl_seconds"]), (15, 15 * 24 * 3600))

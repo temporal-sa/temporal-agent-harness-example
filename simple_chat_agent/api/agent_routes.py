@@ -65,6 +65,7 @@ from temporal_agent_harness.harness.agent_protocol import (
 )
 from temporal_agent_harness.harness.agent_protocol.agent_interface import AcceptedFunction
 
+from simple_chat_agent.agent import approvals
 from simple_chat_agent.agent.approvals import DEFAULT_JUDGE_MODEL, JUDGE_MODEL_ENV, configured_judge_backend
 from simple_chat_agent.agent.contracts import (
     AGENT_WORKFLOW_TYPE,
@@ -199,6 +200,19 @@ def posture_options(environment: str, auto_mode: dict[str, Any]) -> list[dict[st
             }
         )
     return options
+
+
+def tool_risk_info(environment: str) -> dict[str, Any]:
+    """Each known tool's risk class and the classes "Always approve" covers, read from the
+    agent's own rulebook (``approvals.default_criteria`` / ``risk_class_for``), never a copy.
+    Tools not listed (MCP, anything new) fall to ``default_tool_risk_class``."""
+    criteria = approvals.default_criteria(environment)  # type: ignore[arg-type]
+    return {
+        "risk_classes": list(approvals.RISK_CLASSES),
+        "tool_risk_classes": {name: approvals.risk_class_for(name, criteria) for name in sorted(criteria.tools)},
+        "default_tool_risk_class": criteria.default,
+        "remember_allowed_classes": [c for c in approvals.RISK_CLASSES if approvals.remember_allowed(c)],
+    }
 
 
 def temporal_ui_base() -> str | None:
@@ -1034,6 +1048,7 @@ def create_agent_router(
         body["posture_options"] = posture_options(environment, auto_mode)
         body["auto_mode"] = auto_mode
         body["links"] = view_links()
+        body.update(tool_risk_info(environment))
         # How long an idle session and its list entry are kept (the store's own TTL).
         ttl = session_ttl_seconds()
         body["session_ttl_seconds"] = ttl
