@@ -49,6 +49,12 @@ class ChatGPTProviderTests(unittest.IsolatedAsyncioTestCase):
             stream_id="stream-1",
             stream_sequence=2,
             stream_attempt=1,
+            stream_agent={
+                "id": "chat-1-subagent-1",
+                "parent_id": "chat-1",
+                "kind": "subagent",
+                "label": "Research one topic",
+            },
         )
 
         self.assertEqual(
@@ -257,6 +263,12 @@ class GeminiProviderTests(unittest.TestCase):
             stream_id="stream-1",
             stream_sequence=2,
             stream_attempt=1,
+            stream_agent={
+                "id": "chat-1",
+                "parent_id": None,
+                "kind": "main",
+                "label": "Main agent",
+            },
         )
 
         self.assertEqual(

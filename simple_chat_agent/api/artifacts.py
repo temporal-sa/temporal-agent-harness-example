@@ -14,7 +14,7 @@ def artifact_response(
     store: AppStore,
     artifact: ArtifactRecord,
     *,
-    disposition: Literal["inline", "attachment"],
+    disposition: Literal["inline", "attachment", "html-preview"],
 ) -> Response:
     if artifact_is_expired(artifact):
         raise HTTPException(status_code=410, detail="Artifact has expired")
@@ -22,6 +22,30 @@ def artifact_response(
         content = store.read_artifact_bytes(artifact)
     except Exception as err:
         raise HTTPException(status_code=404, detail="Artifact file not found") from err
+
+    if disposition == "html-preview":
+        return Response(
+            content,
+            media_type="text/html; charset=utf-8",
+            headers={
+                "Content-Disposition": content_disposition("inline", artifact.name),
+                "Content-Security-Policy": (
+                    "sandbox; default-src 'none'; base-uri 'none'; "
+                    "form-action 'none'; frame-ancestors 'self'; "
+                    "script-src 'none'; connect-src 'none'; object-src 'none'; "
+                    "frame-src 'none'; worker-src 'none'; "
+                    "style-src 'unsafe-inline'; "
+                    "img-src data: blob:; media-src data: blob:; font-src data:"
+                ),
+                "Permissions-Policy": (
+                    "accelerometer=(), camera=(), geolocation=(), gyroscope=(), "
+                    "microphone=(), payment=(), usb=()"
+                ),
+                "Referrer-Policy": "no-referrer",
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     return Response(
         content,

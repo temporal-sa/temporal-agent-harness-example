@@ -1,222 +1,87 @@
-import { CodeBlock, MarkdownContent } from "./MarkdownContent.jsx";
-import { inferCodeLanguage } from "../utils/code.js";
-import {
-  AGENT_TOOL_INPUT_EVENT_PREFIX,
-  AgentStreamEventKind,
-} from "../state/streamEvents.js";
+import { useMemo } from "react";
 
-export function StreamPanel({ turn, collapsed, onToggle, embedded = false }) {
-  if (!turn) return null;
-  const timeline = normalizeStreamTimeline(turn);
-  if (!timeline.segments.length) return null;
+import { AgentRuntime } from "./AgentRuntime.jsx";
+import { AgentStreamEventKind } from "../state/streamEvents.js";
+
+export function StreamPanel({
+  turn,
+  waiting = false,
+  collapsed,
+  onToggle,
+  embedded = false,
+  inputText = "",
+  workflowId = "",
+}) {
+  const timeline = useMemo(() => normalizeStreamTimeline(turn), [turn]);
+  const agents = useMemo(() => streamAgents(timeline), [timeline]);
+
+  if ((!turn || !timeline.segments.length) && !waiting) return null;
+
   return (
     <section
-      className={`stream-panel ${timeline.status}${collapsed ? " collapsed" : ""}${
+      className={`runtime-stream-panel ${timeline.status}${collapsed ? " collapsed" : ""}${
         embedded ? " embedded" : ""
       }`}
     >
-      <div className="stream-panel-header">
-        <div className="stream-panel-title">
-          Streaming visibility
-          <span className="stream-panel-status">{streamPanelStatus(timeline)}</span>
+      <header className="runtime-panel-header">
+        <div>
+          <span className="runtime-panel-mark" />
+          <strong>Agent runtime</strong>
+          <small>{panelStatus(timeline, agents)}</small>
         </div>
         {onToggle ? (
-          <button type="button" className="stream-panel-toggle" onClick={onToggle}>
-            {collapsed ? "Expand" : "Collapse"}
+          <button type="button" onClick={onToggle}>
+            {collapsed ? "Open runtime" : "Collapse"}
           </button>
         ) : null}
-      </div>
-      <div className="stream-panel-body">
-        {collapsed ? (
-          <div className="stream-preview">{streamPanelPreview(timeline)}</div>
-        ) : (
-          <StreamPanelBody timeline={timeline} />
-        )}
-      </div>
+      </header>
+      {collapsed ? (
+        <button type="button" className="runtime-collapsed-preview" onClick={onToggle}>
+          <span className={`runtime-dot ${panelTone(timeline.status)}`} />
+          <strong>{agents.find((agent) => agent.kind === "main")?.latestAction || "Agent activity"}</strong>
+          <small>Open live runtime</small>
+        </button>
+      ) : (
+        <AgentRuntime
+          timeline={timeline}
+          agents={agents}
+          inputText={inputText}
+          workflowId={workflowId}
+        />
+      )}
     </section>
   );
 }
 
-function StreamPanelBody({ timeline }) {
-  return (
-    <div className="stream-timeline">
-      {timeline.segments.map((segment) =>
-        segment.type === "agent" ? (
-          <AgentStreamSegment key={segment.id} segment={segment} />
-        ) : (
-          <ToolStreamSegment key={segment.id} segment={segment} />
-        ),
-      )}
-    </div>
-  );
-}
-
-function AgentStreamSegment({ segment }) {
-  const complete = segment.status === "complete";
-  const text = String(segment.text || "").trim();
-  const thinking = String(segment.thinking || "").trim();
-  const refusalDetails = refusalDetailsText(segment.stopDetails);
-  return (
-    <div className={`stream-agent-segment ${complete ? "complete" : "streaming"}`}>
-      <div className="stream-finished-title">
-        Agent turn {segment.sequence ?? ""} {complete ? "complete" : "streaming"}
-        {complete && segment.stopReason ? ` | ${segment.stopReason}` : ""}
-      </div>
-      {thinking ? <div className="stream-thinking">{thinking}</div> : null}
-      {refusalDetails ? <div className="stream-refusal-details">{refusalDetails}</div> : null}
-      {text ? (
-        complete ? (
-          <MarkdownContent content={text} />
-        ) : (
-          <div className="stream-text">{text}</div>
-        )
-      ) : (
-        <div className="stream-preview">
-          {complete
-            ? `Completed without text (${segment.stopReason || "unknown"}).`
-            : "Waiting for streamed tokens..."}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ToolStreamSegment({ segment }) {
-  const complete = segment.status === "complete";
-  return (
-    <div className={`stream-tool-segment ${complete ? "complete" : "streaming"}`}>
-      <div className="stream-finished-title">
-        Tool activity after agent turn {segment.afterSequence ?? ""}{" "}
-        {complete ? "complete" : "streaming"}
-      </div>
-      {segment.events?.length ? (
-        <StreamToolList events={segment.events} active={!complete} />
-      ) : (
-        <div className="stream-preview">Waiting for tool activity...</div>
-      )}
-    </div>
-  );
-}
-
-function StreamToolList({ events, active }) {
-  return (
-    <div className="stream-tool-list">
-      {events.slice(-5).map((event, index) => (
-        <StreamToolEvent
-          key={streamToolEventKey(event, index)}
-          event={event}
-          active={active}
-        />
-      ))}
-    </div>
-  );
-}
-
-function StreamToolEvent({ event, active }) {
-  const payloadText = streamToolPayloadText(event);
-  const status = event.payload?.status || sandboxProgressStatus(event.payload);
-  return (
-    <div
-      className={`stream-tool-event${
-        event.kind?.startsWith(AGENT_TOOL_INPUT_EVENT_PREFIX) ? " input-streaming" : ""
-      }`}
-    >
-      <div className="stream-tool-name">
-        {streamToolLabel(event)}
-        {status ? <span className="stream-tool-status">{status}</span> : null}
-      </div>
-      <div className="stream-tool-payload">
-        <CodeBlock
-          source={payloadText}
-          languageHint={streamToolLanguage(event, payloadText)}
-          compact
-          highlight={!active}
-          wrapLongLines
-        />
-      </div>
-    </div>
-  );
-}
-
-function streamToolPayloadText(event) {
-  const payload = event.payload || {};
-  if (event.kind?.startsWith(AGENT_TOOL_INPUT_EVENT_PREFIX)) {
-    if (event.kind === AgentStreamEventKind.AGENT_TOOL_INPUT_COMPLETE) {
-      return truncateStreamText(
-        formatStreamValue(payload.input ?? payload.input_partial ?? payload.input_preview),
-      );
-    }
-    return truncateStreamText(String(payload.input_partial || payload.partial_json || ""));
+export function normalizeStreamTimeline(turn) {
+  if (!turn) return { status: "waiting", segments: [] };
+  if (turn.segments) {
+    return {
+      ...turn,
+      segments: turn.segments.map((segment) => ({
+        ...segment,
+        agentId: segment.agentId || "main",
+        parentAgentId: segment.parentAgentId || null,
+        agentKind: segment.agentKind === "subagent" ? "subagent" : "main",
+        agentLabel:
+          segment.agentLabel ||
+          (segment.agentKind === "subagent" ? "Subagent" : "Main agent"),
+      })),
+    };
   }
-
-  if (
-    typeof payload.text === "string" &&
-    (event.kind?.includes("stdout") || event.kind?.includes("stderr"))
-  ) {
-    return truncateStreamText(payload.text);
-  }
-
-  return truncateStreamText(formatStreamValue(payload));
-}
-
-function streamToolLanguage(event, payloadText) {
-  if (event.kind === AgentStreamEventKind.AGENT_TOOL_INPUT_COMPLETE) return "json";
-  if (event.kind?.includes("stdout") || event.kind?.includes("stderr")) {
-    return inferCodeLanguage(payloadText) || "text";
-  }
-  return inferCodeLanguage(payloadText) || "json";
-}
-
-function streamPanelStatus(turn) {
-  const count = streamToolEvents(turn).length;
-  const toolText = count === 1 ? "1 tool event" : `${count} tool events`;
-  const turnCount = turn.segments.filter((segment) => segment.type === "agent").length;
-  const turnText = turnCount === 1 ? "1 agent turn" : `${turnCount} agent turns`;
-  if (turn.status === "interrupted") return `interrupted | ${toolText}`;
-  if (turn.status === "complete") return `complete | ${turnText} | ${toolText}`;
-  if (turn.status === "tooling") return `tool activity | ${turnText} | ${toolText}`;
-  if (turn.status === "waiting") return `finalizing | ${turnText} | ${toolText}`;
-  return `streaming | ${turnText} | ${toolText}`;
-}
-
-function refusalDetailsText(stopDetails) {
-  if (!stopDetails || typeof stopDetails !== "object") return "";
-  const parts = [];
-  if (typeof stopDetails.category === "string" && stopDetails.category) {
-    parts.push(`Category: ${stopDetails.category}`);
-  }
-  if (typeof stopDetails.explanation === "string" && stopDetails.explanation) {
-    parts.push(stopDetails.explanation);
-  }
-  return parts.join(" | ");
-}
-
-function streamPanelPreview(turn) {
-  const activeAgent = latestAgentSegment(turn, { active: true });
-  const latestAgent = latestAgentSegment(turn);
-  const latestEvent = streamToolEvents(turn).at(-1);
-  const text = String(activeAgent?.text || "").trim();
-  const thinking = String(activeAgent?.thinking || "").trim();
-  if (text) return text.replace(/\s+/g, " ").slice(-240);
-  if (thinking) return thinking.replace(/\s+/g, " ").slice(-240);
-  if (latestAgent?.text) return latestAgent.text.replace(/\s+/g, " ").slice(-240);
-  if (latestAgent?.thinking) {
-    return latestAgent.thinking.replace(/\s+/g, " ").slice(-240);
-  }
-  if (latestEvent) return `${streamToolLabel(latestEvent)} | ${latestEvent.kind}`;
-  return streamPanelStatus(turn);
-}
-
-function normalizeStreamTimeline(turn) {
-  if (turn.segments) return turn;
 
   const segments = [];
   for (const finishedTurn of turn.finishedTurns || []) {
     segments.push({
-      id: `agent:${finishedTurn.sequence ?? "unknown"}:${segments.length}`,
+      id: `agent:main:${finishedTurn.sequence ?? "unknown"}:${segments.length}`,
       type: "agent",
+      agentId: "main",
+      parentAgentId: null,
+      agentKind: "main",
+      agentLabel: "Main agent",
       sequence: finishedTurn.sequence ?? null,
       status: "complete",
+      terminal: finishedTurn.stopReason !== "tool_use",
       text: finishedTurn.text || "",
       thinking: finishedTurn.thinking || "",
       stopReason: finishedTurn.stopReason || "unknown",
@@ -226,8 +91,12 @@ function normalizeStreamTimeline(turn) {
     });
     if (finishedTurn.events?.length) {
       segments.push({
-        id: `tools:${finishedTurn.sequence ?? "unknown"}:${segments.length}`,
+        id: `tools:main:${finishedTurn.sequence ?? "unknown"}:${segments.length}`,
         type: "tools",
+        agentId: "main",
+        parentAgentId: null,
+        agentKind: "main",
+        agentLabel: "Main agent",
         afterSequence: finishedTurn.sequence ?? null,
         status: "complete",
         events: finishedTurn.events,
@@ -237,8 +106,12 @@ function normalizeStreamTimeline(turn) {
   }
   if (turn.text || turn.thinking) {
     segments.push({
-      id: `agent:${turn.activeSequence ?? "unknown"}:${segments.length}`,
+      id: `agent:main:${turn.activeSequence ?? "unknown"}:${segments.length}`,
       type: "agent",
+      agentId: "main",
+      parentAgentId: null,
+      agentKind: "main",
+      agentLabel: "Main agent",
       sequence: turn.activeSequence ?? null,
       status: turn.status === "complete" ? "complete" : "streaming",
       text: turn.text || "",
@@ -250,8 +123,12 @@ function normalizeStreamTimeline(turn) {
   }
   if (turn.currentEvents?.length) {
     segments.push({
-      id: `tools:${turn.activeSequence ?? "unknown"}:${segments.length}`,
+      id: `tools:main:${turn.activeSequence ?? "unknown"}:${segments.length}`,
       type: "tools",
+      agentId: "main",
+      parentAgentId: null,
+      agentKind: "main",
+      agentLabel: "Main agent",
       afterSequence: turn.activeSequence ?? null,
       status: turn.status === "complete" ? "complete" : "streaming",
       events: turn.currentEvents,
@@ -261,56 +138,158 @@ function normalizeStreamTimeline(turn) {
   return { ...turn, segments };
 }
 
-function latestAgentSegment(turn, options = {}) {
-  for (let index = turn.segments.length - 1; index >= 0; index -= 1) {
-    const segment = turn.segments[index];
-    if (segment.type !== "agent") continue;
-    if (options.active && segment.status === "complete") continue;
-    return segment;
+export function streamAgents(timeline) {
+  const agents = new Map();
+  for (const segment of timeline.segments || []) {
+    const kind = segment.agentKind === "subagent" ? "subagent" : "main";
+    const id = String(segment.agentId || (kind === "main" ? "main" : "subagent:unknown"));
+    if (!agents.has(id)) {
+      agents.set(id, {
+        id,
+        parentId: segment.parentAgentId || null,
+        parentToolCallId: segment.parentToolCallId || null,
+        kind,
+        label: String(segment.agentLabel || (kind === "main" ? "Main agent" : "Subagent")),
+        segments: [],
+        events: [],
+        startedAt: segment.startedAt || null,
+        completedAt: null,
+      });
+    }
+    const agent = agents.get(id);
+    agent.segments.push(segment);
+    agent.events.push(...(segment.events || []));
+    if (!agent.startedAt && segment.startedAt) agent.startedAt = segment.startedAt;
+    if (segment.completedAt) agent.completedAt = segment.completedAt;
   }
-  return null;
-}
 
-function streamToolEvents(turn) {
-  return turn.segments.flatMap((segment) => segment.events || []);
-}
-
-function streamToolEventKey(event, index) {
-  if (event.streamToolInputKey) return `input:${event.streamToolInputKey}`;
-  if (event.payload?.tool_use_id) return `tool-use:${event.payload.tool_use_id}`;
-  const sequence = event.sequence ?? event.payload?.sequence ?? index;
-  return `${event.kind}:${event.tool_name || ""}:${event.step || ""}:${sequence}`;
-}
-
-function streamToolLabel(event) {
-  if (event.kind === "python_sandbox_stdout") return "python_sandbox stdout";
-  if (event.kind === "python_sandbox_stderr") return "python_sandbox stderr";
-  if (event.kind === "python_sandbox_progress") return "python_sandbox progress";
-  const payloadToolName = event.payload?.tool_name;
-  const name = payloadToolName || event.tool_name || "stream";
-  return event.step ? `${name}:${event.step}` : name;
-}
-
-function sandboxProgressStatus(payload = {}) {
-  const elapsed = Number(payload.elapsed_seconds);
-  const timeout = Number(payload.timeout_seconds);
-  if (!Number.isFinite(elapsed) || !Number.isFinite(timeout) || timeout <= 0) {
-    return "";
+  const startedToolCalls = new Set(
+    [...agents.values()]
+      .filter((agent) => agent.kind === "subagent" && agent.parentToolCallId)
+      .map((agent) => agent.parentToolCallId),
+  );
+  const startedTasks = new Set(
+    [...agents.values()]
+      .filter(
+        (agent) => agent.kind === "subagent" && !agent.parentToolCallId,
+      )
+      .map((agent) => `${agent.parentId || ""}:${agent.label}`),
+  );
+  for (const segment of timeline.segments || []) {
+    if (segment.type !== "tools") continue;
+    for (const event of segment.events || []) {
+      if (event.kind !== AgentStreamEventKind.AGENT_TOOL_INPUT_COMPLETE) continue;
+      if (event.payload?.tool_name !== "create_subagent") continue;
+      const task = String(event.payload?.input?.task || "").trim();
+      const parentId = String(segment.agentId || "main");
+      const parentToolCallId = String(
+        event.payload?.tool_use_id || event.tool_call_id || "",
+      );
+      const taskKey = `${parentId}:${task}`;
+      if (
+        !task ||
+        (parentToolCallId
+          ? startedToolCalls.has(parentToolCallId)
+          : startedTasks.has(taskKey))
+      ) continue;
+      const id = `queued:${parentToolCallId || agents.size}`;
+      agents.set(id, {
+        id,
+        parentId,
+        parentToolCallId: parentToolCallId || null,
+        kind: "subagent",
+        label: task,
+        segments: [],
+        events: [event],
+        startedAt: segment.startedAt || null,
+        completedAt: null,
+        queued: true,
+      });
+      if (parentToolCallId) startedToolCalls.add(parentToolCallId);
+      else startedTasks.add(taskKey);
+    }
   }
-  return `${elapsed}s / ${timeout}s`;
+
+  return [...agents.values()]
+    .sort((left, right) => {
+      if (left.kind === right.kind) return 0;
+      return left.kind === "main" ? -1 : 1;
+    })
+    .map((agent) => {
+    const agentSegments = agent.segments.filter((segment) => segment.type === "agent");
+    const latestAgentSegment = agentSegments[agentSegments.length - 1] || null;
+    const hasLiveSegment = agent.segments.some((segment) =>
+      ["streaming", "retrying"].includes(segment.status),
+    );
+    let status = "waiting";
+    if (agent.queued) status = "queued";
+    else if (
+      ["interrupted", "failed"].includes(latestAgentSegment?.status) ||
+      ["error", "failed", "cancelled", "refusal"].includes(
+        String(latestAgentSegment?.stopReason || "").toLowerCase(),
+      )
+    ) status = "error";
+    else if (latestAgentSegment?.terminal) status = "complete";
+    else if (latestAgentSegment?.status === "retrying") status = "retrying";
+    else if (hasLiveSegment || (agent.kind === "main" && timeline.status === "tooling")) status = "running";
+
+    const latestSegment = agent.segments[agent.segments.length - 1] || null;
+    const latestEvent = agent.events[agent.events.length - 1] || null;
+    let latestAction = "Waiting for activity…";
+    if (status === "queued") latestAction = "Queued for delegation";
+    else if (status === "complete") latestAction = "Completed the response";
+    else if (status === "error") latestAction = "Stopped with an error";
+    else if (latestSegment?.type === "agent") {
+      const thinking = compactText(latestSegment.thinking, 120);
+      const text = compactText(latestSegment.text, 120);
+      latestAction = thinking ? `Reasoning · ${thinking}` : text ? `Drafting · ${text}` : "Model active";
+    } else if (latestEvent) {
+      latestAction = eventSummary(latestEvent);
+    }
+
+      return {
+        ...agent,
+        status,
+        latestAction,
+        turnCount: agentSegments.length,
+        toolCount: new Set(agent.events.map((event, index) =>
+          event.tool_call_id || event.payload?.tool_use_id || event.payload?.operation_id || `${event.kind}:${index}`,
+        )).size,
+      };
+    });
 }
 
-function formatStreamValue(value) {
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch (_error) {
-    return String(value);
-  }
+function eventSummary(event) {
+  const payload = event.payload || {};
+  const name = String(payload.tool_name || event.tool_name || "tool");
+  const input = payload.input || {};
+  const value = input.query || input.url || input.task || input.path || payload.query || payload.path;
+  return value ? `${name} · ${compactText(value, 110)}` : `${name} · ${humanize(event.kind)}`;
 }
 
-function truncateStreamText(value) {
-  const text = String(value || "");
-  if (text.length <= 4000) return text;
-  return text.slice(-4000);
+function panelStatus(timeline, agents) {
+  if (!(timeline.segments || []).length) return "dispatching";
+  const subagents = agents.filter((agent) => agent.kind === "subagent").length;
+  const events = (timeline.segments || []).reduce(
+    (count, segment) => count + (segment.events?.length || 0),
+    0,
+  );
+  const state = timeline.status === "complete" ? "complete" : timeline.status === "interrupted" ? "stopped" : "live";
+  return `${state} · ${subagents} subagent${subagents === 1 ? "" : "s"} · ${events} events`;
+}
+
+function panelTone(status) {
+  if (status === "complete") return "complete";
+  if (status === "interrupted") return "error";
+  return "running";
+}
+
+function humanize(value) {
+  return String(value || "activity").replace(/^agent_/, "").replace(/_/g, " ");
+}
+
+function compactText(value, limit) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit - 1)}…`;
 }

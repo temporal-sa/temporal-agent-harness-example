@@ -18,8 +18,7 @@ This guide runs the demo on your machine with a single external dependency: the 
 Optional tools:
 
 - Docker, if you prefer running dependencies in containers.
-- `aws`, `kubectl`, and Docker buildx, only if you plan to deploy the Kubernetes
-  stacks.
+- Docker buildx, if you want to validate the catalog image locally.
 
 ## Environment
 
@@ -29,6 +28,7 @@ Create a repo-root `.env` file:
 ANTHROPIC_API_KEY=sk-ant-...
 SIMPLE_CHAT_JWT_SECRET=replace-me-with-any-local-secret
 
+SIMPLE_CHAT_AUTH_MODE=local
 SIMPLE_CHAT_LOCAL_AUTH_ENABLED=1
 SIMPLE_CHAT_LOCAL_AUTH_USERNAME=demo
 SIMPLE_CHAT_LOCAL_AUTH_PASSWORD=demo
@@ -41,9 +41,8 @@ SIMPLE_CHAT_WORKER_VERSION=1.0.0
 SIMPLE_CHAT_WORKER_VERSIONING_ENABLED=0
 ```
 
-Do not set `GOOGLE_OAUTH_CLIENT_ID` or `GOOGLE_OAUTH_CLIENT_SECRET` when using
-local auth. If Google OAuth is configured, the local login route is not
-registered and the UI uses Google login instead.
+Deployed authentication is handled by the catalog. Local login is explicitly
+selected by the settings above.
 
 Optional local values:
 
@@ -188,18 +187,3 @@ That is enough for local development and avoids requiring AWS credentials.
 Local storage is not a production durability boundary. Deleting local state or
 resetting the Temporal dev server can orphan old browser-selected chat ids; use
 New Chat if that happens.
-
-## Google OAuth Instead Of Local Auth
-
-If you want to test the deployed-style Google login locally, leave
-`SIMPLE_CHAT_LOCAL_AUTH_ENABLED=0` and configure:
-
-```bash
-GOOGLE_OAUTH_CLIENT_ID=...
-GOOGLE_OAUTH_CLIENT_SECRET=...
-GOOGLE_OAUTH_REDIRECT_URI=http://127.0.0.1:8000/oauth/google/callback
-GOOGLE_OAUTH_ALLOWED_DOMAIN=temporal.io
-```
-
-Google auth and local auth are intentionally mutually exclusive. Google wins if
-both are configured.

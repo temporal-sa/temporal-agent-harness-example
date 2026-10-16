@@ -14,7 +14,7 @@ from simple_chat_agent.common.external_storage import simple_chat_data_converter
 from simple_chat_agent.worker.tools.subagent import SubagentWorkflow
 from simple_chat_agent.worker.user_chats_workflow import UserChatsWorkflow
 from simple_chat_agent.worker.workflow import SimpleChatWorkflow
-
+from simple_chat_agent.worker.workflow_runner import agent_harness_workflow_runner
 
 WORKFLOWS = [SimpleChatWorkflow, UserChatsWorkflow, SubagentWorkflow]
 
@@ -34,6 +34,7 @@ async def main() -> None:
     history = WorkflowHistory.from_json(workflow_id, history_json)
     replayer = Replayer(
         workflows=WORKFLOWS,
+        workflow_runner=agent_harness_workflow_runner(),
         data_converter=simple_chat_data_converter(),
         debug_mode=args.debug_mode,
     )

@@ -7,6 +7,8 @@ from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+from temporalio.exceptions import ApplicationError
+
 from agent_harness.streaming import StreamContext
 from agent_harness.tool_types import ToolType
 from agent_harness.tools import ToolContext, ToolResult, tool
@@ -66,6 +68,13 @@ async def _fetch_url_activity(
         kind="fetch_complete",
     )
 
+    status = int(result.get("status") or 0)
+    if result.get("retryable") or status in {408, 409, 425, 429} or status >= 500:
+        raise ApplicationError(
+            str(result.get("error") or f"HTTP {status}: transient fetch failure"),
+            type="FetchUrlRequestError",
+        )
+
     return result
 
 
@@ -86,6 +95,7 @@ def _fetch_url_sync(url: str, max_chars: int) -> dict[str, object]:
         return {
             "error": "Request timed out.",
             "url": url,
+            "retryable": True,
         }
     except httpx.TooManyRedirects:
         return {
@@ -96,6 +106,7 @@ def _fetch_url_sync(url: str, max_chars: int) -> dict[str, object]:
         return {
             "error": str(err),
             "url": url,
+            "retryable": True,
         }
 
     content_type = fetched["content_type"]

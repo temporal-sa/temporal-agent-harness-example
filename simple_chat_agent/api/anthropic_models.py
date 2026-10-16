@@ -10,29 +10,21 @@ from typing import Any
 from anthropic import Anthropic
 
 from agent_harness.context_manager import DEFAULT_MAX_CONTEXT_TOKENS
-
+from simple_chat_agent.common.model_policy import anthropic_model_is_allowed
 
 FALLBACK_MODEL_OPTIONS = [
     "claude-sonnet-4-5",
     "claude-sonnet-4-6",
-    "claude-opus-4-5",
-    "claude-opus-4-7",
     "claude-opus-4-8",
     "claude-haiku-4-5",
 ]
-FALLBACK_ADAPTIVE_THINKING_MODEL_PREFIXES = (
-    "claude-opus-4-6",
-    "claude-opus-4-7",
-    "claude-opus-4-8",
-)
+FALLBACK_ADAPTIVE_THINKING_MODEL_PREFIXES = ("claude-opus-4-8",)
 THINKING_MODE_ORDER = ("adaptive", "enabled")
 EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_MODEL_CACHE_SECONDS = 300
 DEFAULT_MAX_OUTPUT_TOKENS = 32_000
 
 FALLBACK_MODEL_CAPABILITIES: dict[str, tuple[int | None, int | None]] = {
-    "claude-opus-4-6": (1_000_000, 128_000),
-    "claude-opus-4-7": (1_000_000, 128_000),
     "claude-opus-4-8": (1_000_000, 128_000),
 }
 
@@ -133,6 +125,19 @@ def max_output_tokens_for_model(
     return max(1, int(model.max_tokens))
 
 
+def select_anthropic_model(
+    model_catalog: AnthropicModelCatalog,
+    requested_model: str | None,
+) -> str:
+    model_id = (requested_model or "").strip() or model_catalog.default_model
+    if model_catalog.model_by_id(model_id) is not None:
+        return model_id
+    raise ValueError(
+        f"Unsupported model {model_id!r}. Choose one of: "
+        f"{', '.join(model_catalog.model_ids())}."
+    )
+
+
 def max_context_tokens_for_model(
     model_catalog: AnthropicModelCatalog,
     model_id: str,
@@ -167,8 +172,9 @@ def _load_anthropic_model_catalog() -> AnthropicModelCatalog:
     except Exception as err:
         return _fallback_catalog(str(err))
 
+    models = [model for model in models if anthropic_model_is_allowed(model.id)]
     if not models:
-        return _fallback_catalog("Anthropic returned no models")
+        return _fallback_catalog("Anthropic returned no allowed models")
 
     models = tuple(sorted(_dedupe_models(models), key=_model_sort_key, reverse=True))
     return AnthropicModelCatalog(
@@ -211,12 +217,14 @@ def _fallback_catalog(error: str | None = None) -> AnthropicModelCatalog:
     configured = [
         model.strip()
         for model in os.environ.get("ANTHROPIC_MODEL_OPTIONS", "").split(",")
-        if model.strip()
+        if model.strip() and anthropic_model_is_allowed(model.strip())
     ]
     options = configured or FALLBACK_MODEL_OPTIONS
     configured_default = os.environ.get("ANTHROPIC_MODEL", "").strip()
-    if configured_default:
+    if configured_default and anthropic_model_is_allowed(configured_default):
         options = [configured_default, *options]
+    else:
+        configured_default = ""
 
     models = tuple(
         sorted(
@@ -238,7 +246,9 @@ def _fallback_catalog(error: str | None = None) -> AnthropicModelCatalog:
             reverse=True,
         )
     )
-    default_model = configured_default or (models[0].id if models else FALLBACK_MODEL_OPTIONS[0])
+    default_model = configured_default or (
+        models[0].id if models else FALLBACK_MODEL_OPTIONS[0]
+    )
     return AnthropicModelCatalog(
         source="fallback",
         models=models,
@@ -252,28 +262,19 @@ def _thinking_modes(capabilities: Any) -> tuple[str, ...]:
     if not _supported(thinking):
         return ()
     types = _get(thinking, "types")
-    return tuple(
-        mode
-        for mode in THINKING_MODE_ORDER
-        if _supported(_get(types, mode))
-    )
+    return tuple(mode for mode in THINKING_MODE_ORDER if _supported(_get(types, mode)))
 
 
 def _effort_options(capabilities: Any) -> tuple[str, ...]:
     effort = _get(capabilities, "effort")
     if not _supported(effort):
         return ()
-    return tuple(
-        name
-        for name in EFFORT_ORDER
-        if _supported(_get(effort, name))
-    )
+    return tuple(name for name in EFFORT_ORDER if _supported(_get(effort, name)))
 
 
 def _fallback_thinking_modes(model: str) -> tuple[str, ...]:
     if any(
-        model.startswith(prefix)
-        for prefix in FALLBACK_ADAPTIVE_THINKING_MODEL_PREFIXES
+        model.startswith(prefix) for prefix in FALLBACK_ADAPTIVE_THINKING_MODEL_PREFIXES
     ):
         return ("adaptive", "enabled")
     return ("enabled",)

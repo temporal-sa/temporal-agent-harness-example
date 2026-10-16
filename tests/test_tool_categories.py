@@ -47,6 +47,15 @@ async def unguarded_write_file(ctx: ToolContext, path: str) -> ToolResult:
     return ToolResult(payload={"path": path}, error=False)
 
 
+@tool(
+    name="failed_write_file",
+    description="Return a structured tool failure.",
+    tool_type=ExampleToolCategory.WRITE_FILE,
+)
+async def failed_write_file(ctx: ToolContext, path: str) -> ToolResult:
+    return ToolResult(payload={"error": "disk is full", "path": path}, error=True)
+
+
 async def dynamic_write_file(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult(payload=args, error=False)
 
@@ -145,4 +154,25 @@ class ToolCategoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             tools.get_tool("dynamic_write_file").tool_type,
             "write_file",
+        )
+
+    def test_terminal_stream_event_contains_bounded_success_result(self) -> None:
+        payload = tools_module._stream_tool_result_payload(
+            ToolResult(payload={"path": "notes.txt"}, error=False)
+        )
+
+        self.assertEqual(payload["result_preview"], '{"path":"notes.txt"}')
+        self.assertFalse(payload["result_truncated"])
+
+    def test_terminal_stream_event_contains_structured_failure(self) -> None:
+        payload = tools_module._stream_tool_result_payload(
+            ToolResult(
+                payload={"error": "disk is full", "path": "notes.txt"},
+                error=True,
+            )
+        )
+
+        self.assertEqual(
+            payload["error"],
+            {"type": "ToolResultError", "message": "disk is full"},
         )

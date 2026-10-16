@@ -90,6 +90,16 @@ DEFAULT_ACTIVITY_OPTIONS = ActivityOptions(
     start_to_close_timeout=timedelta(minutes=5)
 )
 
+DEFAULT_TOOL_ACTIVITY_OPTIONS = ActivityOptions(
+    start_to_close_timeout=timedelta(minutes=5),
+    retry_policy=RetryPolicy(
+        initial_interval=timedelta(seconds=1),
+        backoff_coefficient=2.0,
+        maximum_interval=timedelta(seconds=30),
+        maximum_attempts=6,
+    ),
+)
+
 
 def activity_options_with_overrides(
     defaults: ActivityOptions,

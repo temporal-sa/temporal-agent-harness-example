@@ -5,6 +5,7 @@ import { visibleMessageItems } from "../state/chatState.js";
 import { formatBytes } from "../utils/format.js";
 
 export function Messages({
+  workflowId,
   workflowState,
   draftConversation,
   loadingConversation,
@@ -26,12 +27,25 @@ export function Messages({
   const transcript = workflowState?.transcript || [];
   const transcriptOffset = workflowState?.transcript_offset || 0;
   const transcriptTotal = workflowState?.transcript_total ?? transcriptOffset + transcript.length;
+  const activeMessageValue = workflowState?.active_message_index;
+  const activeMessageIndex =
+    activeMessageValue === null || activeMessageValue === undefined
+      ? null
+      : Number(activeMessageValue);
+  const activeMessage = Number.isFinite(activeMessageIndex)
+    ? transcript[activeMessageIndex - transcriptOffset]
+    : null;
   const messageItems = visibleMessageItems(
     transcript,
     localPending,
     transcriptOffset,
     transcriptTotal,
   );
+  const waitingForRuntime =
+    workflowState?.status === "responding" ||
+    localPending.some((pending) =>
+      ["sending", "delivered"].includes(String(pending?.phase || "")),
+    );
   const hasContent = workflowState || localPending.length > 0;
   if (loadingConversation) {
     return <ConversationLoading />;
@@ -78,8 +92,11 @@ export function Messages({
       ))}
       <StreamPanel
         turn={streamTurn}
+        waiting={waitingForRuntime}
         collapsed={streamPanelCollapsed}
         onToggle={onToggleStreamPanel}
+        inputText={activeMessage?.role === "user" ? activeMessage.content : ""}
+        workflowId={workflowId}
       />
       <ApprovalsPanel
         workflowState={workflowState}
@@ -90,7 +107,13 @@ export function Messages({
   );
 }
 
-export function TurnTraceDrawer({ trace, transcriptIndex, open, onClose }) {
+export function TurnTraceDrawer({
+  trace,
+  transcriptIndex,
+  workflowId,
+  open,
+  onClose,
+}) {
   return (
     <section
       className={`turn-trace-drawer-shell${open ? " open" : ""}`}
@@ -113,7 +136,7 @@ export function TurnTraceDrawer({ trace, transcriptIndex, open, onClose }) {
           </button>
         </div>
         <div className="turn-trace-drawer-body">
-          <TurnTraceDetails trace={trace} />
+          <TurnTraceDetails trace={trace} workflowId={workflowId} />
         </div>
       </div>
     </section>
@@ -268,7 +291,7 @@ function AttachmentChips({ attachments }) {
   );
 }
 
-function TurnTraceDetails({ trace }) {
+function TurnTraceDetails({ trace, workflowId }) {
   if (!trace || trace.status === "loading") {
     return <div className="turn-trace-status">Loading turn details...</div>;
   }
@@ -280,7 +303,12 @@ function TurnTraceDetails({ trace }) {
   }
   return (
     <div className="turn-trace-panel">
-      <StreamPanel turn={trace.turn} collapsed={false} embedded />
+      <StreamPanel
+        turn={trace.turn}
+        collapsed={false}
+        embedded
+        workflowId={workflowId}
+      />
     </div>
   );
 }

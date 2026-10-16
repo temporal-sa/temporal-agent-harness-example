@@ -37,7 +37,7 @@ cancellation should still propagate.
 - attachment reader;
 - artifact creator;
 - `fetch_url`;
-- Python sandbox;
+- persistent Bubblewrap workspace shell;
 - research tools;
 - GitHub tools;
 - subagent tool;
@@ -75,9 +75,9 @@ workflow and waits for the UI to approve or reject the requested tool call.
 | `artifacts.py` | `create_artifact` stores durable files that appear in the UI. |
 | `fetch_url.py` | `fetch_url` retrieves a URL and returns extracted readable content, metadata, and useful links. |
 | `github.py` | `github_authenticated_user`, `github_list_repositories`, `github_list_issues`, `github_open_issue`. |
-| `python_sandbox.py` | `python_sandbox` executes Python locally in dev or through a configured Lambda in deployment. |
+| `workspace_shell.py` | `workspace_shell` runs Bash, Python, and other commands through the credential-free workspace executor. It also retains a hidden `python_sandbox` compatibility alias. |
 | `research.py` | Optional SearXNG and Google-backed research tools. |
-| `subagent.py` | `create_subagent` starts a child agent workflow for delegated work. |
+| `subagent.py` | `create_subagent` starts a child agent workflow for delegated work. Every child receives the tool and can delegate recursively; approvals remain anchored to the main chat workflow. |
 | `approval.py` | Approval guard, not a user-visible tool. |
 
 Dynamic HTTP MCP tools are registered by `AppToolSet._sync_mcp_tools()` from the
@@ -120,9 +120,14 @@ hidden marker into the issue body and searches for that marker before creating a
 new issue on retry.
 
 For tools where idempotency is impossible or unknowable, use conservative retry
-policies and document the behavior. The Python sandbox can execute arbitrary
-user code, so the app should not promise semantic idempotency for the code
-inside the sandbox.
+policies and document the behavior. The workspace shell can execute arbitrary
+commands, so it uses one Activity attempt and the executor records a completed
+result by tool-call id. That prevents completed calls from being repeated but
+cannot roll back partial filesystem or network side effects after a hard crash.
+The executor also stays unready if it detects AWS credential variables, a
+ServiceAccount token, any reachable metadata endpoint, or a reachable Kubernetes
+API. This validates the egress rules installed by the Pod's short-lived firewall
+init container and provides a runtime backstop for CNI-specific behavior.
 
 ## Heartbeats And Cancellation
 
@@ -153,7 +158,7 @@ workflow correctness.
 
 Use streaming for:
 
-- sandbox stdout/stderr;
+- workspace-shell stdout/stderr;
 - large tool input/output visibility;
 - user-facing progress during long-running activities.
 
@@ -175,7 +180,11 @@ Both use app storage, not workflow history, for file bytes.
 
 Research tools are feature-gated by environment:
 
-- `SIMPLE_CHAT_SEARXNG_BASE_URL` enables `search_web`.
+- `GOOGLE_SEARCH_GROUNDING_API_KEY` enables Google-grounded `search_web` and
+  takes precedence over SearXNG. `GOOGLE_SEARCH_GROUNDING_MODEL` optionally
+  overrides the default `gemini-2.5-flash` model.
+- `SIMPLE_CHAT_SEARXNG_BASE_URL` enables the compatibility `search_web` backend
+  when Google grounding is not configured.
 - `GOOGLE_API_KEY` or per-service Google keys enable Fact Check, Knowledge
   Graph, Books, YouTube, and Safe Browsing helpers.
 

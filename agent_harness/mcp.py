@@ -6,6 +6,8 @@ import re
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, cast
 
+from temporalio.exceptions import ApplicationError
+
 from .tools import ToolContext, ToolResult, ToolSet
 from .tool_types import ToolType
 from .mcp_types import HttpMcpServerConfig, HttpMcpToolConfig
@@ -114,9 +116,23 @@ async def call_http_mcp_tool(
     except BaseExceptionGroup as err:
         if _is_cancelled_exception_group(err):
             raise
-        result = _mcp_error_payload(err)
+        payload = _mcp_error_payload(err)
+        structured = cast(dict[str, Any], payload["structured_content"])
+        raise ApplicationError(
+            str(structured["error"]),
+            payload["meta"],
+            type="McpToolCallError",
+            non_retryable=bool(structured["reauthorization_required"]),
+        ) from err
     except Exception as err:
-        result = _mcp_error_payload(err)
+        payload = _mcp_error_payload(err)
+        structured = cast(dict[str, Any], payload["structured_content"])
+        raise ApplicationError(
+            str(structured["error"]),
+            payload["meta"],
+            type="McpToolCallError",
+            non_retryable=bool(structured["reauthorization_required"]),
+        ) from err
 
     result["server_id"] = server_id
     result["tool_name"] = tool_name

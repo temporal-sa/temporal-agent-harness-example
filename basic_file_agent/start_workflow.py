@@ -37,7 +37,6 @@ async def main() -> None:
             prompt=args.prompt,
             instructions=args.instructions,
             model=args.model,
-            max_turns=args.max_turns,
         ),
         id=args.workflow_id or f"basic-file-agent-{uuid4()}",
         task_queue=TASK_QUEUE,
@@ -57,12 +56,6 @@ def _parse_args() -> argparse.Namespace:
         "--model",
         default=BasicFileAgentRequest.model,
         help="Claude model name.",
-    )
-    parser.add_argument(
-        "--max-turns",
-        type=int,
-        default=BasicFileAgentRequest.max_turns,
-        help="Maximum provider/tool loop iterations.",
     )
     parser.add_argument("--workflow-id", default="", help="Optional workflow id.")
     return parser.parse_args()

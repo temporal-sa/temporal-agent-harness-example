@@ -45,7 +45,6 @@ class UserChatsInput:
     # every chat and MCP server. Empty on a first start.
     chats: list[ChatRecord] = field(default_factory=list)
     mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
-    demo_workspace: "UserDemoWorkspaceRecord | None" = None
     last_touched_at: str = ""
 
 
@@ -70,7 +69,6 @@ class CreateChatRequest:
     system_prompt: str
     model: str
     max_tokens: int
-    max_turns: int
     max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS
     thinking: ClaudeThinkingConfig | None = None
     initial_message: str | None = None
@@ -79,6 +77,7 @@ class CreateChatRequest:
     mcp_servers: list[HttpMcpServerConfig] = field(default_factory=list)
     good_place_censor: bool = False
     task_queue: str = TASK_QUEUE
+    reference_time: str = ""
 
 
 @dataclass
@@ -96,18 +95,6 @@ class ChatRecord:
     created_at: str
     updated_at: str
     task_queue: str = TASK_QUEUE
-
-
-@dataclass
-class UserDemoWorkspaceRecord:
-    control_workflow_id: str
-    status: str
-    workspace_id: str = ""
-    namespace: str = ""
-    host: str = ""
-    url: str = ""
-    task_queue: str = ""
-    updated_at: str = ""
 
 
 @dataclass
@@ -139,7 +126,6 @@ class UserChatsWorkflow:
         self._search_attr_name = ""
         self._chats: dict[str, ChatRecord] = {}
         self._mcp_servers: dict[str, HttpMcpServerConfig] = {}
-        self._demo_workspace: UserDemoWorkspaceRecord | None = None
         self._run_started_at: datetime | None = None
         self._last_touched_at: datetime | None = None
         self._touched_this_run = False
@@ -160,10 +146,9 @@ class UserChatsWorkflow:
         # first start; the chat/MCP updates that follow repopulate it on replay.
         self._chats = {chat.workflow_id: chat for chat in request.chats}
         self._mcp_servers = {server.server_id: server for server in request.mcp_servers}
-        self._demo_workspace = request.demo_workspace
 
         # This entity workflow receives updates on every chat create/touch/forget
-        # and MCP/workspace change. Checkpoint active runs before claim-checked
+        # and MCP change. Checkpoint active runs before claim-checked
         # payload lifecycle can expire; if no update touched this run for a full
         # TTL, close the registry and its tracked chat workflows.
         while True:
@@ -211,7 +196,13 @@ class UserChatsWorkflow:
             else ""
         )
         pending_messages = (
-            [QueuedChatMessage(content=initial_message, transcript_index=0)]
+            [
+                QueuedChatMessage(
+                    content=initial_message,
+                    transcript_index=0,
+                    reference_time=request.reference_time,
+                )
+            ]
             if initial_message
             else []
         )
@@ -225,7 +216,6 @@ class UserChatsWorkflow:
                 max_tokens=request.max_tokens,
                 max_context_tokens=request.max_context_tokens,
                 thinking=request.thinking,
-                max_turns=request.max_turns,
                 stream_id=workflow_id,
                 available_tool_names=list(request.available_tool_names),
                 github_connection_id=request.github_connection_id,
@@ -258,6 +248,13 @@ class UserChatsWorkflow:
 
     @workflow.update
     async def touch_chat(self, request: TouchChatRequest) -> ChatRecord | None:
+        return self._touch_chat(request)
+
+    @workflow.signal
+    def touch_chat_signal(self, request: TouchChatRequest) -> None:
+        self._touch_chat(request)
+
+    def _touch_chat(self, request: TouchChatRequest) -> ChatRecord | None:
         self._touch()
         record = self._chats.get(request.workflow_id)
         if record is None:
@@ -323,29 +320,6 @@ class UserChatsWorkflow:
 
         self._chats.pop(workflow_id, None)
 
-    @workflow.update
-    async def set_demo_workspace(
-        self,
-        record: UserDemoWorkspaceRecord,
-    ) -> UserDemoWorkspaceRecord:
-        self._touch()
-        updated = UserDemoWorkspaceRecord(
-            control_workflow_id=record.control_workflow_id,
-            status=record.status,
-            workspace_id=record.workspace_id,
-            namespace=record.namespace,
-            host=record.host,
-            url=record.url,
-            task_queue=record.task_queue,
-            updated_at=record.updated_at or workflow.now().isoformat(),
-        )
-        self._demo_workspace = updated
-        return updated
-
-    @workflow.update
-    async def clear_demo_workspace(self) -> None:
-        self._touch()
-        self._demo_workspace = None
 
     @workflow.query
     def list_chats(self) -> list[ChatRecord]:
@@ -359,9 +333,6 @@ class UserChatsWorkflow:
     def has_chat(self, workflow_id: str) -> bool:
         return workflow_id in self._chats
 
-    @workflow.query
-    def demo_workspace(self) -> UserDemoWorkspaceRecord | None:
-        return self._demo_workspace
 
     @workflow.query
     def list_mcp_servers(self) -> list[HttpMcpServerConfig]:
@@ -389,7 +360,6 @@ class UserChatsWorkflow:
             search_attr_name=self._search_attr_name,
             chats=list(self._chats.values()),
             mcp_servers=list(self._mcp_servers.values()),
-            demo_workspace=self._demo_workspace,
             last_touched_at=(
                 self._last_touched_at.isoformat()
                 if self._last_touched_at is not None

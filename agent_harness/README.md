@@ -98,7 +98,12 @@ The generic loop in `Agent.run(...)` does the same sequence for every provider:
 
 The loop treats partial streaming as sideband UX. Durable conversation state is
 only committed when the provider activity returns and the workflow records the
-assistant message or tool results.
+assistant message or tool results. `configure_stream_sink(...)` also accepts one
+optional post-LLM guard. When assigned, text deltas, thinking deltas, and
+completed agent text pass through that guard before the sink emits them. With no
+guard assigned, streaming is unchanged. Stream guards run in the provider
+activity, so they must be pure in-process transforms and cannot schedule their
+own Temporal activities.
 
 ## Context
 
@@ -189,11 +194,26 @@ Providers translate vendor stream events into these fixed event kinds:
 - `agent_tool_input_complete`
 - `agent_complete`
 - `agent_cancelled`
+- `agent_failed`
+
+The harness also emits correlated `harness_*` lifecycle events for LLM guards,
+tools, tool guards, and routed tool/guard Activities. Each lifecycle payload has
+an `operation_id`, and nested operations have a `parent_operation_id`. Activity
+events include the Temporal attempt number so consumers can retain failed
+attempts and render the transition into a retry. `StreamEvent.emitted_at`
+contains the Activity-side UTC timestamp.
 
 The sink is configured by the application runtime. The harness must not require
 stream emission to succeed for workflow correctness. In this demo, the worker
 emits sideband events to the API, and the API reconciles those events with
 durable workflow snapshot/delta queries.
+
+Agents can attach `stream_agent` metadata with a stable `id`, `parent_id`,
+`kind`, and user-facing `label`. A child can also include
+`parent_tool_call_id`, which links its runtime to the tool call that created it.
+The same metadata follows provider deltas, tool and guard activities, and
+sandbox output so a shared conversation stream can be grouped accurately when
+multiple child agents run concurrently.
 
 ## Attachments
 

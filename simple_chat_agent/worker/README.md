@@ -2,7 +2,7 @@
 
 `simple_chat_agent/worker` contains the Temporal worker process and all workflow
 code for the demo application. It is the durable execution boundary: chat
-state, user chat registry state, demo workspace state, approvals, tool
+state, user chat registry state, approvals, tool
 orchestration, and continue-as-new all live here.
 
 The worker is not an HTTP server for the browser. The API sends signals,
@@ -38,10 +38,8 @@ a `ClaudeAgent` for chat workflows.
 | `streaming_activities.py` | Durable settlement activity used to send `turn_settled` to the API stream endpoint. |
 | `workflow.py` | Per-chat workflow. |
 | `user_chats_workflow.py` | Per-user registry/entity workflow. |
-| `demo_workspace_workflow.py` | Per-user demo workspace controller workflow. |
-| `demo_workspace_activities.py` | Kubernetes provisioning/crash/delete activities for temp workspaces. |
 | `tools/` | Application tool providers and tool activities. |
-| `sandbox/` | Python sandbox runtime and Lambda handler. |
+| `sandbox/` | Credential-free Bubblewrap executor plus legacy Python sandbox compatibility. |
 
 ## Registered Workflows
 
@@ -49,12 +47,15 @@ a `ClaudeAgent` for chat workflows.
 
 - `SimpleChatWorkflow`: one chat conversation.
 - `UserChatsWorkflow`: one user registry, including chat list, MCP server
-  configuration, and demo workspace record.
-- `SubagentWorkflow`: child agent workflow used by the `create_subagent` tool.
-- `DemoWorkspaceWorkflow`: controller for temporary demo workspaces.
+  configuration, .
+- `SubagentWorkflow`: recursively delegating child agent workflow used by the
+  `create_subagent` tool. The main workflow is depth 0; subagents through depth
+  2 may delegate, while depth-3 subagents do not receive `create_subagent`.
+  Every descendant keeps the main chat workflow as its approval and artifact
+  authority while recording its immediate delegator for stream lineage.
 
 The worker also registers the provider activity, generic tool and guard
-activity routers, turn-settlement activity, and demo workspace activities.
+activity routers, turn-settlement activity, .
 
 ## SimpleChatWorkflow
 
@@ -95,7 +96,7 @@ the place that schedules provider/tool activity work.
 
 `UserChatsWorkflow` is an entity workflow keyed by user id. It creates chat
 child workflows, tracks active chat records, stores configured MCP servers, and
-stores the user's demo workspace record.
+tracks configured MCP servers.
 
 The API asks this workflow to create chats instead of directly starting
 `SimpleChatWorkflow`. That keeps per-user chat state in one durable place and
@@ -105,17 +106,11 @@ The registry has a 15-day run TTL. If it was touched during the run, it
 continues as new and carries its compact state forward. If it was not touched,
 it signals/cancels associated chats and exits.
 
-## DemoWorkspaceWorkflow
+## Catalog Workspaces
 
-`DemoWorkspaceWorkflow` creates and manages isolated temporary demo workspaces.
-It provisions Kubernetes namespaces, copies configuration, deploys web/API/worker
-workloads, waits for readiness, tracks chats created in that workspace, and
-deletes the workspace on explicit delete, crash simulation, or idle timeout.
-
-Workspace ids are deterministic per user so repeated create requests converge on
-the same controller workflow and namespace shape. Temp workspaces use their own
-task queue and workflow prefix so crashing the temp worker does not affect the
-main demo stack.
+The catalog provisions, crashes, scales, and removes workspaces. The worker
+hosts only the application workflows; it requires no Kubernetes permissions.
+See [Catalog deployment](../../docs/catalog.md).
 
 ## Activities
 
@@ -125,8 +120,8 @@ The worker registers three broad activity categories:
   provider module;
 - generic routers: `agent_harness.run_tool_activity` and
   `agent_harness.run_guard_activity`;
-- application activities: turn-settlement, demo workspace Kubernetes actions,
-  sandbox Lambda invocation, artifact writes, GitHub calls, research calls, and
+- application activities: turn-settlement,
+  persistent workspace commands, artifact writes, GitHub calls, research calls, and
   other tool side effects.
 
 Workflow code should schedule activities with explicit timeouts. Long-running
@@ -136,20 +131,14 @@ points.
 
 ## Worker Versioning
 
-Worker versioning is enabled by default in `main.py`.
+The worker reads the catalog's `TEMPORAL_DEPLOYMENT_NAME` and
+`TEMPORAL_WORKER_BUILD_ID`, with the existing `SIMPLE_CHAT_*` settings as local
+fallbacks. Workflows default to PINNED. Local development can disable versioning
+with `SIMPLE_CHAT_WORKER_VERSIONING_ENABLED=0`.
 
-Environment variables:
-
-- `SIMPLE_CHAT_WORKER_VERSION`: build id, default `1.0.0`.
-- `SIMPLE_CHAT_WORKER_DEPLOYMENT_NAME`: deployment name, default task queue.
-- `SIMPLE_CHAT_WORKER_VERSIONING_ENABLED`: set false/0/no/off to disable.
-
-The default behavior is pinned. Continue-as-new calls use
-`AUTO_UPGRADE`, so a workflow can move to the latest compatible deployment when
-it checkpoints into a new run.
-
-Temporary demo workspaces may disable versioning because each temp workspace has
-a unique task queue and short lifecycle.
+The catalog keeps worker identities separate for crashable environments. Do not
+retire a version while workflows remain pinned to it. This catalog branch starts
+in a fresh namespace; it does not migrate the previous deployments.
 
 ## Codec Server And External Payload Storage
 
@@ -169,13 +158,16 @@ results after pod restarts.
 ## Streaming And Settlement
 
 Provider and tool activities emit sideband stream events through a configured
-stream sink. In Kubernetes, the sink posts to the API's `/internal/stream`
-endpoint. Local dev can use JSONL stream files.
+stream sink. In Kubernetes, workers append directly to Redis Streams while the
+API exposes that ordered log through authenticated SSE. Workspace executor output
+returns over its authenticated internal response stream; the worker publishes it
+to Redis without giving the sandbox Redis credentials. Local dev can use JSONL
+stream files.
 
 Most stream events are best-effort UX. The exception is turn settlement:
 `SimpleChatWorkflow` commits transcript state, then schedules
-`emit_turn_settled`. That activity posts a durable settlement event so the UI can
-reconcile final transcript state in order.
+`emit_turn_settled`. That activity atomically appends an idempotent settlement
+event so the UI can reconcile final transcript state in order.
 
 ## Interrupts And Cancellation
 

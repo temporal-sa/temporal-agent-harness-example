@@ -17,6 +17,13 @@ from .activity_options import (
 from .activity_router import ActivityFn, function_ref
 from .guards import GuardActivityRequest, RUN_GUARD_ACTIVITY_NAME
 from .invocation import maybe_await
+from .streaming import (
+    EmitStreamEventRequest,
+    emit_harness_event,
+    emit_harness_events,
+    stream_error_payload,
+    stream_event_request,
+)
 from .workflow_activities import execute_routed_activity, record_routed_activity_call
 
 LlmGuardFn = Callable[["LlmGuardContext"], Any]
@@ -98,7 +105,9 @@ class LlmGuardContext:
     response: dict | None = None
     state: dict = field(default_factory=dict)
     stream_id: str | None = None
+    stream_agent: dict[str, str | None] | None = None
     activity_options: ActivityOptions = DEFAULT_ACTIVITY_OPTIONS
+    operation_id: str | None = None
     _activity_count: int = field(default=0, init=False)
     _used_unstepped_activity: bool = field(default=False, init=False)
 
@@ -136,6 +145,8 @@ class LlmGuardContext:
                 guard_name=self.guard_name,
                 step=step,
                 stream_id=self.stream_id,
+                stream_agent=self.stream_agent,
+                parent_operation_id=self.operation_id,
             ),
             summary_base=f"llm_guard:{self.timing.value}:{self.guard_name}",
             step=step,
@@ -161,6 +172,7 @@ class LlmGuardExecution:
     state: dict
     action: LlmGuardAction = LlmGuardAction.CONTINUE
     reason: str | None = None
+    stream_events: list[EmitStreamEventRequest] = field(default_factory=list)
 
     @property
     def halted(self) -> bool:
@@ -187,7 +199,10 @@ class LlmGuardPipeline:
         request: dict[str, Any],
         state: dict[str, Any] | None = None,
         stream_id: str | None,
+        stream_agent: dict[str, str | None] | None = None,
         activity_options: ActivityOptions,
+        defer_stream_events: bool = False,
+        emit_stream_events: bool = True,
     ) -> LlmGuardExecution:
         return await self._execute(
             self._pre_guards,
@@ -196,7 +211,10 @@ class LlmGuardPipeline:
             response=None,
             state=state or {},
             stream_id=stream_id,
+            stream_agent=stream_agent,
             activity_options=activity_options,
+            defer_stream_events=defer_stream_events,
+            emit_stream_events=emit_stream_events,
         )
 
     async def execute_post(
@@ -206,7 +224,10 @@ class LlmGuardPipeline:
         response: dict[str, Any],
         state: dict[str, Any],
         stream_id: str | None,
+        stream_agent: dict[str, str | None] | None = None,
         activity_options: ActivityOptions,
+        defer_stream_events: bool = False,
+        emit_stream_events: bool = True,
     ) -> LlmGuardExecution:
         return await self._execute(
             self._post_guards,
@@ -215,7 +236,10 @@ class LlmGuardPipeline:
             response=response,
             state=state,
             stream_id=stream_id,
+            stream_agent=stream_agent,
             activity_options=activity_options,
+            defer_stream_events=defer_stream_events,
+            emit_stream_events=emit_stream_events,
         )
 
     async def _execute(
@@ -227,14 +251,45 @@ class LlmGuardPipeline:
         response: dict[str, Any] | None,
         state: dict[str, Any],
         stream_id: str | None,
+        stream_agent: dict[str, str | None] | None,
         activity_options: ActivityOptions,
+        defer_stream_events: bool,
+        emit_stream_events: bool,
     ) -> LlmGuardExecution:
         current_request = _copy_dict(request)
         current_response = None if response is None else _copy_dict(response)
         current_state = _copy_dict(state)
+        stream_events: list[EmitStreamEventRequest] = []
 
-        for guard in guards:
+        llm_sequence = current_request.get("stream_sequence")
+        agent_id = (
+            stream_agent.get("id")
+            if stream_agent is not None
+            else "main"
+        )
+        llm_operation_id = f"{agent_id or 'main'}:llm:{llm_sequence or 'unknown'}"
+
+        for guard_index, guard in enumerate(guards):
             guard_name = _guard_name(guard)
+            operation_id = (
+                f"{llm_operation_id}:guard:{timing.value}:{guard_index}:{guard_name}"
+            )
+            await _emit_llm_guard_event(
+                stream_id=stream_id,
+                kind="harness_llm_guard_start",
+                payload={
+                    "operation_id": operation_id,
+                    "parent_operation_id": llm_operation_id,
+                    "guard_name": guard_name,
+                    "timing": timing.value,
+                    "llm_sequence": llm_sequence,
+                    "status": "running",
+                },
+                agent=stream_agent,
+                tool_name=guard_name,
+                deferred=stream_events if defer_stream_events else None,
+                enabled=emit_stream_events,
+            )
             ctx = LlmGuardContext(
                 guard_name=guard_name,
                 timing=timing,
@@ -244,9 +299,33 @@ class LlmGuardPipeline:
                 else _copy_dict(current_response),
                 state=_copy_dict(current_state),
                 stream_id=stream_id,
+                stream_agent=stream_agent,
                 activity_options=activity_options,
+                operation_id=operation_id,
             )
-            result = await call_llm_guard(guard, ctx)
+            try:
+                result = await call_llm_guard(guard, ctx)
+            except Exception as err:
+                await _emit_llm_guard_event(
+                    stream_id=stream_id,
+                    kind="harness_llm_guard_failed",
+                    payload={
+                        "operation_id": operation_id,
+                        "parent_operation_id": llm_operation_id,
+                        "guard_name": guard_name,
+                        "timing": timing.value,
+                        "llm_sequence": llm_sequence,
+                        "status": "failed",
+                        "error": stream_error_payload(err),
+                    },
+                    agent=stream_agent,
+                    tool_name=guard_name,
+                    deferred=stream_events if defer_stream_events else None,
+                    enabled=emit_stream_events,
+                )
+                if defer_stream_events:
+                    await emit_harness_events(stream_events)
+                raise
 
             current_request = _copy_dict(result.request or ctx.request)
             if current_response is not None or result.response is not None:
@@ -263,6 +342,28 @@ class LlmGuardPipeline:
                     guard_name=guard_name,
                 )
 
+            await _emit_llm_guard_event(
+                stream_id=stream_id,
+                kind="harness_llm_guard_complete",
+                payload={
+                    "operation_id": operation_id,
+                    "parent_operation_id": llm_operation_id,
+                    "guard_name": guard_name,
+                    "timing": timing.value,
+                    "llm_sequence": llm_sequence,
+                    "status": (
+                        "passed"
+                        if result.action == LlmGuardAction.CONTINUE
+                        else result.action.value
+                    ),
+                    "reason": result.reason,
+                },
+                agent=stream_agent,
+                tool_name=guard_name,
+                deferred=stream_events if defer_stream_events else None,
+                enabled=emit_stream_events,
+            )
+
             if result.action != LlmGuardAction.CONTINUE:
                 current_response = _blocked_response(
                     current_response,
@@ -276,13 +377,47 @@ class LlmGuardPipeline:
                     state=current_state,
                     action=result.action,
                     reason=result.reason,
+                    stream_events=stream_events,
                 )
 
         return LlmGuardExecution(
             request=current_request,
             response=current_response,
             state=current_state,
+            stream_events=stream_events,
         )
+
+
+async def _emit_llm_guard_event(
+    *,
+    stream_id: str | None,
+    kind: str,
+    payload: object,
+    agent: dict[str, str | None] | None,
+    tool_name: str,
+    deferred: list[EmitStreamEventRequest] | None,
+    enabled: bool,
+) -> None:
+    if not enabled:
+        return
+    if deferred is None:
+        await emit_harness_event(
+            stream_id=stream_id,
+            kind=kind,
+            payload=payload,
+            agent=agent,
+            tool_name=tool_name,
+        )
+        return
+    event = stream_event_request(
+        stream_id=stream_id,
+        kind=kind,
+        payload=payload,
+        agent=agent,
+        tool_name=tool_name,
+    )
+    if event is not None:
+        deferred.append(event)
 
 
 async def call_llm_guard(

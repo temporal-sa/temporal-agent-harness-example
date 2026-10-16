@@ -8,6 +8,7 @@ export const AgentStreamEventKind = Object.freeze({
   AGENT_TOOL_INPUT_COMPLETE: "agent_tool_input_complete",
   AGENT_COMPLETE: "agent_complete",
   AGENT_CANCELLED: "agent_cancelled",
+  AGENT_FAILED: "agent_failed",
 });
 
 export const AGENT_STREAM_EVENT_PREFIX = "agent_";

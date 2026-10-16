@@ -362,6 +362,7 @@ Constructor concepts:
 | `max_tokens` | Provider response token budget. |
 | `tool_names` | Optional allow-list from the registered `ToolSet`. |
 | `stream_id` | Correlation id for sideband stream events. |
+| `stream_agent` | Optional agent identity (`id`, `parent_id`, `kind`, `label`) attached to provider and tool events. |
 | `activity_options` | Default options for tool activity routing. |
 | `llm_guard_activity_options` | Default options for LLM guard activity routing. |
 | `pre_llm_guards` / `post_llm_guards` | Request/response guard functions. |
@@ -375,7 +376,7 @@ Important methods:
 
 | Method | Use |
 | --- | --- |
-| `run(user_prompt, attachments=None, state=None, max_turns=20)` | Execute the model/tool loop. Use `state` to resume after continue-as-new. |
+| `run(user_prompt, attachments=None, state=None, reference_time=None)` | Execute the uncapped model/tool loop. `reference_time` adds durable UTC context for relative dates; use `state` to resume after continue-as-new. |
 | `steer(message, mode="immediate")` | Add out-of-band steering during a run. |
 | `interrupt(message, partial_response_policy="discard")` | Interrupt an in-flight provider call or tool call. |
 | `restore_idle_state(state)` | Restore compacted context between turns. |
@@ -424,7 +425,6 @@ Required provider methods:
 | `response_from_guard_execution(...)` | Build a provider-shaped guard response. |
 | `response_with_visible_refusal(...)` | Normalize provider refusals. |
 | `response_message(...)` | Convert provider response into generic assistant message. |
-| `stop_reason_for_max_turns()` | Stop reason used when `max_turns` is reached. |
 
 Provider convenience classes live under `agent_harness.providers`. They keep
 provider-specific options provider-specific while letting workflow code create
@@ -764,7 +764,9 @@ Provider activities should use `AgentStreamWriter` and its fixed event kinds:
 - `agent_cancelled`
 
 Tool or guard activities can accept `StreamContext` by annotation and emit their
-own lower-frequency progress events.
+own lower-frequency progress events. `StreamEvent.agent` identifies the main or
+child agent that caused an event, and `StreamEvent.tool_call_id` lets consumers
+roll multiple progress events into one logical tool invocation.
 
 ### Attachments
 

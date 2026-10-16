@@ -16,6 +16,7 @@ dependencies = [
     "pydantic>=2.13.4",
     "python-multipart>=0.0.29",
     "pyjwt[crypto]>=2.12.1",
+    "redis>=6.4.0",
     "temporalio>=1.27.2",
     "trafilatura>=2.0.0",
     "uvicorn>=0.47.0",

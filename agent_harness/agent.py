@@ -39,6 +39,13 @@ from .providers.interface import (
     start_provider_activity,
 )
 from .sliding_window_context_manager import SlidingWindowContextManager
+from .streaming import (
+    emit_harness_event,
+    emit_harness_events,
+    start_harness_event_batch,
+    stream_error_payload,
+    wait_harness_event_batch,
+)
 from .tools import ToolResult, ToolSet
 
 AgentStopReason = str
@@ -68,6 +75,7 @@ class Agent:
         max_tokens: int = 4096,
         tool_names: list[str] | None = None,
         stream_id: str | None = None,
+        stream_agent: dict[str, str | None] | None = None,
         activity_options: ActivityOptions | None = None,
         llm_guard_activity_options: ActivityOptions | None = None,
         pre_llm_guards: Iterable[LlmGuardFn] | None = None,
@@ -78,6 +86,7 @@ class Agent:
         context_chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
         continue_as_new_policy: ContinueAsNewPolicy | None = None,
     ):
+        self._base_system_prompt = system_prompt
         self._system_prompt = system_prompt
         self._tools = tools
         self._provider = provider
@@ -85,6 +94,7 @@ class Agent:
         self._max_tokens = max_tokens
         self._tool_names = tool_names
         self._stream_id = stream_id
+        self._stream_agent = dict(stream_agent) if stream_agent is not None else None
         self._activity_options = activity_options
         self._llm_guard_activity_options = (
             llm_guard_activity_options or activity_options or DEFAULT_ACTIVITY_OPTIONS
@@ -113,6 +123,7 @@ class Agent:
         self._terminated = False
         self._termination_reason: str | None = None
         self._llm_guard_state: dict[str, Any] = {}
+        self._reference_time: str | None = None
 
     def steer(
         self,
@@ -153,7 +164,7 @@ class Agent:
         *,
         attachments: list[AttachmentRef] | None = None,
         state: AgentState | None = None,
-        max_turns: int = 20,
+        reference_time: str | None = None,
     ) -> AgentResult:
         if self._terminated:
             return self._terminated_result(turns=state.turns if state else 0)
@@ -174,17 +185,31 @@ class Agent:
                 self._context_initialized = True
             self._turn_user_prompt_index = self._context.message_count() - 1
             completed_turns = 0
+            self._reference_time = reference_time.strip() if reference_time else None
         else:
             self._context.restore(state.context_snapshot)
             self._context_initialized = True
             self._llm_guard_state = dict(state.llm_guard_state)
             self._turn_user_prompt_index = None
             completed_turns = state.turns
+            self._reference_time = state.reference_time
+
+        self._system_prompt = self._base_system_prompt
+        if self._reference_time:
+            self._system_prompt = (
+                f"{self._base_system_prompt}\n\n"
+                "<current_datetime>\n"
+                f"Current reference time: {self._reference_time} (UTC).\n"
+                "Use this to interpret relative dates. This timestamp is "
+                "temporal context only, not evidence of current facts; verify "
+                "time-sensitive claims with research tools.\n"
+                "</current_datetime>"
+            )
 
         tool_schemas = self._tools.tool_schemas(self._tool_names)
         turn = completed_turns
 
-        while turn < max_turns:
+        while True:
             if self._interrupt_requested:
                 await self._flush_interrupt_context()
             await self._flush_immediate_context()
@@ -251,20 +276,12 @@ class Agent:
                         ),
                         turns=turn,
                         llm_guard_state=dict(self._llm_guard_state),
+                        reference_time=self._reference_time,
                     ),
                     guard_action=response.guard_action,
                     guard_reason=response.guard_reason,
                     stop_details=response.stop_details,
                 )
-
-        return AgentResult(
-            message=text_message(
-                "assistant",
-                f"Stopped after reaching max_turns={max_turns}.",
-            ),
-            stop_reason=self._provider.stop_reason_for_max_turns(),
-            turns=max_turns,
-        )
 
     async def effective_user_prompt(self) -> str | None:
         """The post-pre-guard text of this turn's initiating user message.
@@ -318,16 +335,23 @@ class Agent:
             stream_id=self._stream_id,
             stream_sequence=self._provider_call_sequence,
             stream_attempt=1,
+            stream_agent=self._stream_agent,
         )
 
         pre_guard_execution = await self._llm_guards.execute_pre(
             request=self._provider.request_to_dict(guard_request),
             state=self._llm_guard_state,
             stream_id=self._stream_id,
+            stream_agent=self._stream_agent,
             activity_options=self._llm_guard_activity_options,
+            defer_stream_events=True,
+        )
+        pre_guard_stream_handle = start_harness_event_batch(
+            pre_guard_execution.stream_events
         )
         guarded = self._provider.request_from_dict(pre_guard_execution.request)
         if pre_guard_execution.halted:
+            await wait_harness_event_batch(pre_guard_stream_handle)
             self._llm_guard_state = pre_guard_execution.state
             return self._provider.response_from_guard_execution(
                 pre_guard_execution,
@@ -341,10 +365,13 @@ class Agent:
         )
 
         try:
-            response = await self._call_provider_with_context_recovery(
-                guarded,
-                tool_params,
-            )
+            try:
+                response = await self._call_provider_with_context_recovery(
+                    guarded,
+                    tool_params,
+                )
+            finally:
+                await wait_harness_event_batch(pre_guard_stream_handle)
             if response is None:
                 return None
 
@@ -358,8 +385,11 @@ class Agent:
                 response=self._provider.response_to_dict(response),
                 state=pre_guard_execution.state,
                 stream_id=self._stream_id,
+                stream_agent=self._stream_agent,
                 activity_options=self._llm_guard_activity_options,
+                defer_stream_events=True,
             )
+            await emit_harness_events(post_guard_execution.stream_events)
             if post_guard_execution.halted:
                 self._llm_guard_state = post_guard_execution.state
                 return self._provider.response_from_guard_execution(
@@ -406,7 +436,32 @@ class Agent:
                     and _is_context_window_exceeded(err)
                 ):
                     context_overflow_retries += 1
+                    previous_attempt = stream_attempt
                     stream_attempt += 1
+                    agent_id = (
+                        self._stream_agent.get("id")
+                        if self._stream_agent is not None
+                        else "main"
+                    )
+                    await emit_harness_event(
+                        stream_id=self._stream_id,
+                        kind="harness_llm_retry",
+                        payload={
+                            "operation_id": (
+                                f"{agent_id or 'main'}:llm:"
+                                f"{self._provider_call_sequence}"
+                            ),
+                            "llm_sequence": self._provider_call_sequence,
+                            "provider": self._provider.name,
+                            "model": self._model,
+                            "failed_attempt": previous_attempt,
+                            "next_attempt": stream_attempt,
+                            "status": "retrying",
+                            "error": stream_error_payload(err),
+                        },
+                        agent=self._stream_agent,
+                        tool_name="agent",
+                    )
                     context_budget = self._context_token_budget(
                         tool_params,
                         context_overflow_retry=True,
@@ -548,11 +603,73 @@ class Agent:
         **kwargs: Any,
     ) -> ToolResult:
         if self._tool_names is not None and tool_name not in self._tool_names:
+            agent_id = (
+                self._stream_agent.get("id")
+                if self._stream_agent is not None
+                else "main"
+            )
+            await emit_harness_event(
+                stream_id=self._stream_id,
+                kind="harness_tool_failed",
+                payload={
+                    "operation_id": tool_call_id
+                    or (
+                        f"{agent_id or 'main'}:tool:"
+                        f"{self._provider_call_sequence}:{tool_name}"
+                    ),
+                    "parent_operation_id": (
+                        f"{agent_id or 'main'}:llm:"
+                        f"{self._provider_call_sequence}"
+                    ),
+                    "tool_name": tool_name,
+                    "llm_sequence": self._provider_call_sequence,
+                    "status": "failed",
+                    "error": {
+                        "type": "ToolUnavailable",
+                        "message": (
+                            f"Tool is not available to this agent: {tool_name}"
+                        ),
+                    },
+                },
+                agent=self._stream_agent,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+            )
             return ToolResult(
                 payload={"error": f"Tool is not available to this agent: {tool_name}"},
                 error=True,
             )
         if tool_name not in self._tools.tool_names():
+            agent_id = (
+                self._stream_agent.get("id")
+                if self._stream_agent is not None
+                else "main"
+            )
+            await emit_harness_event(
+                stream_id=self._stream_id,
+                kind="harness_tool_failed",
+                payload={
+                    "operation_id": tool_call_id
+                    or (
+                        f"{agent_id or 'main'}:tool:"
+                        f"{self._provider_call_sequence}:{tool_name}"
+                    ),
+                    "parent_operation_id": (
+                        f"{agent_id or 'main'}:llm:"
+                        f"{self._provider_call_sequence}"
+                    ),
+                    "tool_name": tool_name,
+                    "llm_sequence": self._provider_call_sequence,
+                    "status": "failed",
+                    "error": {
+                        "type": "UnknownTool",
+                        "message": f"Unknown tool requested: {tool_name}",
+                    },
+                },
+                agent=self._stream_agent,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+            )
             return ToolResult(
                 payload={"error": f"Unknown tool requested: {tool_name}"},
                 error=True,
@@ -562,6 +679,8 @@ class Agent:
             kwargs,
             stream_id=self._stream_id,
             tool_call_id=tool_call_id,
+            stream_agent=self._stream_agent,
+            llm_sequence=self._provider_call_sequence,
             activity_options=self._activity_options,
         )
 
@@ -739,6 +858,7 @@ class AgentState:
     context_snapshot: ContextSnapshot
     turns: int
     llm_guard_state: dict = field(default_factory=dict)
+    reference_time: str | None = None
 
 
 @dataclass

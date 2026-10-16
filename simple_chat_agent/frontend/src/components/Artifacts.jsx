@@ -107,6 +107,17 @@ function ArtifactViewerBody({ viewer }) {
   const previewKind = viewer.previewKind || artifactPreviewKind(artifact);
   if (viewer.loading) return <div className="empty">Loading artifact...</div>;
   if (viewer.error) return <div className="artifact-viewer-error">{viewer.error}</div>;
+  if (previewKind === "html") {
+    return (
+      <iframe
+        className="artifact-viewer-frame"
+        src={`${artifact.view_url}/preview`}
+        sandbox=""
+        referrerPolicy="no-referrer"
+        title={artifact.name || "Artifact HTML preview"}
+      ></iframe>
+    );
+  }
   if (previewKind === "image") {
     return (
       <img

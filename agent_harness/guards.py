@@ -22,7 +22,7 @@ from .activity_router import (
     resolve_function_ref,
 )
 from .invocation import bind_keyword_arguments, maybe_await
-from .streaming import StreamContext
+from .streaming import StreamContext, emit_harness_event, stream_error_payload
 from .tool_types import (
     ToolCategory,
     ToolType,
@@ -136,6 +136,10 @@ class GuardContext:
     tool_args: dict
     tool_result: ToolResult | None = None
     stream_id: str | None = None
+    stream_agent: dict[str, str | None] | None = None
+    tool_call_id: str | None = None
+    llm_sequence: int | None = None
+    operation_id: str | None = None
     activity_options: ActivityOptions = DEFAULT_ACTIVITY_OPTIONS
     _activity_count: int = field(default=0, init=False)
     _used_unstepped_activity: bool = field(default=False, init=False)
@@ -174,6 +178,9 @@ class GuardContext:
                 guard_name=self.guard_name,
                 step=step,
                 stream_id=self.stream_id,
+                stream_agent=self.stream_agent,
+                tool_call_id=self.tool_call_id,
+                parent_operation_id=self.operation_id,
             ),
             summary_base=self.guard_name,
             step=step,
@@ -199,6 +206,9 @@ class GuardActivityRequest:
     guard_name: str | None = None
     step: str | None = None
     stream_id: str | None = None
+    stream_agent: dict[str, str | None] | None = None
+    tool_call_id: str | None = None
+    parent_operation_id: str | None = None
 
 
 @dataclass
@@ -289,9 +299,33 @@ class GuardSet:
         tool_args: dict[str, Any],
         tool_result: ToolResult | None,
         stream_id: str | None,
+        stream_agent: dict[str, str | None] | None,
+        tool_call_id: str | None,
+        llm_sequence: int | None,
+        parent_operation_id: str,
         activity_options: ActivityOptions,
     ) -> GuardFailure | None:
-        for guard in guards:
+        for guard_index, guard in enumerate(guards):
+            operation_id = (
+                f"{parent_operation_id}:guard:{timing.value}:{guard_index}:{guard.name}"
+            )
+            await emit_harness_event(
+                stream_id=stream_id,
+                kind="harness_tool_guard_start",
+                payload={
+                    "operation_id": operation_id,
+                    "parent_operation_id": parent_operation_id,
+                    "guard_name": guard.name,
+                    "timing": timing.value,
+                    "tool_name": tool_name,
+                    "tool_type": tool_type,
+                    "llm_sequence": llm_sequence,
+                    "status": "running",
+                },
+                agent=stream_agent,
+                tool_name=guard.name,
+                tool_call_id=tool_call_id,
+            )
             ctx = GuardContext(
                 guard_name=guard.name,
                 tool_name=tool_name,
@@ -299,9 +333,53 @@ class GuardSet:
                 tool_args=tool_args,
                 tool_result=tool_result,
                 stream_id=stream_id,
+                stream_agent=stream_agent,
+                tool_call_id=tool_call_id,
+                llm_sequence=llm_sequence,
+                operation_id=operation_id,
                 activity_options=activity_options,
             )
-            result = await call_guard(guard.fn, ctx)
+            try:
+                result = await call_guard(guard.fn, ctx)
+            except Exception as err:
+                await emit_harness_event(
+                    stream_id=stream_id,
+                    kind="harness_tool_guard_failed",
+                    payload={
+                        "operation_id": operation_id,
+                        "parent_operation_id": parent_operation_id,
+                        "guard_name": guard.name,
+                        "timing": timing.value,
+                        "tool_name": tool_name,
+                        "tool_type": tool_type,
+                        "llm_sequence": llm_sequence,
+                        "status": "failed",
+                        "error": stream_error_payload(err),
+                    },
+                    agent=stream_agent,
+                    tool_name=guard.name,
+                    tool_call_id=tool_call_id,
+                )
+                raise
+
+            await emit_harness_event(
+                stream_id=stream_id,
+                kind="harness_tool_guard_complete",
+                payload={
+                    "operation_id": operation_id,
+                    "parent_operation_id": parent_operation_id,
+                    "guard_name": guard.name,
+                    "timing": timing.value,
+                    "tool_name": tool_name,
+                    "tool_type": tool_type,
+                    "llm_sequence": llm_sequence,
+                    "status": "passed" if result.passed else "blocked",
+                    "reason": result.reason,
+                },
+                agent=stream_agent,
+                tool_name=guard.name,
+                tool_call_id=tool_call_id,
+            )
             if not result.passed:
                 return GuardFailure(
                     payload=guard_failure_payload(guard, timing, result)
@@ -317,6 +395,8 @@ async def run_guard_activity(request: GuardActivityRequest) -> Any:
         stream_id=request.stream_id,
         tool_name=request.guard_name,
         step=request.step,
+        agent=request.stream_agent,
+        tool_call_id=request.tool_call_id,
     )
     activity_context = RoutedActivityContext(
         route_kind="guard",
@@ -324,12 +404,58 @@ async def run_guard_activity(request: GuardActivityRequest) -> Any:
         step=request.step,
         stream_id=request.stream_id,
     )
-    return await call_activity(
-        fn,
-        request.args,
-        stream,
-        activity_context=activity_context,
+    activity_attempt = temporal_activity.info().attempt
+    parent_operation_id = request.parent_operation_id or (
+        f"guard:{request.guard_name or 'unknown'}"
     )
+    operation_id = (
+        f"{parent_operation_id}:activity:{request.step or request.function_ref}"
+    )
+    await stream.emit(
+        {
+            "operation_id": operation_id,
+            "parent_operation_id": parent_operation_id,
+            "activity_name": request.function_ref,
+            "guard_name": request.guard_name,
+            "activity_attempt": activity_attempt,
+            "status": "running" if activity_attempt == 1 else "retrying",
+        },
+        kind="harness_guard_activity_start",
+    )
+    try:
+        result = await call_activity(
+            fn,
+            request.args,
+            stream,
+            activity_context=activity_context,
+        )
+    except Exception as err:
+        await stream.emit(
+            {
+                "operation_id": operation_id,
+                "parent_operation_id": parent_operation_id,
+                "activity_name": request.function_ref,
+                "guard_name": request.guard_name,
+                "activity_attempt": activity_attempt,
+                "status": "failed",
+                "error": stream_error_payload(err),
+            },
+            kind="harness_guard_activity_failed",
+        )
+        raise
+
+    await stream.emit(
+        {
+            "operation_id": operation_id,
+            "parent_operation_id": parent_operation_id,
+            "activity_name": request.function_ref,
+            "guard_name": request.guard_name,
+            "activity_attempt": activity_attempt,
+            "status": "complete",
+        },
+        kind="harness_guard_activity_complete",
+    )
+    return result
 
 
 async def call_guard(fn: GuardFn, ctx: GuardContext) -> GuardResult:

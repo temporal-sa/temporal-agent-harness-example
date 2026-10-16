@@ -32,10 +32,14 @@ class ArtifactProvider:
         description=(
             "Create a persistent file artifact that the user can view and "
             "download from the chat UI. Use this when the user asks you to "
-            "write, save, export, or create a file. The Python sandbox cannot "
-            "persist files; use this tool for durable file output. Pass text "
+            "write, save, export, or create a user-facing file. Files created "
+            "by workspace_shell persist for later commands, but use this tool "
+            "to publish the final file into the chat UI. Pass text "
             "content directly with encoding='text', or pass base64 content "
             "with encoding='base64' for binary files. File name should be the name of the file only without path - paths are not supported."
+            " HTML artifacts must be self-contained and work without JavaScript "
+            "or network-loaded assets because the viewer deliberately disables "
+            "both."
         ),
         tool_type=ToolType.MUTATING,
         pre_guards=["mutating_tool_approval"],

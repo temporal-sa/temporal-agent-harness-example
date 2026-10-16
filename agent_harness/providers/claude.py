@@ -74,7 +74,7 @@ ClaudeThinkingMode = Literal["enabled", "adaptive"]
 ClaudeThinkingEffort = Literal["low", "medium", "high", "xhigh", "max"]
 
 DEFAULT_CLAUDE_ACTIVITY_OPTIONS = ActivityOptions(
-    start_to_close_timeout=timedelta(minutes=10),
+    start_to_close_timeout=timedelta(minutes=20),
     heartbeat_timeout=timedelta(seconds=10),
 )
 CLAUDE_HEARTBEAT_INTERVAL_SECONDS = 5
@@ -86,6 +86,7 @@ PROVIDER_REFUSAL_FALLBACK = (
     "refusal message, so the app stopped this agent run instead of retrying "
     "the same request."
 )
+_anthropic_clients: dict[tuple[str, str, str], AsyncAnthropic] = {}
 
 
 @dataclass(frozen=True)
@@ -110,6 +111,7 @@ class ClaudeRequest:
     stream_id: str | None = None
     stream_sequence: int | None = None
     stream_attempt: int | None = None
+    stream_agent: dict[str, str | None] | None = None
 
 
 @dataclass
@@ -172,6 +174,7 @@ class ClaudeProvider(AgentProvider):
         stream_id: str | None,
         stream_sequence: int | None,
         stream_attempt: int | None,
+        stream_agent: dict[str, str | None] | None = None,
     ) -> "ClaudeRequest":
         return ClaudeRequest(
             system_prompt=system_prompt,
@@ -183,6 +186,7 @@ class ClaudeProvider(AgentProvider):
             stream_id=stream_id,
             stream_sequence=stream_sequence,
             stream_attempt=stream_attempt,
+            stream_agent=stream_agent,
             **_thinking_request_params(self._thinking, max_tokens=max_tokens),
         )
 
@@ -235,9 +239,6 @@ class ClaudeProvider(AgentProvider):
     def response_message(self, response: ProviderResponse) -> AgentMessage:
         return _claude_message_to_agent_message(cast(ClaudeResponse, response).message)
 
-    def stop_reason_for_max_turns(self) -> ClaudeStopReason:
-        return "max_tokens"
-
 
 class ClaudeAgent(Agent):
     def __init__(
@@ -250,6 +251,7 @@ class ClaudeAgent(Agent):
         thinking: ClaudeThinkingConfig | None = None,
         tool_names: list[str] | None = None,
         stream_id: str | None = None,
+        stream_agent: dict[str, str | None] | None = None,
         activity_options: ActivityOptions | None = None,
         claude_activity_options: ActivityOptions | None = None,
         llm_guard_activity_options: ActivityOptions | None = None,
@@ -273,6 +275,7 @@ class ClaudeAgent(Agent):
             max_tokens=max_tokens,
             tool_names=tool_names,
             stream_id=stream_id,
+            stream_agent=stream_agent,
             activity_options=activity_options,
             llm_guard_activity_options=llm_guard_activity_options,
             pre_llm_guards=pre_llm_guards,
@@ -306,6 +309,7 @@ def _claude_request_to_dict(request: ClaudeRequest) -> dict[str, Any]:
         "stream_id": request.stream_id,
         "stream_sequence": request.stream_sequence,
         "stream_attempt": request.stream_attempt,
+        "stream_agent": _copy_optional_mapping(request.stream_agent),
         "output_config": _copy_optional_mapping(request.output_config),
     }
 
@@ -323,6 +327,10 @@ def _claude_request_from_dict(request: dict[str, Any]) -> ClaudeRequest:
         stream_id=cast(str | None, request.get("stream_id")),
         stream_sequence=cast(int | None, request.get("stream_sequence")),
         stream_attempt=cast(int | None, request.get("stream_attempt")),
+        stream_agent=cast(
+            dict[str, str | None] | None,
+            _copy_optional_mapping(request.get("stream_agent")),
+        ),
     )
 
 
@@ -361,6 +369,28 @@ def _anthropic_client_kwargs() -> dict[str, str]:
     return {"base_url": base_url}
 
 
+def _anthropic_client() -> AsyncAnthropic:
+    kwargs = _anthropic_client_kwargs()
+    key = (
+        os.environ.get("ANTHROPIC_API_KEY", ""),
+        os.environ.get("ANTHROPIC_AUTH_TOKEN", ""),
+        kwargs.get("base_url", ""),
+    )
+    client = _anthropic_clients.get(key)
+    if client is None:
+        client = AsyncAnthropic(max_retries=0, **kwargs)
+        _anthropic_clients[key] = client
+    return client
+
+
+async def close_anthropic_clients() -> None:
+    clients = list(_anthropic_clients.values())
+    _anthropic_clients.clear()
+    for client in clients:
+        with suppress(Exception):
+            await client.close()
+
+
 def _claude_response_from_guard_execution(
     execution: LlmGuardExecution,
     *,
@@ -395,21 +425,32 @@ async def call_agent_api(request: ClaudeRequest) -> ClaudeResponse:
         create_params["output_config"] = request.output_config
 
     try:
-        async with AsyncAnthropic(max_retries=0, **_anthropic_client_kwargs()) as client:
-            if _should_count_request_tokens(request):
-                await _raise_if_claude_context_too_large(
-                    client,
-                    request,
-                    create_params,
-                )
-            response = await _stream_claude_message(
+        client = _anthropic_client()
+        if _should_count_request_tokens(request):
+            await _raise_if_claude_context_too_large(
                 client,
+                request,
                 create_params,
-                stream_id=request.stream_id,
-                stream_sequence=request.stream_sequence,
-                stream_attempt=request.stream_attempt,
             )
+        response = await _stream_claude_message(
+            client,
+            create_params,
+            stream_id=request.stream_id,
+            stream_sequence=request.stream_sequence,
+            stream_attempt=request.stream_attempt,
+            stream_agent=request.stream_agent,
+        )
     except APIStatusError as err:
+        await AgentStreamWriter.for_provider(
+            stream_id=request.stream_id,
+            provider="claude",
+            attempt=request.stream_attempt,
+            agent=request.stream_agent,
+        ).agent_failed(
+            sequence=request.stream_sequence,
+            model=request.model,
+            error=err,
+        )
         if _anthropic_error_is_context_window_exceeded(err):
             raise ApplicationError(
                 str(err),
@@ -422,6 +463,19 @@ async def call_agent_api(request: ClaudeRequest) -> ClaudeResponse:
                 type=err.__class__.__name__,
                 non_retryable=True,
             ) from err
+        raise
+    except BaseException as err:
+        if not isinstance(err, asyncio.CancelledError):
+            await AgentStreamWriter.for_provider(
+                stream_id=request.stream_id,
+                provider="claude",
+                attempt=request.stream_attempt,
+                agent=request.stream_agent,
+            ).agent_failed(
+                sequence=request.stream_sequence,
+                model=request.model,
+                error=err,
+            )
         raise
 
     return ClaudeResponse(
@@ -495,16 +549,21 @@ async def _stream_claude_message(
     stream_id: str | None,
     stream_sequence: int | None,
     stream_attempt: int | None,
+    stream_agent: dict[str, str | None] | None,
 ) -> Any:
     stream = AgentStreamWriter.for_provider(
         stream_id=stream_id,
         provider="claude",
         attempt=stream_attempt,
+        agent=stream_agent,
     )
     heartbeat_state = _ClaudeHeartbeatState(sequence=stream_sequence)
     activity.heartbeat(heartbeat_state.payload("starting"))
     heartbeat_task = asyncio.create_task(_heartbeat_claude_stream(heartbeat_state))
-    await stream.agent_started(sequence=stream_sequence)
+    await stream.agent_started(
+        sequence=stream_sequence,
+        model=cast(str | None, create_params.get("model")),
+    )
 
     try:
         async with client.messages.stream(
@@ -976,4 +1035,3 @@ def _text_from_block_dict(block: Any) -> str:
         refusal = block.get("refusal")
         return refusal if isinstance(refusal, str) else ""
     return ""
-

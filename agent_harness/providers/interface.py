@@ -25,6 +25,7 @@ class ProviderRequest:
     stream_id: str | None = None
     stream_sequence: int | None = None
     stream_attempt: int | None = None
+    stream_agent: dict[str, str | None] | None = None
 
 
 @dataclass
@@ -75,6 +76,7 @@ class AgentProvider(Protocol):
         stream_id: str | None,
         stream_sequence: int | None,
         stream_attempt: int | None,
+        stream_agent: dict[str, str | None] | None = None,
     ) -> ProviderRequest:
         pass
 
@@ -122,9 +124,6 @@ class AgentProvider(Protocol):
         pass
 
     def response_message(self, response: ProviderResponse) -> AgentMessage:
-        pass
-
-    def stop_reason_for_max_turns(self) -> ProviderStopReason:
         pass
 
 

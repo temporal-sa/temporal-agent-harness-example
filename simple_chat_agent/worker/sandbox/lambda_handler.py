@@ -22,6 +22,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         stream_id=stream_data.get("stream_id"),
         tool_name=stream_data.get("tool_name"),
         step=stream_data.get("step"),
+        agent=stream_data.get("agent"),
+        tool_call_id=stream_data.get("tool_call_id"),
     )
     return asyncio.run(
         execute_python_sandbox(

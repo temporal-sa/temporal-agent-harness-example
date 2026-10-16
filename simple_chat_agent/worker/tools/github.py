@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 
 from temporalio import activity as temporal_activity
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError
 
 from agent_harness.streaming import StreamContext
 from agent_harness.tools import ToolContext, ToolResult, tool
@@ -522,7 +523,11 @@ def _github_api_request(
 ) -> Any:
     connection = app_store().get_oauth_connection_by_id(connection_id)
     if connection is None:
-        return {"error": "GitHub connection was not found."}
+        raise ApplicationError(
+            "GitHub connection was not found.",
+            type="GitHubConnectionNotFound",
+            non_retryable=True,
+        )
 
     url = f"https://api.github.com{path}"
     if query:
@@ -548,12 +553,23 @@ def _github_api_request(
             raw = response.read().decode("utf-8")
             headers = response.headers
     except HTTPError as err:
-        return {
-            "error": f"GitHub API HTTP {err.code}",
-            "details": _read_http_error(err),
-        }
+        details = _read_http_error(err)
+        retryable = (
+            err.code in {408, 409, 425, 429}
+            or err.code >= 500
+            or (err.code == 403 and "rate limit" in details.lower())
+        )
+        raise ApplicationError(
+            f"GitHub API HTTP {err.code}",
+            details,
+            type="GitHubApiError",
+            non_retryable=not retryable,
+        ) from err
     except URLError as err:
-        return {"error": f"GitHub API error: {err.reason}"}
+        raise ApplicationError(
+            f"GitHub API error: {err.reason}",
+            type="GitHubApiError",
+        ) from err
 
     if not raw:
         data: Any = {}

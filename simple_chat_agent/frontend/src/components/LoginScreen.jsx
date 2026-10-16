@@ -10,12 +10,12 @@ export function LoginScreen({
   onLocalUsernameChange,
   onLocalPasswordChange,
   onLocalSubmit,
-  onGoogleLoginClick,
+  onCatalogLoginClick,
 }) {
   return (
     <section className="login-screen" hidden={hidden}>
       <div className={`login-card${loggingIn ? " logging-in" : ""}`}>
-        <h1 aria-label="Simple Chat Agent"></h1>
+        <h1 aria-label="Advanced AI Agent"></h1>
         <p className="login-subtitle">{subtitle}</p>
         {authMode === "local" ? (
           <LocalLoginForm
@@ -27,10 +27,10 @@ export function LoginScreen({
             onSubmit={onLocalSubmit}
           />
         ) : (
-          <GoogleLoginForm
+          <CatalogLoginForm
             configured={configured}
             error={error}
-            onLoginClick={onGoogleLoginClick}
+            onLoginClick={onCatalogLoginClick}
           />
         )}
       </div>
@@ -38,16 +38,16 @@ export function LoginScreen({
   );
 }
 
-function GoogleLoginForm({ configured, error, onLoginClick }) {
+function CatalogLoginForm({ configured, error, onLoginClick }) {
   return (
     <div className="login-form">
       <a
         className="login-button login-google"
-        href="/oauth/google/start"
+        href="https://catalog.tmprl-demo.cloud"
         aria-disabled={configured ? undefined : "true"}
         onClick={onLoginClick}
       >
-        Log In
+        Open Catalog
       </a>
       <LoginError error={error} />
     </div>

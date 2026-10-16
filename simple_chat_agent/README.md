@@ -1,4 +1,4 @@
-# Simple Chat Agent
+# Advanced AI Agent
 
 This is the demo application for the agent harness. It is intentionally not a
 generic agent SDK. It shows how an application can compose the harness with its
@@ -15,7 +15,7 @@ The app includes:
   visibility, tool approvals, tool configuration, and artifact viewing/downloading.
 - A Temporal worker that hosts the chat workflows, subagent workflow, provider
   activity, generic tool activity, and generic guard activity.
-- Example tools for URL fetches, Python sandbox execution, artifact creation,
+- Example tools for URL fetches, persistent sandboxed shell execution, artifact creation,
   GitHub operations, HTTP MCP servers, optional research/search providers, and
   subagents.
 
@@ -23,7 +23,7 @@ The Python code is split by runtime boundary:
 
 - `simple_chat_agent/api/`: FastAPI app, OAuth flows, SSE, and HTTP API routes.
 - `simple_chat_agent/worker/`: Temporal worker, workflows, tools, codec server,
-  replay tooling, and sandbox Lambda code.
+  replay tooling, and the Bubblewrap workspace executor.
 - `simple_chat_agent/common/`: shared storage, payload conversion, streaming,
   MCP auth, and environment helpers.
 - `simple_chat_agent/frontend/`: React/Vite SPA and the production static
@@ -47,7 +47,8 @@ ANTHROPIC_MODEL=claude-sonnet-4-5
 
 SIMPLE_CHAT_JWT_SECRET=replace-me-for-local-dev
 
-# Local-only login. Do not set Google OAuth credentials when using this mode.
+# Explicit local login. The catalog handles deployed authentication.
+SIMPLE_CHAT_AUTH_MODE=local
 SIMPLE_CHAT_LOCAL_AUTH_ENABLED=1
 SIMPLE_CHAT_LOCAL_AUTH_USERNAME=demo
 SIMPLE_CHAT_LOCAL_AUTH_PASSWORD=demo
@@ -70,35 +71,35 @@ The worker also starts a Temporal Web codec server at
 that URL to decode claim-checked payloads from the local JSON-file external
 storage.
 
-Locally, the `python_sandbox` tool runs inside a subprocess owned by the worker.
-For deployment, set `PYTHON_SANDBOX_LAMBDA_FUNCTION` on the worker to invoke a
-dedicated executor Lambda instead. The Temporal Activity remains on the normal
-worker so workflow history still shows sandbox schedule/start/close timing and
-failures, but arbitrary Python executes outside the agent worker.
+`workspace_shell` executes Bash, piped Python, curl, git, and other command-line
+work inside Bubblewrap. Each agent workflow receives a stable `/workspace`, so
+files and local virtual environments remain available to later tool calls. The
+Temporal Activity stays on the normal worker for durable orchestration, but the
+command runs in a separate credential-free executor Pod. stdout, stderr,
+progress, exit status, and changed-file metadata stream back through the worker.
 
-Package `simple_chat_agent.worker.sandbox.lambda_handler.lambda_handler` as the
-Lambda handler. The executor Lambda does not need Temporal credentials or app
-environment variables. The worker passes a narrow stream endpoint/token in the
-Lambda invoke payload so long-running code can post stdout/stderr/progress
-events back to the API; the sandbox child process still receives only its
-minimal runner environment. Do not pass agent model keys, OAuth credentials,
-artifact storage config, database config, app session secrets, or Temporal config
-into the Lambda environment. The Lambda execution role should not have app IAM
-permissions and the deploy script should force its configured environment to an
-empty map. Before spawning sandbox code on Linux, the host process marks itself
-non-dumpable where permitted; Lambda runtimes that deny that call fall back to
-overwriting sensitive AWS/Lambda entries in the C process environment before
-unsetting them so same-UID child code cannot recover those values through
-`/proc/<pid>/environ`.
+The executor has no ServiceAccount token, IRSA role, application environment, or
+mounted app secrets. A root-only init container installs Pod-network firewall
+rules permitting DNS plus public HTTP/HTTPS while excluding cluster, VPC,
+loopback, link-local, and metadata ranges, then exits before the executor starts.
+The non-root executor has no network-administration capability and cannot change
+those rules; the equivalent NetworkPolicy remains as defense in depth for
+clusters that enforce it. Readiness also fails closed if an AWS credential
+environment, ServiceAccount token, metadata endpoint, or Kubernetes API becomes
+reachable. Bubblewrap clears the command environment, masks the executor's
+`/proc`, makes the image read-only, and exposes only the selected persistent
+workspace as writable. Activity retries are disabled because an arbitrary command
+may mutate files or external systems; the executor also caches completed results
+by tool-call id to make reconnects idempotent.
 
-The worker that hosts the Temporal Activity needs permission to invoke only that
-sandbox Lambda. Set `SIMPLE_CHAT_PUBLIC_URL` on that worker to the public base
-URL for its own app environment; the Lambda callback posts to
-`/internal/stream` under that URL. Use `PYTHON_SANDBOX_STREAM_SINK_URL` only as
-an explicit override. Set `PYTHON_SANDBOX_LAMBDA_QUALIFIER` when invoking a
-published version or alias. The activity retries Lambda invoke/control-plane
-failures, but completed sandbox execution failures are returned to the LLM
-instead of retried.
+The Kubernetes manifests and deployment scripts configure the executor. For a
+local Linux runtime, install `bubblewrap`, set `WORKSPACE_EXECUTOR_TOKEN`, choose
+a writable `WORKSPACE_EXECUTOR_ROOT`, start
+`python -m simple_chat_agent.worker.sandbox.executor`, and give the worker the
+same token plus `WORKSPACE_EXECUTOR_URL=http://127.0.0.1:8082`. The tool is hidden
+when it is not configured. The old `python_sandbox` implementation remains only
+as a rolling-compatibility path for already-running conversations and is not
+advertised to new chats.
 
 For local development, build the frontend once and let the API serve the static
 files:
@@ -114,31 +115,30 @@ uv run python -m simple_chat_agent.api.main
 Open `http://127.0.0.1:8000` and log in. The default credentials are
 `demo` / `demo` unless you override them in `.env`.
 
-For the full local setup, including required CLI tools and optional Google
-OAuth, see [`docs/local-development.md`](../docs/local-development.md).
+Local development uses per-chat JSONL stream files by default. To exercise the
+deployed Redis Streams path locally, start Redis and set
+`SIMPLE_CHAT_REDIS_URL=redis://127.0.0.1:6379/0` for both the API and worker.
+
+For the full local setup, including required CLI tools and optional research tools, see [`docs/local-development.md`](../docs/local-development.md).
 
 ## Authentication Modes
 
-The app always uses the same signed session cookie after login, but it can mint
-that session in two ways:
+The deployed application uses catalog identity headers. In catalog mode it
+never accepts local login cookies. The catalog also provides crashable
+workspaces and their controls. See [Catalog deployment](../docs/catalog.md).
 
-- Google OAuth for shared and deployed environments.
-- Local testing auth for private local runs.
-
-Local testing auth is default-off. When
-`SIMPLE_CHAT_LOCAL_AUTH_ENABLED=1` and Google OAuth is not configured, the API
-registers `POST /api/auth/local/login` and the UI renders the local
-username/password form. If Google OAuth is configured, the local route is not
-registered and the UI uses Google login.
+Local development explicitly sets `SIMPLE_CHAT_AUTH_MODE=local` and
+`SIMPLE_CHAT_LOCAL_AUTH_ENABLED=1`.
 
 ## What To Try
 
 - Start a new chat and ask a normal question.
 - Ask the agent to fetch a URL.
-- Ask it to write and save a small Python file. The `create_artifact` tool will
-  create a persistent artifact that can be viewed or downloaded in the UI.
-- Ask it to run Python. The sandbox tool is a mutating tool, so the workflow will
-  pause for an approval decision before the tool runs.
+- Ask it to create a Python script with `workspace_shell`, run it, and inspect a
+  generated file in a later command. Use `create_artifact` when the final file
+  should be viewable or downloadable in the UI.
+- Ask it to run a Bash pipeline or call a public HTTPS endpoint. The shell is a
+  mutating tool, so the workflow pauses for approval before it runs.
 - Connect an HTTP MCP server from the Tools window and start a new chat so the
   chat workflow receives the updated tool list.
 
@@ -170,7 +170,12 @@ Research tools are opt-in. If the corresponding environment value is absent,
 the tool is not shown in the Tools window and is not offered to new chats.
 
 ```bash
-# Web search through an internal SearXNG instance.
+# Preferred web search backend: Gemini with Google Search grounding. This key
+# is intentionally separate from the keys used by the direct Google APIs.
+GOOGLE_SEARCH_GROUNDING_API_KEY=...
+GOOGLE_SEARCH_GROUNDING_MODEL=gemini-2.5-flash
+
+# Legacy compatibility backend when Google grounding is not configured.
 SIMPLE_CHAT_SEARXNG_BASE_URL=http://127.0.0.1:8080
 
 # Optional Google-backed research enrichers. This shared key enables all of
@@ -188,10 +193,13 @@ GOOGLE_SAFE_BROWSING_API_KEY=...
 For local SearXNG Docker setup, see `docs/local-development.md` from the repo
 root.
 
-The Kubernetes manifests deploy SearXNG as an internal ClusterIP service in the
-primary namespace; it is not routed through ingress. Temporary demo workspaces
-receive the same SearXNG URL and Google research API key environment values so
-the research tools carry over when those values are configured.
+When `GOOGLE_SEARCH_GROUNDING_API_KEY` is set, `search_web` uses Google Search
+grounding and does not call SearXNG. SearXNG remains available only for
+environments without that key. The Kubernetes manifests still deploy SearXNG
+as an internal ClusterIP compatibility service in the primary namespace; it is
+not routed through ingress. Catalog crashable environments receive the same search
+URL and Google research API key environment values, including the grounding
+key, so the research tools carry over when those values are configured.
 
 ## HTTP MCP Servers
 
@@ -248,7 +256,10 @@ state only when needed:
 - `stream`: non-durable sideband stream events. Local dev reads the JSONL stream
   file written by `JsonlStreamSink`; deployment receives the same events through
   the API-owned `/internal/stream` endpoint. This is used for Claude token
-  deltas, streamed tool input construction, and tool activity visibility.
+  deltas, streamed tool input construction, and tool activity visibility. Every
+  new event includes main/subagent origin metadata, allowing the UI to show a
+  compact orchestration overview while retaining a fully attributed raw-event
+  debug view.
 - Durable state loads through `/api/sessions/{workflow_id}/snapshot`, older
   messages through `/messages`, settled-message deltas through `/messages/deltas`,
   and small workflow-state patches through `/state/patch`.

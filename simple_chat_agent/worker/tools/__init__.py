@@ -1,29 +1,37 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agent_harness.mcp import HttpMcpProvider
 from agent_harness.mcp_types import HttpMcpServerConfig
 from agent_harness.tools import ToolResult, ToolSet
+
+if TYPE_CHECKING:
+    from agent_harness.providers.claude import ClaudeThinkingConfig
 
 from .approval import ApprovalDecision, MutatingToolApprovalProvider
 from .attachments import AttachmentProvider, READ_ATTACHMENT_TOOL
 from .artifacts import ArtifactProvider, CREATE_ARTIFACT_TOOL
 from .fetch_url import fetch_url
 from .github import GitHubProvider
-from .python_sandbox import python_sandbox
 from .research import (
     ResearchProvider,
     configured_research_tool_names,
 )
 from .subagent import CREATE_SUBAGENT_TOOL, SubagentProvider
+from .workspace_shell import (
+    LEGACY_PYTHON_SANDBOX_TOOL,
+    WORKSPACE_SHELL_TOOL,
+    WorkspaceShellProvider,
+)
 
 ApprovalRequest = Callable[[str, dict[str, Any]], Awaitable[ApprovalDecision]]
 
 FETCH_URL_TOOL = "fetch_url"
-PYTHON_SANDBOX_TOOL = "python_sandbox"
+PYTHON_SANDBOX_TOOL = LEGACY_PYTHON_SANDBOX_TOOL
 GITHUB_TOOL_NAMES = [
     "github_authenticated_user",
     "github_list_repositories",
@@ -117,9 +125,11 @@ def build_tools(
     user_ref: Callable[[], str | None],
     conversation_id: Callable[[], str | None],
     workflow_id: Callable[[], str],
+    reference_time: Callable[[], str | None],
     github_connection_id: Callable[[], str | None],
     mcp_servers: Callable[[], Iterable[HttpMcpServerConfig]] | None = None,
     default_model: Callable[[], str],
+    thinking: Callable[[], ClaudeThinkingConfig | None] | None = None,
     request_mutating_tool_approval: ApprovalRequest | None = None,
 ) -> ToolSet:
     tools = AppToolSet(
@@ -140,14 +150,17 @@ def build_tools(
             workflow_id=workflow_id,
         )
     )
-    tools.add_tool(fetch_url, python_sandbox)
+    tools.add_tool(fetch_url)
+    tools.add_provider(WorkspaceShellProvider(workspace_id=workflow_id))
     tools.add_provider(ResearchProvider())
     tools.add_provider(GitHubProvider(github_connection_id))
     tools.add_provider(
         SubagentProvider(
             default_model=default_model,
+            thinking=thinking,
             user_ref=user_ref,
             conversation_id=conversation_id,
+            reference_time=reference_time,
             github_connection_id=github_connection_id,
             mcp_servers=lambda: list(
                 mcp_servers() if mcp_servers is not None else ()
@@ -165,14 +178,25 @@ def tool_names_for_connections(
 ) -> list[str]:
     names = [
         FETCH_URL_TOOL,
-        PYTHON_SANDBOX_TOOL,
         READ_ATTACHMENT_TOOL,
         CREATE_ARTIFACT_TOOL,
         CREATE_SUBAGENT_TOOL,
     ]
+    if workspace_shell_enabled():
+        names.append(WORKSPACE_SHELL_TOOL)
     names.extend(research_tool_names or ())
     if github_connection_id is not None:
         names.extend(GITHUB_TOOL_NAMES)
     for server in mcp_servers or ():
         names.extend(HttpMcpProvider(server).tool_names())
     return names
+
+
+def workspace_shell_enabled() -> bool:
+    configured = os.environ.get("SIMPLE_CHAT_WORKSPACE_SHELL_ENABLED")
+    if configured is not None:
+        return configured.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(
+        os.environ.get("WORKSPACE_EXECUTOR_URL", "").strip()
+        and os.environ.get("WORKSPACE_EXECUTOR_TOKEN", "").strip()
+    )

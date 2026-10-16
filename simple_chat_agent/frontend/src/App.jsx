@@ -10,6 +10,7 @@ import { artifactNeedsTextFetch, artifactPreviewKind } from "./utils/artifacts.j
 import { jsonHeaders, responseErrorText } from "./utils/http.js";
 import { mcpOAuthStartUrl } from "./utils/tools.js";
 import {
+  applyReplayedStreamEventsInState,
   applyWorkflowStatePatchInState,
   agentSettingsFromConfig,
   applyTranscriptDeltasInState,
@@ -20,6 +21,7 @@ import {
   mergeReplayedTurnTracesInState,
   normalizeAgentSettings,
   prependTranscriptPageInState,
+  restoreActiveStreamTurnInState,
   saveAgentSettings,
   setTurnTraceErrorInState,
   setTurnTraceLoadingInState,
@@ -34,7 +36,18 @@ import {
   emptyArtifactViewer,
   initialState,
 } from "./state/initialState.js";
+import {
+  coalesceBufferedStreamEvents,
+  coalesceStreamEvents,
+  latestBufferedStreamCursor,
+  takeBufferedStreamEventBatch,
+} from "./state/streamBuffer.js";
 import { AgentStreamEventKind } from "./state/streamEvents.js";
+import {
+  TURN_STREAM_FIRST_EVENT_TIMEOUT_MS,
+  turnStreamNeedsRecovery,
+  turnStreamRecoveryDelay,
+} from "./state/turnStream.js";
 
 const TURN_TRACE_CACHE_PREFIX = "simpleChatTurnTraces:v2:";
 const TURN_TRACE_CACHE_LIMIT = 12;
@@ -186,6 +199,8 @@ export default function App() {
   const workflowStateRefreshRequestRef = useRef(0);
   const streamEventBufferRef = useRef([]);
   const streamEventFrameRef = useRef(null);
+  const turnLatencyRef = useRef(null);
+  const turnStreamRecoveryAttemptRef = useRef(0);
 
   useEffect(() => {
     stateRef.current = state;
@@ -232,7 +247,16 @@ export default function App() {
       if (document.hidden) return;
       const current = stateRef.current;
       if (current.auth === "app" && current.workflowId) {
-        reconcileWorkflow(current.workflowId, { resumeActive: true });
+        // Browsers may keep delivering SSE callbacks while suspending animation
+        // frames in a background tab. Apply anything already received before
+        // reconnecting, then replay Redis so events the browser never delivered
+        // are folded back into the live projection as well.
+        flushStreamEventsNow();
+        closeTurnStream();
+        reconcileWorkflow(current.workflowId, {
+          resumeActive: true,
+          restoreActiveStream: true,
+        });
       }
     }
 
@@ -253,13 +277,6 @@ export default function App() {
     if (pinnedToBottomRef.current) {
       messages.scrollTop = messages.scrollHeight;
     }
-    messages
-      .querySelectorAll(
-        ".stream-current-turn .stream-text, .stream-current-turn .stream-thinking, .stream-agent-segment .stream-text, .stream-agent-segment .stream-thinking",
-      )
-      .forEach((node) => {
-        node.scrollTop = node.scrollHeight;
-      });
   }, [
     state.workflowState,
     state.localPending,
@@ -277,11 +294,10 @@ export default function App() {
         return;
       }
 
-      const [config, tools, conversations, demoWorkspace] = await Promise.all([
+      const [config, tools, conversations] = await Promise.all([
         loadConfigData(),
         loadToolsData(),
         loadConversationsData(),
-        loadDemoWorkspaceData(),
       ]);
       if (run.cancelled) return;
 
@@ -291,7 +307,6 @@ export default function App() {
         auth: "app",
         user,
         config,
-        demoWorkspace,
         tools,
         conversations,
         agentSettings,
@@ -338,6 +353,7 @@ export default function App() {
   }
 
   function beginTurnStream(workflowId) {
+    flushStreamEventsNow();
     closeTurnStream();
     clearLiveStreamState();
     turnStreamTokenRef.current += 1;
@@ -353,8 +369,8 @@ export default function App() {
     streamEventFrameRef.current = null;
   }
 
-  function enqueueStreamEvent(workflowId, event) {
-    streamEventBufferRef.current.push({ workflowId, event });
+  function enqueueStreamEvent(workflowId, event, cursor = "") {
+    streamEventBufferRef.current.push({ workflowId, event, cursor });
     if (streamEventFrameRef.current !== null) return;
     streamEventFrameRef.current = window.requestAnimationFrame(flushStreamEvents);
   }
@@ -369,18 +385,23 @@ export default function App() {
 
   function flushStreamEvents() {
     streamEventFrameRef.current = null;
-    const pending = streamEventBufferRef.current;
-    streamEventBufferRef.current = [];
+    const pending = takeBufferedStreamEventBatch(streamEventBufferRef.current);
     if (!pending.length) return;
+    const coalesced = coalesceBufferedStreamEvents(pending);
+
+    const activeWorkflowId = stateRef.current.workflowId;
+    const appliedCursor = latestBufferedStreamCursor(pending, activeWorkflowId);
 
     setState((previous) => {
       let next = previous;
-      for (const { workflowId, event } of pending) {
+      for (const { workflowId, event } of coalesced) {
         if (workflowId && next.workflowId !== workflowId) continue;
         next = handleStreamEventInState(next, event);
       }
       return next;
     });
+    if (appliedCursor) streamCursorRef.current = appliedCursor;
+    recordFirstRenderedToken(coalesced);
 
     if (streamEventBufferRef.current.length) {
       streamEventFrameRef.current = window.requestAnimationFrame(flushStreamEvents);
@@ -448,7 +469,7 @@ export default function App() {
       setState((previous) => ({
         ...previous,
         authMode: mode,
-        loginConfigured: mode === "google" || mode === "local",
+        loginConfigured: mode === "catalog" || mode === "local",
         loginSubtitle: loginSubtitleForMode(mode),
       }));
     } catch (error) {
@@ -463,8 +484,8 @@ export default function App() {
 
   function loginSubtitleForMode(mode) {
     if (mode === "local") return "Local testing mode. Use demo/demo unless overridden.";
-    if (mode === "google") return "";
-    return "Authentication is not configured. Set Google OAuth credentials or enable local testing auth.";
+    if (mode === "catalog") return "Open this demo from the catalog to sign in.";
+    return "Enable local testing auth to run this demo locally.";
   }
 
   async function loadConversationsData() {
@@ -499,22 +520,6 @@ export default function App() {
     return response.json();
   }
 
-  async function loadDemoWorkspaceData() {
-    const response = await fetch("/api/demo-workspace");
-    if (response.status === 401) {
-      showLogin();
-      return null;
-    }
-    if (!response.ok) throw new Error(await response.text());
-    return response.json();
-  }
-
-  async function refreshDemoWorkspace() {
-    const demoWorkspace = await loadDemoWorkspaceData();
-    setState((previous) => ({ ...previous, demoWorkspace }));
-    return demoWorkspace;
-  }
-
   async function loadWorkflowStateData(workflowId) {
     const started = performance.now();
     const response = await fetch(
@@ -535,6 +540,37 @@ export default function App() {
       workflowState,
       streamCursor: response.headers.get("x-stream-cursor") || "",
     };
+  }
+
+  async function loadActiveStreamReplayData(workflowId, options = {}) {
+    const events = [];
+    let cursor = options.cursor || "";
+    for (let page = 0; page < 50; page += 1) {
+      const params = new URLSearchParams({ limit: "5000" });
+      if (cursor) params.set("cursor", cursor);
+      const response = await fetch(
+        `/api/sessions/${encodeURIComponent(workflowId)}/stream/events?${params}`,
+        { headers: { "Cache-Control": "no-cache" } },
+      );
+      if (response.status === 401) {
+        showLogin();
+        return null;
+      }
+      if (response.status === 404) {
+        await handleMissingWorkflow();
+        return null;
+      }
+      if (!response.ok) throw new Error(await responseErrorText(response));
+      const replay = await response.json();
+      if (!replay.replay_available) return replay;
+      events.push(...(replay.events || []));
+      const nextCursor = replay.cursor || cursor;
+      if (!replay.has_more || nextCursor === cursor) {
+        return { ...replay, cursor: nextCursor, events };
+      }
+      cursor = nextCursor;
+    }
+    throw new Error("active stream replay exceeded 250,000 retained events");
   }
 
   function logSessionLoadTiming(label, workflowId, started, response, workflowState) {
@@ -640,6 +676,7 @@ export default function App() {
     }));
     loadWorkflowStateAndConnect(conversation.workflow_id, loadRequest, {
       resumeActive: true,
+      restoreActiveStream: true,
     }).catch((error) => {
       if (stateLoadRequestRef.current !== loadRequest) return;
       setStatusNotice(`state load failed: ${error}`);
@@ -660,9 +697,45 @@ export default function App() {
         ? updateWorkflowStateInState(previous, loaded.workflowState)
         : previous,
     );
-    if (options.resumeActive && workflowHasActiveRun(loaded.workflowState)) {
+    const activeRun = workflowHasActiveRun(loaded.workflowState);
+    if (!activeRun && !streamCursorRef.current) {
+      streamCursorRef.current = loaded.streamCursor;
+    }
+    if (options.resumeActive && activeRun) {
+      let resumeCursor = streamCursorRef.current || loaded.streamCursor;
+      if (options.restoreActiveStream) {
+        try {
+          const replayStartCursor = streamCursorRef.current;
+          const replay = await loadActiveStreamReplayData(workflowId, {
+            cursor: replayStartCursor,
+          });
+          if (
+            stateLoadRequestRef.current !== loadRequest ||
+            stateRef.current.workflowId !== workflowId
+          ) {
+            return;
+          }
+          if (replay?.replay_available) {
+            resumeCursor = replay.cursor || resumeCursor;
+            streamCursorRef.current = resumeCursor;
+            const replayEvents = coalesceStreamEvents(replay.events || []);
+            setState((previous) =>
+              previous.workflowId === workflowId
+                ? previous.streamTurn && replayStartCursor
+                  ? applyReplayedStreamEventsInState(previous, replayEvents)
+                  : restoreActiveStreamTurnInState(previous, replayEvents)
+                : previous,
+            );
+          } else if (replay?.cursor) {
+            resumeCursor = replay.cursor;
+            streamCursorRef.current = replay.cursor;
+          }
+        } catch (error) {
+          console.warn("active stream replay failed", { workflowId, error });
+        }
+      }
       resumeActiveTurnStream(workflowId, {
-        cursor: streamCursorRef.current || loaded.streamCursor,
+        cursor: resumeCursor,
         afterRevision: loaded.workflowState?.transcript_revision || 0,
       }).catch((error) => {
         setStatusNotice(`stream resume failed: ${error}`);
@@ -672,7 +745,8 @@ export default function App() {
 
   function reconcileWorkflow(workflowId, options = {}) {
     if (!workflowId) return;
-    clearLiveStreamState();
+    flushStreamEventsNow();
+    clearWorkflowStateRefresh();
     const loadRequest = nextStateLoadRequest();
     loadWorkflowStateAndConnect(workflowId, loadRequest, options).catch((error) => {
       if (stateLoadRequestRef.current !== loadRequest) return;
@@ -809,79 +883,194 @@ export default function App() {
     }
   }
 
-  function openTurnEventSource(workflowId, options = {}) {
+  function startTurnEventSource(workflowId, options = {}) {
     const token = beginTurnStream(workflowId);
     let source = null;
     let settled = false;
     let reconciled = false;
     let finished = false;
+    let accepted = false;
+    let firstEventReceived = false;
+    let streamErrored = false;
+    let firstEventTimer = null;
+    let recoveryTimer = null;
 
-    return new Promise((resolve) => {
-      function finish() {
-        if (finished) return;
-        finished = true;
-        if (source) source.close();
-        if (turnStreamTokenRef.current === token) {
-          turnStreamSourceRef.current = null;
-          turnStreamFinishRef.current = null;
-          activeTurnStreamWorkflowRef.current = null;
-        }
-        resolve({ settled, reconciled });
-      }
-
-      turnStreamFinishRef.current = finish;
-      source = new EventSource(turnEventSourceUrl(workflowId, options));
-      turnStreamSourceRef.current = source;
-
-      source.addEventListener("stream", (message) => {
-        if (turnStreamTokenRef.current !== token) return;
-        if (message.lastEventId) streamCursorRef.current = message.lastEventId;
-        const streamEvent = parseStreamEventData(message);
-        if (!streamEvent) return;
-        enqueueStreamEvent(workflowId, streamEvent);
-        if (streamEvent.kind === AgentStreamEventKind.AGENT_START) {
-          clearWorkflowStateRefresh();
-        }
-        if (streamEventNeedsWorkflowStateRefresh(streamEvent)) {
-          scheduleWorkflowStateRefresh(workflowId);
-        }
-      });
-
-      source.addEventListener("turn_settled", async (message) => {
-        if (turnStreamTokenRef.current !== token) return;
-        if (message.lastEventId) streamCursorRef.current = message.lastEventId;
-        const body = parseStreamEventData(message);
-        if (!body) {
-          deferReconcileWorkflow(workflowId, { resumeActive: true });
-          finish();
-          return;
-        }
-        if (body.cursor) streamCursorRef.current = body.cursor;
-        settled = true;
-        flushStreamEventsNow();
-        await applyTurnSettledResult(workflowId, body.result);
-        finish();
-      });
-
-      source.addEventListener("reconcile", (message) => {
-        if (turnStreamTokenRef.current !== token) return;
-        if (message.lastEventId) streamCursorRef.current = message.lastEventId;
-        reconciled = true;
-        finish();
-        deferReconcileWorkflow(workflowId, { resumeActive: true });
-      });
-
-      source.onerror = () => {
-        if (turnStreamTokenRef.current !== token) {
-          finish();
-          return;
-        }
-        if (source.readyState === EventSource.CLOSED && !settled && !reconciled) {
-          finish();
-          deferReconcileWorkflow(workflowId, { resumeActive: true });
-        }
-      };
+    let resolveCompletion;
+    let resolveOpened;
+    const completion = new Promise((resolve) => {
+      resolveCompletion = resolve;
     });
+    const opened = new Promise((resolve) => {
+      resolveOpened = resolve;
+    });
+
+    function finish() {
+      if (finished) return;
+      finished = true;
+      if (firstEventTimer !== null) {
+        window.clearTimeout(firstEventTimer);
+        firstEventTimer = null;
+      }
+      if (recoveryTimer !== null) {
+        window.clearTimeout(recoveryTimer);
+        recoveryTimer = null;
+      }
+      if (source) source.close();
+      if (turnStreamTokenRef.current === token) {
+        turnStreamSourceRef.current = null;
+        turnStreamFinishRef.current = null;
+        activeTurnStreamWorkflowRef.current = null;
+      }
+      resolveOpened(false);
+      resolveCompletion({ settled, reconciled });
+    }
+
+    function scheduleRecovery(reason) {
+      if (
+        finished ||
+        recoveryTimer !== null ||
+        !turnStreamNeedsRecovery({ settled, reconciled })
+      ) {
+        return;
+      }
+      flushStreamEventsNow();
+      const attempt = turnStreamRecoveryAttemptRef.current;
+      turnStreamRecoveryAttemptRef.current += 1;
+      const delay = turnStreamRecoveryDelay(attempt);
+      console.warn("turn stream recovery scheduled", {
+        workflowId,
+        reason,
+        attempt,
+        delay,
+      });
+      recoveryTimer = window.setTimeout(() => {
+        recoveryTimer = null;
+        if (turnStreamTokenRef.current !== token || finished) return;
+        finish();
+        reconcileWorkflow(workflowId, {
+          resumeActive: true,
+          restoreActiveStream: true,
+        });
+      }, delay);
+    }
+
+    function armFirstEventWatchdog() {
+      accepted = true;
+      if (firstEventReceived) return;
+      if (finished) {
+        const attempt = turnStreamRecoveryAttemptRef.current;
+        turnStreamRecoveryAttemptRef.current += 1;
+        window.setTimeout(() => {
+          if (
+            turnStreamTokenRef.current === token &&
+            stateRef.current.workflowId === workflowId
+          ) {
+            reconcileWorkflow(workflowId, {
+              resumeActive: true,
+              restoreActiveStream: true,
+            });
+          }
+        }, turnStreamRecoveryDelay(attempt));
+        return;
+      }
+      if (streamErrored) {
+        scheduleRecovery("stream unavailable after message acceptance");
+        return;
+      }
+      if (firstEventTimer !== null) window.clearTimeout(firstEventTimer);
+      firstEventTimer = window.setTimeout(() => {
+        firstEventTimer = null;
+        scheduleRecovery("no first event after message acceptance");
+      }, TURN_STREAM_FIRST_EVENT_TIMEOUT_MS);
+    }
+
+    function noteStreamEvent() {
+      const first = !firstEventReceived;
+      firstEventReceived = true;
+      streamErrored = false;
+      turnStreamRecoveryAttemptRef.current = 0;
+      if (firstEventTimer !== null) {
+        window.clearTimeout(firstEventTimer);
+        firstEventTimer = null;
+      }
+      return first;
+    }
+
+    turnStreamFinishRef.current = finish;
+    source = new EventSource(turnEventSourceUrl(workflowId, options));
+    turnStreamSourceRef.current = source;
+    source.onopen = () => {
+      resolveOpened(true);
+      markTurnLatency("streamOpenedAt");
+    };
+
+    source.addEventListener("stream", (message) => {
+      if (turnStreamTokenRef.current !== token) return;
+      const streamEvent = parseStreamEventData(message);
+      if (!streamEvent) return;
+      const first = noteStreamEvent();
+      recordFirstStreamEvent(streamEvent, message.lastEventId);
+      enqueueStreamEvent(workflowId, streamEvent, message.lastEventId);
+      if (first) flushStreamEventsNow();
+      if (
+        streamEvent.kind === AgentStreamEventKind.AGENT_START &&
+        streamEvent.agent?.kind !== "subagent"
+      ) {
+        clearWorkflowStateRefresh();
+      }
+      if (streamEventNeedsWorkflowStateRefresh(streamEvent)) {
+        scheduleWorkflowStateRefresh(workflowId);
+      }
+    });
+
+    source.addEventListener("turn_settled", async (message) => {
+      if (turnStreamTokenRef.current !== token) return;
+      noteStreamEvent();
+      flushStreamEventsNow();
+      if (message.lastEventId) streamCursorRef.current = message.lastEventId;
+      const body = parseStreamEventData(message);
+      if (!body) {
+        deferReconcileWorkflow(workflowId, { resumeActive: true });
+        finish();
+        return;
+      }
+      if (body.cursor) streamCursorRef.current = body.cursor;
+      settled = true;
+      await applyTurnSettledResult(workflowId, body.result);
+      finishTurnLatency("settled");
+      finish();
+    });
+
+    source.addEventListener("reconcile", (message) => {
+      if (turnStreamTokenRef.current !== token) return;
+      noteStreamEvent();
+      flushStreamEventsNow();
+      if (message.lastEventId) streamCursorRef.current = message.lastEventId;
+      reconciled = true;
+      finishTurnLatency("reconciled");
+      finish();
+      deferReconcileWorkflow(workflowId, {
+        resumeActive: true,
+        restoreActiveStream: true,
+      });
+    });
+
+    source.onerror = () => {
+      flushStreamEventsNow();
+      if (turnStreamTokenRef.current !== token) {
+        finish();
+        return;
+      }
+      streamErrored = true;
+      if (accepted) scheduleRecovery(`EventSource readyState=${source.readyState}`);
+    };
+    return { completion, finish, opened, armFirstEventWatchdog };
+  }
+
+  async function openTurnEventSource(workflowId, options = {}) {
+    const turnStream = startTurnEventSource(workflowId, options);
+    turnStream.armFirstEventWatchdog();
+    return turnStream.completion;
   }
 
   async function resumeActiveTurnStream(workflowId, options = {}) {
@@ -890,30 +1079,124 @@ export default function App() {
   }
 
   async function streamChatMessage(workflowId, payload, pendingId) {
-    closeTurnStream();
-    clearLiveStreamState();
-    const response = await fetch(`/api/sessions/${encodeURIComponent(workflowId)}/chat`, {
-      method: "POST",
-      headers: jsonHeaders(),
-      body: JSON.stringify(payload),
+    beginTurnLatency(workflowId);
+    turnStreamRecoveryAttemptRef.current = 0;
+    const initialCursor = streamCursorRef.current;
+    const turnStream = startTurnEventSource(workflowId, {
+      cursor: initialCursor,
+      afterRevision: payload.after_revision,
     });
+    if (!initialCursor) await turnStream.opened;
+    let response;
+    try {
+      response = await fetch(`/api/sessions/${encodeURIComponent(workflowId)}/chat`, {
+        method: "POST",
+        headers: jsonHeaders(),
+        body: JSON.stringify(payload),
+      });
+    } catch (error) {
+      turnStream.finish();
+      finishTurnLatency("submit_failed");
+      throw error;
+    }
+    markTurnLatency("acceptedAt");
+    if (turnLatencyRef.current) {
+      turnLatencyRef.current.serverTiming = response.headers.get("Server-Timing") || "";
+    }
     if (response.status === 401) {
+      turnStream.finish();
+      finishTurnLatency("unauthorized");
       showLogin();
       return;
     }
     if (response.status === 404) {
+      turnStream.finish();
+      finishTurnLatency("workflow_missing");
       await handleMissingWorkflow();
       return;
     }
-    if (!response.ok) throw new Error(await responseErrorText(response));
+    if (!response.ok) {
+      turnStream.finish();
+      finishTurnLatency("submit_failed");
+      throw new Error(await responseErrorText(response));
+    }
 
-    const body = await response.json();
-    if (body.cursor) streamCursorRef.current = body.cursor;
+    await response.json();
     markPendingDelivered(pendingId);
-    await openTurnEventSource(workflowId, {
-      cursor: body.cursor || streamCursorRef.current,
-      afterRevision: payload.after_revision,
+    turnStream.armFirstEventWatchdog();
+    await turnStream.completion;
+  }
+
+  function beginTurnLatency(workflowId) {
+    turnLatencyRef.current = {
+      workflowId,
+      submittedAt: performance.now(),
+    };
+  }
+
+  function markTurnLatency(field) {
+    const timing = turnLatencyRef.current;
+    if (timing && timing[field] === undefined) timing[field] = performance.now();
+  }
+
+  function recordFirstStreamEvent(event, cursor) {
+    const timing = turnLatencyRef.current;
+    if (!timing) return;
+    markTurnLatency("firstStreamEventAt");
+    if (
+      timing.firstTokenReceivedAt === undefined &&
+      [AgentStreamEventKind.AGENT_TEXT_DELTA, AgentStreamEventKind.AGENT_THINKING_DELTA].includes(
+        event.kind,
+      )
+    ) {
+      timing.firstTokenReceivedAt = performance.now();
+      timing.providerEmittedAt = event.emitted_at || "";
+      const cursorMilliseconds = String(cursor || "").split("-", 1)[0];
+      const redisMilliseconds = /^\d+$/.test(cursorMilliseconds)
+        ? Number(cursorMilliseconds)
+        : Number.NaN;
+      const emittedMilliseconds = Date.parse(event.emitted_at || "");
+      if (Number.isFinite(redisMilliseconds)) {
+        timing.redisToBrowserMs = Date.now() - redisMilliseconds;
+      }
+      if (Number.isFinite(redisMilliseconds) && Number.isFinite(emittedMilliseconds)) {
+        timing.workerToRedisMs = redisMilliseconds - emittedMilliseconds;
+      }
+    }
+  }
+
+  function recordFirstRenderedToken(pending) {
+    const timing = turnLatencyRef.current;
+    if (!timing || timing.firstTokenRenderedAt !== undefined) return;
+    const hasToken = pending.some(({ event }) =>
+      [AgentStreamEventKind.AGENT_TEXT_DELTA, AgentStreamEventKind.AGENT_THINKING_DELTA].includes(
+        event?.kind,
+      ),
+    );
+    if (!hasToken) return;
+    window.requestAnimationFrame(() => markTurnLatency("firstTokenRenderedAt"));
+  }
+
+  function finishTurnLatency(outcome) {
+    const timing = turnLatencyRef.current;
+    if (!timing) return;
+    const now = performance.now();
+    const duration = (value) =>
+      value === undefined ? undefined : Math.round((value - timing.submittedAt) * 10) / 10;
+    console.info("[turn-latency]", {
+      workflowId: timing.workflowId,
+      outcome,
+      acceptedMs: duration(timing.acceptedAt),
+      streamOpenMs: duration(timing.streamOpenedAt),
+      firstEventMs: duration(timing.firstStreamEventAt),
+      firstTokenReceivedMs: duration(timing.firstTokenReceivedAt),
+      firstTokenRenderedMs: duration(timing.firstTokenRenderedAt),
+      settledMs: Math.round((now - timing.submittedAt) * 10) / 10,
+      workerToRedisMs: timing.workerToRedisMs,
+      redisToBrowserMs: timing.redisToBrowserMs,
+      serverTiming: timing.serverTiming || "",
     });
+    turnLatencyRef.current = null;
   }
 
   async function refreshWorkflowStatePatch(workflowId, options = {}) {
@@ -1008,7 +1291,10 @@ export default function App() {
 
     setState((previous) => {
       if (previous.workflowId !== workflowId) return previous;
-      const merged = mergeReplayedTurnTracesInState(previous, body.events || []);
+      const merged = mergeReplayedTurnTracesInState(
+        previous,
+        coalesceStreamEvents(body.events || []),
+      );
       return merged.turnTraces?.[transcriptIndex]?.turn
         ? merged
         : setTurnTraceErrorInState(
@@ -1036,7 +1322,6 @@ export default function App() {
     const body = await response.json();
     const conversations = await refreshConversations();
     selectConversation(body.workflow_id, options, conversations);
-    touchDemoWorkspaceCountdown();
     return body;
   }
 
@@ -1077,7 +1362,6 @@ export default function App() {
         const body = await response.json();
         if (body.attachment) addComposerAttachment(body.attachment);
       }
-      touchDemoWorkspaceCountdown();
     } catch (error) {
       setState((previous) => ({
         ...previous,
@@ -1122,7 +1406,6 @@ export default function App() {
       if (!response.ok) throw new Error(await responseErrorText(response));
       const body = await response.json();
       if (body.attachment) addComposerAttachment(body.attachment);
-      touchDemoWorkspaceCountdown();
     } catch (error) {
       setState((previous) => ({
         ...previous,
@@ -1366,333 +1649,9 @@ export default function App() {
       await handleMissingWorkflow();
     }
     if (!response.ok) throw new Error(await responseErrorText(response));
-    if (url.startsWith("/api/sessions/")) {
-      touchDemoWorkspaceCountdown();
-    }
     const contentType = response.headers.get("content-type") || "";
     if (contentType.includes("application/json")) return response.json();
     return {};
-  }
-
-  function touchDemoWorkspaceCountdown() {
-    const now = new Date().toISOString();
-    setState((previous) => {
-      const demoWorkspace = previous.demoWorkspace;
-      const workspace = demoWorkspace?.workspace;
-      if (
-        !demoWorkspace?.in_demo_workspace ||
-        !workspace ||
-        workspace.status !== "active"
-      ) {
-        return previous;
-      }
-      return {
-        ...previous,
-        demoWorkspace: {
-          ...demoWorkspace,
-          workspace: {
-            ...workspace,
-            updated_at: now,
-            last_activity_at: now,
-          },
-        },
-      };
-    });
-  }
-
-  function writeDemoWorkspaceLoadingPage(workspaceTab) {
-    const apiUrl = `${window.location.origin}/api/demo-workspace`;
-    workspaceTab.document.open();
-    workspaceTab.document.write(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Creating demo workspace</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link
-    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+Mono:wght@400;500;600&display=swap"
-    rel="stylesheet"
-  />
-  <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; }
-    body {
-      min-height: 100vh;
-      margin: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: #141414;
-      color: #f8fafc;
-      font: 15px/1.5 "Inter", "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    }
-    main {
-      width: min(420px, calc(100vw - 32px));
-      display: grid;
-      justify-items: center;
-      gap: 14px;
-      text-align: center;
-    }
-    img {
-      width: 132px;
-      height: 132px;
-      object-fit: contain;
-    }
-    h1 {
-      margin: 0;
-      font-size: 22px;
-      font-weight: 650;
-      letter-spacing: 0;
-    }
-    p {
-      margin: 0;
-      color: #92a4c3;
-    }
-    .host {
-      max-width: 100%;
-      overflow: hidden;
-      color: #7c8fb1;
-      font: 12px/1.4 "JetBrains Mono", "Noto Sans Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Courier New", monospace;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .meta {
-      display: grid;
-      max-width: 100%;
-      gap: 4px;
-    }
-    .bar {
-      position: relative;
-      width: 100%;
-      height: 4px;
-      overflow: hidden;
-      border-radius: 999px;
-      background: #273860;
-    }
-    .bar::after {
-      position: absolute;
-      inset: 0;
-      width: 42%;
-      border-radius: inherit;
-      background: #444ce7;
-      content: "";
-      animation: load 1.2s ease-in-out infinite;
-    }
-    @keyframes load {
-      0% { transform: translateX(-110%); }
-      100% { transform: translateX(250%); }
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <img src="/static/animated/temporal-logo-animation-inverted-transparent.gif" alt="" />
-    <h1>Loading</h1>
-    <p id="status">Starting workspace creation...</p>
-    <div class="meta">
-      <div class="host" id="namespace"></div>
-    </div>
-    <div class="bar" aria-hidden="true"></div>
-  </main>
-  <script>
-    const apiUrl = ${JSON.stringify(apiUrl)};
-    const statusNode = document.getElementById("status");
-    const namespaceNode = document.getElementById("namespace");
-    const steps = [
-      "Creating Kubernetes namespace...",
-      "Copying configuration and TLS...",
-      "Creating services, routes, and deployments...",
-      "Waiting for readiness..."
-    ];
-    let stepIndex = 0;
-    let terminal = false;
-    let hasServerStatus = false;
-    function setStatus(text, serverStatus = false) {
-      if (serverStatus) hasServerStatus = true;
-      statusNode.textContent = text;
-    }
-    function rotateStep() {
-      if (terminal || hasServerStatus) return;
-      setStatus(steps[stepIndex % steps.length]);
-      stepIndex += 1;
-    }
-    async function pollWorkspace() {
-      try {
-        const response = await fetch(apiUrl, {
-          credentials: "include",
-          cache: "no-store"
-        });
-        if (!response.ok) return;
-        const body = await response.json();
-        const workspace = body.workspace || {};
-        if (workspace.namespace) namespaceNode.textContent = workspace.namespace;
-        if (workspace.provisioning_message) {
-          setStatus(workspace.provisioning_message, true);
-        }
-        if (workspace.status === "active") {
-          terminal = true;
-          setStatus("Workspace ready. Opening...");
-        } else if (workspace.status === "failed") {
-          terminal = true;
-          setStatus(workspace.error || "Workspace creation failed.");
-        } else if (workspace.status === "provisioning" && !workspace.provisioning_message) {
-          rotateStep();
-        }
-      } catch (_) {
-        rotateStep();
-      }
-    }
-    rotateStep();
-    setInterval(rotateStep, 1800);
-    setInterval(pollWorkspace, 5000);
-    pollWorkspace();
-  <\/script>
-</body>
-</html>`);
-    workspaceTab.document.close();
-  }
-
-  function writeDemoWorkspaceLoadingError(workspaceTab, error) {
-    workspaceTab.document.open();
-    workspaceTab.document.write(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Demo workspace failed</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link
-    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+Mono:wght@400;500;600&display=swap"
-    rel="stylesheet"
-  />
-  <style>
-    :root { color-scheme: dark; }
-    body {
-      min-height: 100vh;
-      margin: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: #141414;
-      color: #f8fafc;
-      font: 15px/1.5 "Inter", "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    }
-    main {
-      width: min(520px, calc(100vw - 32px));
-      display: grid;
-      gap: 12px;
-      text-align: center;
-    }
-    h1 { margin: 0; font-size: 22px; letter-spacing: 0; }
-    pre {
-      margin: 0;
-      overflow-wrap: anywhere;
-      white-space: pre-wrap;
-      color: #ffb199;
-      font: 12px/1.5 "JetBrains Mono", "Noto Sans Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Courier New", monospace;
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>Workspace creation failed</h1>
-    <pre>${String(error)
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")}</pre>
-  </main>
-</body>
-</html>`);
-    workspaceTab.document.close();
-  }
-
-  async function ensureDemoWorkspace() {
-    const current = stateRef.current.demoWorkspace;
-    if (current?.login_url && current?.workspace?.status === "active") {
-      window.open(current.login_url, "_blank", "noopener,noreferrer");
-      return;
-    }
-    const workspaceTab = window.open("", "_blank");
-    if (workspaceTab) {
-      writeDemoWorkspaceLoadingPage(workspaceTab);
-    }
-    setState((previous) => ({ ...previous, demoWorkspaceLoading: true }));
-    try {
-      const response = await post("/api/demo-workspace", {});
-      setState((previous) => ({
-        ...previous,
-        demoWorkspace: response,
-        demoWorkspaceLoading: false,
-      }));
-      if (response.login_url) {
-        if (workspaceTab) {
-          workspaceTab.location.href = response.login_url;
-        } else {
-          window.open(response.login_url, "_blank", "noopener,noreferrer");
-        }
-      }
-    } catch (error) {
-      if (workspaceTab) {
-        writeDemoWorkspaceLoadingError(workspaceTab, error);
-      }
-      setState((previous) => ({
-        ...previous,
-        demoWorkspaceLoading: false,
-        statusNotice: `demo workspace failed: ${error}`,
-      }));
-    }
-  }
-
-  async function crashDemoWorkspace() {
-    if (!confirm("Crash all pods in this demo workspace?")) return;
-    const inDemoWorkspace = Boolean(stateRef.current.demoWorkspace?.in_demo_workspace);
-    setState((previous) => ({ ...previous, demoWorkspaceLoading: true }));
-    try {
-      const response = await post("/api/demo-workspace/crash", {});
-      setState((previous) => ({
-        ...previous,
-        demoWorkspace: response,
-        demoWorkspaceLoading: false,
-        statusNotice: "demo workspace pods deleted",
-      }));
-    } catch (error) {
-      setState((previous) => ({
-        ...previous,
-        demoWorkspaceLoading: false,
-        statusNotice: inDemoWorkspace
-          ? "demo workspace crash requested; reconnecting..."
-          : `demo crash failed: ${error}`,
-      }));
-    }
-  }
-
-  async function deleteDemoWorkspace() {
-    if (!confirm("Delete this demo workspace namespace?")) return;
-    setState((previous) => ({ ...previous, demoWorkspaceLoading: true }));
-    try {
-      const response = await fetch("/api/demo-workspace", { method: "DELETE" });
-      if (response.status === 401) {
-        showLogin();
-        return;
-      }
-      if (!response.ok) throw new Error(await responseErrorText(response));
-      const body = await response.json();
-      setState((previous) => ({
-        ...previous,
-        demoWorkspace: body,
-        demoWorkspaceLoading: false,
-        statusNotice: "demo workspace deleted",
-      }));
-    } catch (error) {
-      setState((previous) => ({
-        ...previous,
-        demoWorkspaceLoading: false,
-        statusNotice: `demo delete failed: ${error}`,
-      }));
-    }
   }
 
   async function handleMissingWorkflow() {
@@ -1764,6 +1723,9 @@ export default function App() {
 
   async function resolveApproval(approvalId, decision) {
     if (stateRef.current.resolvingApprovals.has(approvalId)) return;
+    const selectedApproval = (
+      stateRef.current.workflowState?.pending_approvals || []
+    ).find((approval) => approval.approval_id === approvalId);
     setState((previous) => ({
       ...previous,
       resolvingApprovals: new Set([...previous.resolvingApprovals, approvalId]),
@@ -1784,7 +1746,13 @@ export default function App() {
           workflowState: {
             ...previous.workflowState,
             pending_approvals: (previous.workflowState.pending_approvals || []).filter(
-              (approval) => approval.approval_id !== approvalId,
+              (approval) =>
+                approval.approval_id !== approvalId &&
+                (
+                  decision !== "always_allow" ||
+                  !selectedApproval?.memory_key ||
+                  approval.memory_key !== selectedApproval.memory_key
+                ),
             ),
           },
         };
@@ -2008,7 +1976,7 @@ export default function App() {
 
   function handleLoginClick(event) {
     event.preventDefault();
-    if (state.authMode !== "google" || !state.loginConfigured) return;
+    if (state.authMode !== "catalog" || !state.loginConfigured) return;
     const href = event.currentTarget.getAttribute("href");
     setState((previous) => ({ ...previous, loggingIn: true }));
     setTimeout(() => {
@@ -2073,7 +2041,7 @@ export default function App() {
           setState((previous) => ({ ...previous, localLoginPassword: value }))
         }
         onLocalSubmit={handleLocalLoginSubmit}
-        onGoogleLoginClick={handleLoginClick}
+        onCatalogLoginClick={handleLoginClick}
       />
       <div className="app" hidden={state.auth !== "app"}>
         <AppHeader
@@ -2083,9 +2051,6 @@ export default function App() {
           onOpenTools={() =>
             setState((previous) => ({ ...previous, toolsWindowOpen: true }))
           }
-          onEnsureDemoWorkspace={ensureDemoWorkspace}
-          onCrashDemoWorkspace={crashDemoWorkspace}
-          onDeleteDemoWorkspace={deleteDemoWorkspace}
           onLogout={async () => {
             await post("/api/logout", {});
             localStorage.removeItem("simpleChatWorkflowId");
@@ -2121,6 +2086,7 @@ export default function App() {
             }}
           >
             <Messages
+              workflowId={state.workflowId}
               workflowState={state.workflowState}
               draftConversation={state.draftConversation}
               loadingConversation={loadingConversation}
@@ -2208,6 +2174,7 @@ export default function App() {
           open={selectedTraceIndex !== null && selectedTraceIndex !== undefined}
           trace={selectedTrace}
           transcriptIndex={selectedTraceIndex}
+          workflowId={state.workflowId}
           onClose={() =>
             setState((previous) => ({
               ...previous,

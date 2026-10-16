@@ -1,4 +1,3 @@
-import { useEffect, useState } from "react";
 
 import { ConversationList } from "./ConversationList.jsx";
 import {
@@ -9,16 +8,12 @@ import {
   thinkingModesForModel,
 } from "../state/chatState.js";
 
-const WORKSPACE_IDLE_TIMEOUT_MS = 60 * 60 * 1000;
 
 export function AppHeader({
   state,
   status,
   onNewChat,
   onOpenTools,
-  onEnsureDemoWorkspace,
-  onCrashDemoWorkspace,
-  onDeleteDemoWorkspace,
   onLogout,
   onUpdateAgentSettings,
   onUpdateThinkingBudget,
@@ -49,7 +44,7 @@ export function AppHeader({
   return (
     <header>
       <div className="header-left">
-        <h1 aria-label="Simple Chat Agent"></h1>
+        <h1 aria-label="Advanced AI Agent"></h1>
         {state.user?.temporal_ui_workflows_url ? (
           <a
             className="temporal-link"
@@ -75,18 +70,6 @@ export function AppHeader({
             </button>
           </div>
         </section>
-        {state.demoWorkspace?.enabled || state.demoWorkspace?.in_demo_workspace ? (
-          <section className="side-section">
-            <p className="side-section-title">My Demo Workspace</p>
-            <DemoWorkspaceControls
-              demoWorkspace={state.demoWorkspace}
-              loading={state.demoWorkspaceLoading}
-              onEnsure={onEnsureDemoWorkspace}
-              onCrash={onCrashDemoWorkspace}
-              onDelete={onDeleteDemoWorkspace}
-            />
-          </section>
-        ) : null}
         <section className="side-section">
           <p className="side-section-title">Agent</p>
           <div className="agent-settings">
@@ -199,108 +182,6 @@ export function AppHeader({
       <div className="status">{status}</div>
     </header>
   );
-}
-
-function DemoWorkspaceControls({
-  demoWorkspace,
-  loading,
-  onEnsure,
-  onCrash,
-  onDelete,
-}) {
-  const workspace = demoWorkspace?.workspace;
-  if (demoWorkspace?.in_demo_workspace) {
-    const active = workspace?.status === "active";
-    return (
-      <div className="demo-workspace-card">
-        <div className="demo-workspace-status">Disposable workspace</div>
-        {workspace?.namespace ? (
-          <div className="demo-workspace-namespace" title={workspace.namespace}>
-            {workspace.namespace}
-          </div>
-        ) : null}
-        <WorkspaceCountdown workspace={workspace} />
-        <div className="demo-workspace-actions single">
-          <button
-            className="danger"
-            type="button"
-            disabled={!active || loading}
-            onClick={onCrash}
-          >
-            Crash Pods
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  const status = workspace?.status || "inactive";
-  const active = status === "active";
-  const hasWorkspace = Boolean(workspace?.workspace_id) && status !== "inactive";
-  const provisioning = loading || status === "provisioning" || status === "deleting";
-  return (
-    <div className="demo-workspace-card">
-      <div className="demo-workspace-status">{status}</div>
-      {workspace?.host ? (
-        <div className="demo-workspace-host" title={workspace.host}>
-          {workspace.host}
-        </div>
-      ) : null}
-      <WorkspaceCountdown workspace={workspace} />
-      {workspace?.provisioning_message ? (
-        <div className="demo-workspace-progress">{workspace.provisioning_message}</div>
-      ) : null}
-      <div className="demo-workspace-actions">
-        <button type="button" disabled={provisioning} onClick={onEnsure}>
-          {active ? "Open" : "Create"}
-        </button>
-        <button
-          className="danger"
-          type="button"
-          disabled={!hasWorkspace || provisioning}
-          onClick={onDelete}
-        >
-          Delete
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function WorkspaceCountdown({ workspace }) {
-  const active = workspace?.status === "active" && workspace?.last_activity_at;
-  const [now, setNow] = useState(() => Date.now());
-
-  useEffect(() => {
-    if (!active) return undefined;
-    setNow(Date.now());
-    const interval = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(interval);
-  }, [active, workspace?.last_activity_at]);
-
-  if (!active) return null;
-
-  const lastActivity = Date.parse(workspace.last_activity_at);
-  if (!Number.isFinite(lastActivity)) return null;
-
-  const remainingMs = Math.max(0, lastActivity + WORKSPACE_IDLE_TIMEOUT_MS - now);
-  return (
-    <div className="demo-workspace-countdown">
-      Auto-delete in {formatDuration(remainingMs)}
-    </div>
-  );
-}
-
-function formatDuration(milliseconds) {
-  const totalSeconds = Math.max(0, Math.ceil(milliseconds / 1000));
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (minutes >= 60) {
-    const hours = Math.floor(minutes / 60);
-    const remainingMinutes = minutes % 60;
-    return `${hours}h ${remainingMinutes}m`;
-  }
-  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
 }
 
 function thinkingModeLabel(mode) {

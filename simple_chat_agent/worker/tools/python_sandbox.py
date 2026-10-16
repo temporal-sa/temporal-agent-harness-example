@@ -38,7 +38,9 @@ LAMBDA_ACTIVITY_RETRY_POLICY = RetryPolicy(
         "the sandbox. The sandbox ceases to exist when the tool finishes, "
         "as well as any files written to disk. Treat this as purely ephemeral. "
         "External side effects performed by user code are not made idempotent by "
-        "the harness, so sandbox executions are not retried automatically."
+        "the harness, so sandbox executions are not retried automatically. Do "
+        "not use this tool to sleep or wait for another tool's rate limit; "
+        "retryable tool failures are retried durably by Temporal."
     ),
     tool_type=ToolType.MUTATING,
     pre_guards=["mutating_tool_approval"],
@@ -116,6 +118,8 @@ async def _invoke_sandbox_lambda(
             "stream_id": stream.stream_id,
             "tool_name": stream.tool_name,
             "step": stream.step,
+            "agent": stream.agent,
+            "tool_call_id": stream.tool_call_id,
         },
     }
     stream_sink = _lambda_stream_sink_config()

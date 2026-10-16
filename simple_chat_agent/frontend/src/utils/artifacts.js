@@ -1,6 +1,7 @@
 import { languageFromFileName, languageFromMimeType } from "./code.js";
 
 export function artifactPreviewKind(artifact) {
+  if (isHtmlArtifact(artifact)) return "html";
   if (isImageArtifact(artifact)) return "image";
   if (isPdfArtifact(artifact)) return "pdf";
   if (isAudioArtifact(artifact)) return "audio";
@@ -20,6 +21,7 @@ export function artifactKindLabel(kind) {
     audio: "audio",
     binary: "file",
     code: "code",
+    html: "html",
     image: "image",
     markdown: "md",
     pdf: "pdf",
@@ -27,6 +29,18 @@ export function artifactKindLabel(kind) {
     video: "video",
   };
   return labels[kind] || "file";
+}
+
+function isHtmlArtifact(artifact) {
+  const mimeType = String(artifact?.mime_type || "").toLowerCase();
+  const name = String(artifact?.name || artifact?.artifact_id || "").toLowerCase();
+  return (
+    mimeType === "text/html" ||
+    mimeType === "application/xhtml+xml" ||
+    name.endsWith(".html") ||
+    name.endsWith(".htm") ||
+    name.endsWith(".xhtml")
+  );
 }
 
 function isImageArtifact(artifact) {

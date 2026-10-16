@@ -53,7 +53,6 @@ pure and deterministic:
 - `response_from_guard_execution`
 - `response_with_visible_refusal`
 - `response_message`
-- `stop_reason_for_max_turns`
 
 These methods may copy data, normalize JSON-like structures, and convert between
 `AgentMessage` and the vendor schema. They must not read environment variables,
@@ -97,8 +96,6 @@ The provider must expose:
 - `response_with_visible_refusal`: provider refusal normalization into a clear
   assistant message when the provider returned no visible text.
 - `response_message`: conversion back to `AgentMessage`.
-- `stop_reason_for_max_turns`: provider stop reason to use when the generic
-  loop stops at `max_turns`.
 
 Use helpers from `agent_harness.providers._shared` for repeated mechanics such
 as JSON-like copying, mapping-list serialization, provider metadata round trips,

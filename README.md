@@ -1,4 +1,8 @@
-# Temporal Agent Harness Example
+# Advanced AI Agent
+
+The catalog owns deployment, login, shared LLM keys, and crashable environments.
+See [Catalog deployment](docs/catalog.md). This branch tracks the catalog
+integration while preserving the durable agent harness.
 
 This repo is not trying to be a generic agent SDK.
 
@@ -6,7 +10,7 @@ It is an example of how a team might build a small, opinionated agent harness ar
 
 The interesting part is not "how to call an LLM." It is how the agent loop, tool registry, guard policy, context manager, and Temporal execution model fit together.
 
-Want to run this locally without setting up Google OAuth? Start here:
+Want to run this locally? Start here:
 [Running Locally](docs/local-development.md).
 
 Want to build your own project on the harness? Start here:
@@ -313,10 +317,17 @@ agent = ClaudeAgent(
     max_context_tokens=200_000,
 )
 
-result = await agent.run(user_message, max_turns=20)
+result = await agent.run(user_message)
 ```
 
 The default `SlidingWindowContextManager` keeps recent context, preserves the initial user message, removes stale tool-result blocks from older rounds, and fits the model input into a conservative token budget before each provider call. The latest tool result is preserved in full for the next model call.
+The agent loop has no turn cap; it continues until the model produces a final
+response, a guard halts it, the user interrupts it, or the workflow reaches a
+safe continue-as-new boundary.
+Applications can pass a durable ISO-8601 UTC `reference_time` to `run(...)`.
+The harness adds it to the system context for that turn, carries it through
+continue-as-new, and reminds the model to verify time-sensitive facts rather
+than treating the timestamp itself as evidence.
 
 Applications can replace the context manager by passing `context_manager_factory=...`.
 

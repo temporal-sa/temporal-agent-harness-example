@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import asdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from typing import Any, AsyncIterator, Callable
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
@@ -15,6 +15,7 @@ from simple_chat_agent.api.anthropic_models import (
     clamp_output_tokens_for_model,
     get_anthropic_model_catalog,
     max_context_tokens_for_model,
+    select_anthropic_model,
 )
 from simple_chat_agent.api.artifacts import artifact_response
 from simple_chat_agent.api.auth import AuthenticatedUser
@@ -39,10 +40,10 @@ from simple_chat_agent.api.serialization import (
 from simple_chat_agent.api.streaming import StreamBroker
 from simple_chat_agent.api.temporal_ui import temporal_ui_url
 from simple_chat_agent.api.thinking import (
-    default_model,
     good_place_enabled,
     thinking_config_from_request,
 )
+from simple_chat_agent.api.tool_results import tool_result_from_history
 from simple_chat_agent.common.attachments import (
     AttachmentValidationError,
     artifact_is_user_attachment,
@@ -62,10 +63,14 @@ from simple_chat_agent.worker.user_chats_workflow import (
     CreateChatRequest,
     UserChatsWorkflow,
 )
-from simple_chat_agent.worker.workflow import ChatSignalRequest, SimpleChatWorkflow
-from simple_chat_agent.worker.workflow import TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES
-from simple_chat_agent.worker.workflow import TRANSCRIPT_QUERY_HARD_MAX_BYTES
-from simple_chat_agent.worker.workflow import TRANSCRIPT_QUERY_MIN_MAX_BYTES
+from simple_chat_agent.worker.workflow import (
+    TRANSCRIPT_QUERY_DEFAULT_MAX_BYTES,
+    TRANSCRIPT_QUERY_HARD_MAX_BYTES,
+    TRANSCRIPT_QUERY_MIN_MAX_BYTES,
+    ChatSignalRequest,
+    SimpleChatWorkflow,
+)
+
 
 @dataclass(frozen=True)
 class SessionRouteDeps:
@@ -85,9 +90,6 @@ class SessionRouteDeps:
     forget_conversation: Callable[..., Any]
     is_temporal_not_found: Callable[[BaseException], bool]
     github_connection_id_for_user: Callable[[AuthenticatedUser], str | None]
-    register_demo_workspace_chat: Callable[..., Any]
-    unregister_demo_workspace_chat: Callable[..., Any]
-    touch_demo_workspace: Callable[..., Any]
 
 
 def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
@@ -122,7 +124,13 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         registry = await deps.ensure_user_chats_workflow(user.user_id, user.username)
         mcp_servers = await registry.query(UserChatsWorkflow.list_mcp_servers)
         model_catalog = await asyncio.to_thread(get_anthropic_model_catalog)
-        model = session_request.model or default_model(model_catalog)
+        try:
+            model = select_anthropic_model(model_catalog, session_request.model)
+        except ValueError as err:
+            raise HTTPException(
+                status_code=400,
+                detail=str(err),
+            ) from err
         max_tokens = clamp_output_tokens_for_model(
             session_request.max_tokens,
             model_catalog,
@@ -136,7 +144,6 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
                 model=model,
                 max_tokens=max_tokens,
                 max_context_tokens=max_context_tokens,
-                max_turns=session_request.max_turns,
                 thinking=thinking_config_from_request(
                     session_request.thinking,
                     model=model,
@@ -151,10 +158,15 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
                 github_connection_id=github_connection_id,
                 mcp_servers=mcp_servers,
                 good_place_censor=good_place_enabled(),
+                reference_time=(
+                    datetime.now(UTC)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                ),
             ),
         )
-        deps.stream_broker().clear(conversation.workflow_id)
-        await deps.register_demo_workspace_chat(conversation)
+        await deps.stream_broker().clear(conversation.workflow_id)
         return {
             "workflow_id": conversation.workflow_id,
             "run_id": conversation.run_id,
@@ -215,7 +227,9 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         record_timing(timings, "owner", started)
 
         response.headers["Cache-Control"] = "no-store"
-        response.headers["X-Stream-Cursor"] = deps.stream_broker().cursor(workflow_id)
+        response.headers["X-Stream-Cursor"] = await deps.stream_broker().cursor(
+            workflow_id
+        )
         query_started = time.perf_counter()
         try:
             snapshot = await deps.query_snapshot(
@@ -341,39 +355,51 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         http_request: Request,
         workflow_id: str,
         request: MessageRequest,
+        response: Response,
     ) -> dict[str, Any]:
+        timings: list[tuple[str, float]] = []
+        started = time.perf_counter()
         user = await deps.require_conversation_owner(http_request, workflow_id)
+        record_timing(timings, "owner", started)
         attachments = _attachment_refs_for_request(
             deps.store(),
             user_id=user.user_id,
             workflow_id=workflow_id,
             attachment_ids=request.attachment_ids,
         )
-        cursor = deps.stream_broker().cursor(workflow_id)
-        await deps.signal_workflow(
-            http_request,
-            workflow_id,
-            SimpleChatWorkflow.chat,
-            args=[
-                await _chat_signal_request(
-                    deps,
-                    user=user,
-                    message_request=request,
-                    attachments=attachments,
-                )
-            ],
+        prepare_started = time.perf_counter()
+        cursor, signal_request = await asyncio.gather(
+            deps.stream_broker().cursor(workflow_id),
+            _chat_signal_request(
+                deps,
+                user=user,
+                message_request=request,
+                attachments=attachments,
+            ),
         )
-        await deps.touch_conversation(
-            user.user_id,
-            workflow_id,
-            title=conversation_title(request.message),
-            user_email=user.username,
+        record_timing(timings, "prepare", prepare_started)
+        signal_started = time.perf_counter()
+        await asyncio.gather(
+            deps.signal_workflow(
+                http_request,
+                workflow_id,
+                SimpleChatWorkflow.chat,
+                args=[signal_request],
+            ),
+            deps.touch_conversation(
+                user.user_id,
+                workflow_id,
+                title=conversation_title(request.message),
+                user_email=user.username,
+            ),
         )
-        await deps.touch_demo_workspace()
+        record_timing(timings, "signal", signal_started)
+        response.headers["Server-Timing"] = server_timing(timings)
         return {
             "status": "ok",
             "cursor": cursor,
             "workflow_id": workflow_id,
+            "accepted_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         }
 
     @router.post("/api/sessions/{workflow_id}/chat/stream")
@@ -389,27 +415,29 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id=workflow_id,
             attachment_ids=request.attachment_ids,
         )
-        cursor = deps.stream_broker().cursor(workflow_id)
-        await deps.signal_workflow(
-            http_request,
-            workflow_id,
-            SimpleChatWorkflow.chat,
-            args=[
-                await _chat_signal_request(
-                    deps,
-                    user=user,
-                    message_request=request,
-                    attachments=attachments,
-                )
-            ],
+        cursor, signal_request = await asyncio.gather(
+            deps.stream_broker().cursor(workflow_id),
+            _chat_signal_request(
+                deps,
+                user=user,
+                message_request=request,
+                attachments=attachments,
+            ),
         )
-        await deps.touch_conversation(
-            user.user_id,
-            workflow_id,
-            title=conversation_title(request.message),
-            user_email=user.username,
+        await asyncio.gather(
+            deps.signal_workflow(
+                http_request,
+                workflow_id,
+                SimpleChatWorkflow.chat,
+                args=[signal_request],
+            ),
+            deps.touch_conversation(
+                user.user_id,
+                workflow_id,
+                title=conversation_title(request.message),
+                user_email=user.username,
+            ),
         )
-        await deps.touch_demo_workspace()
 
         async def generate() -> AsyncIterator[dict[str, str]]:
             yield deps.stream_broker().event(
@@ -424,6 +452,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
                 workflow_id,
                 http_request,
                 cursor=cursor,
+                after_revision=request.after_revision,
             ):
                 yield chunk
 
@@ -452,14 +481,23 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             http_request,
             workflow_id,
             SimpleChatWorkflow.steer,
-            args=[request.message, request.mode, attachments],
+            args=[
+                request.message,
+                request.mode,
+                attachments,
+                (
+                    datetime.now(UTC)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                ),
+            ],
         )
         await deps.touch_conversation(
             user.user_id,
             workflow_id,
             user_email=user.username,
         )
-        await deps.touch_demo_workspace()
         return {"status": "ok"}
 
     @router.post("/api/sessions/{workflow_id}/interrupt")
@@ -473,14 +511,21 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             http_request,
             workflow_id,
             SimpleChatWorkflow.interrupt,
-            request.message,
+            args=[
+                request.message,
+                (
+                    datetime.now(UTC)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                ),
+            ],
         )
         await deps.touch_conversation(
             user.user_id,
             workflow_id,
             user_email=user.username,
         )
-        await deps.touch_demo_workspace()
         return {"status": "ok"}
 
     @router.post("/api/sessions/{workflow_id}/approvals/{approval_id}")
@@ -502,7 +547,6 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id,
             user_email=user.username,
         )
-        await deps.touch_demo_workspace()
         return {"status": "ok"}
 
     @router.get("/api/sessions/{workflow_id}/artifacts")
@@ -558,7 +602,6 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id,
             user_email=user.username,
         )
-        await deps.touch_demo_workspace()
         return {"attachment": attachment_dict(artifact)}
 
     @router.post("/api/sessions/{workflow_id}/attachments/text")
@@ -586,7 +629,6 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             workflow_id,
             user_email=user.username,
         )
-        await deps.touch_demo_workspace()
         return {"attachment": attachment_dict(artifact)}
 
     @router.get("/api/artifacts/{artifact_id}")
@@ -599,6 +641,31 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         if artifact is None or artifact_is_user_attachment(artifact):
             raise HTTPException(status_code=404, detail="Artifact not found")
         return artifact_response(deps.store(), artifact, disposition="inline")
+
+    @router.get("/api/artifacts/{artifact_id}/preview")
+    async def preview_html_artifact(request: Request, artifact_id: str) -> Response:
+        user = deps.current_user(request)
+        artifact = deps.store().get_artifact(
+            user_id=user.user_id,
+            artifact_id=artifact_id,
+        )
+        if artifact is None or artifact_is_user_attachment(artifact):
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        mime_type = artifact.mime_type.lower()
+        name = artifact.name.lower()
+        if mime_type not in (
+            "text/html",
+            "application/xhtml+xml",
+        ) and not name.endswith((".html", ".htm", ".xhtml")):
+            raise HTTPException(
+                status_code=415,
+                detail="Artifact is not an HTML document",
+            )
+        return artifact_response(
+            deps.store(),
+            artifact,
+            disposition="html-preview",
+        )
 
     @router.get("/api/artifacts/{artifact_id}/download")
     async def download_artifact(request: Request, artifact_id: str) -> Response:
@@ -653,7 +720,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         stream_cursor = (
             request.headers.get("last-event-id")
             or cursor
-            or deps.stream_broker().cursor(workflow_id)
+            or await deps.stream_broker().cursor(workflow_id)
         )
 
         return EventSourceResponse(
@@ -661,6 +728,7 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
                 workflow_id,
                 request,
                 cursor=stream_cursor,
+                after_revision=after_revision,
             ),
             headers={
                 "Cache-Control": "no-cache",
@@ -676,11 +744,42 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
         limit: int = Query(1000, ge=1, le=5000),
     ) -> dict[str, Any]:
         await deps.require_conversation_owner(request, workflow_id)
-        return deps.stream_broker().replay(
+        return await deps.stream_broker().replay(
             workflow_id,
             cursor=cursor,
             limit=limit,
         )
+
+    @router.get(
+        "/api/sessions/{workflow_id}/agents/{agent_workflow_id}/"
+        "tools/{tool_call_id}/result"
+    )
+    async def tool_result(
+        workflow_id: str,
+        agent_workflow_id: str,
+        tool_call_id: str,
+        request: Request,
+    ) -> dict[str, Any]:
+        await deps.require_conversation_owner(request, workflow_id)
+        if not _is_conversation_agent(workflow_id, agent_workflow_id):
+            raise HTTPException(status_code=404, detail="Agent execution not found")
+
+        try:
+            result = await tool_result_from_history(
+                deps.client(),
+                workflow_id=agent_workflow_id,
+                tool_call_id=tool_call_id,
+            )
+        except Exception as err:
+            if deps.is_temporal_not_found(err):
+                raise HTTPException(
+                    status_code=404,
+                    detail="Agent execution not found",
+                ) from err
+            raise
+        if result is None:
+            raise HTTPException(status_code=404, detail="Tool result not found")
+        return result
 
     @router.delete("/api/sessions/{workflow_id}")
     async def delete_session(request: Request, workflow_id: str) -> dict[str, str]:
@@ -695,11 +794,16 @@ def create_sessions_router(deps: SessionRouteDeps) -> APIRouter:
             user_id=user.user_id,
             workflow_id=workflow_id,
         )
-        deps.stream_broker().clear(workflow_id)
-        await deps.unregister_demo_workspace_chat(workflow_id)
+        await deps.stream_broker().clear(workflow_id)
         return {"status": "ok"}
 
     return router
+
+
+def _is_conversation_agent(workflow_id: str, agent_workflow_id: str) -> bool:
+    return agent_workflow_id == workflow_id or agent_workflow_id.startswith(
+        f"{workflow_id}-subagent-"
+    )
 
 
 def _attachment_refs_for_request(
@@ -735,19 +839,32 @@ async def _chat_signal_request(
     attachments: list[Any],
 ) -> ChatSignalRequest:
     registry = await deps.ensure_user_chats_workflow(user.user_id, user.username)
-    mcp_servers = await registry.query(UserChatsWorkflow.list_mcp_servers)
     github_connection_id = deps.github_connection_id_for_user(user)
+    mcp_servers = []
+    available_tool_names = None
+    try:
+        async with asyncio.timeout(2):
+            mcp_servers = await registry.query(UserChatsWorkflow.list_mcp_servers)
+    except TimeoutError:
+        # A paused worker cannot answer queries. None preserves the chat's
+        # existing tool configuration while Temporal buffers this signal.
+        pass
+    else:
+        available_tool_names = tool_names_for_connections(
+            github_connection_id=github_connection_id,
+            mcp_servers=mcp_servers,
+            research_tool_names=configured_research_tool_names(),
+        )
     return ChatSignalRequest(
         message=message_request.message,
         attachments=attachments,
         after_revision=message_request.after_revision,
-        available_tool_names=tool_names_for_connections(
-            github_connection_id=github_connection_id,
-            mcp_servers=mcp_servers,
-            research_tool_names=configured_research_tool_names(),
-        ),
+        available_tool_names=available_tool_names,
         github_connection_id=github_connection_id,
         mcp_servers=mcp_servers,
+        reference_time=(
+            datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        ),
     )
 
 

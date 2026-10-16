@@ -1,1 +1,1 @@
-"""Python sandbox runtime and Lambda handler."""
+"""Isolated command executors and legacy Python sandbox compatibility."""

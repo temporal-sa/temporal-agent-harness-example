@@ -8,6 +8,7 @@ from temporalio.worker import Worker
 
 from agent_harness.guards import run_guard_activity
 from agent_harness.providers.claude import call_agent_api
+from agent_harness.streaming import emit_stream_event_activity
 from agent_harness.tools import run_tool_activity
 from basic_file_agent import TASK_QUEUE
 from basic_file_agent.env import env_flag, load_dotenv
@@ -37,6 +38,7 @@ async def main() -> None:
             call_agent_api,
             run_tool_activity,
             run_guard_activity,
+            emit_stream_event_activity,
         ],
     )
     await worker.run()

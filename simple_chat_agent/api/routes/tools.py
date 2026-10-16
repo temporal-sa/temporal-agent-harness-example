@@ -42,7 +42,7 @@ from simple_chat_agent.worker.tools import (
     CREATE_SUBAGENT_TOOL,
     FETCH_URL_TOOL,
     GITHUB_TOOL_NAMES,
-    PYTHON_SANDBOX_TOOL,
+    WORKSPACE_SHELL_TOOL,
     configured_research_tool_names,
 )
 from simple_chat_agent.worker.user_chats_workflow import (
@@ -90,7 +90,7 @@ def create_tools_router(deps: ToolRouteDeps) -> APIRouter:
                 "scopes": "local",
                 "available_tools": [
                     FETCH_URL_TOOL,
-                    PYTHON_SANDBOX_TOOL,
+                    WORKSPACE_SHELL_TOOL,
                     CREATE_ARTIFACT_TOOL,
                     CREATE_SUBAGENT_TOOL,
                 ],

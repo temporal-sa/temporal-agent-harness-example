@@ -64,7 +64,7 @@ ChatGPTReasoningEffort = Literal["minimal", "low", "medium", "high"]
 ChatGPTReasoningSummary = Literal["auto", "concise", "detailed"]
 
 DEFAULT_CHATGPT_ACTIVITY_OPTIONS = ActivityOptions(
-    start_to_close_timeout=timedelta(minutes=10),
+    start_to_close_timeout=timedelta(minutes=20),
     heartbeat_timeout=timedelta(seconds=10),
 )
 CHATGPT_HEARTBEAT_INTERVAL_SECONDS = 5
@@ -74,6 +74,25 @@ PROVIDER_REFUSAL_FALLBACK = (
     "provider-generated refusal message, so the app stopped this agent run "
     "instead of retrying the same request."
 )
+_chatgpt_clients: dict[str, Any] = {}
+
+
+def _chatgpt_client(api_key: str) -> Any:
+    client = _chatgpt_clients.get(api_key)
+    if client is None:
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(api_key=api_key, max_retries=0)
+        _chatgpt_clients[api_key] = client
+    return client
+
+
+async def close_chatgpt_clients() -> None:
+    clients = list(_chatgpt_clients.values())
+    _chatgpt_clients.clear()
+    for client in clients:
+        with suppress(Exception):
+            await client.close()
 
 
 @dataclass(frozen=True)
@@ -93,6 +112,7 @@ class ChatGPTRequest:
     stream_id: str | None = None
     stream_sequence: int | None = None
     stream_attempt: int | None = None
+    stream_agent: dict[str, str | None] | None = None
     reasoning: dict | None = None
 
 
@@ -156,6 +176,7 @@ class ChatGPTProvider(AgentProvider):
         stream_id: str | None,
         stream_sequence: int | None,
         stream_attempt: int | None,
+        stream_agent: dict[str, str | None] | None = None,
     ) -> ChatGPTRequest:
         return ChatGPTRequest(
             system_prompt=system_prompt,
@@ -167,6 +188,7 @@ class ChatGPTProvider(AgentProvider):
             stream_id=stream_id,
             stream_sequence=stream_sequence,
             stream_attempt=stream_attempt,
+            stream_agent=stream_agent,
             reasoning=_reasoning_config_to_openai(self._reasoning),
         )
 
@@ -219,9 +241,6 @@ class ChatGPTProvider(AgentProvider):
     def response_message(self, response: ProviderResponse) -> AgentMessage:
         return _chatgpt_message_to_agent_message(cast(ChatGPTResponse, response).message)
 
-    def stop_reason_for_max_turns(self) -> ChatGPTStopReason:
-        return "max_output_tokens"
-
 
 class ChatGPTAgent(Agent):
     def __init__(
@@ -234,6 +253,7 @@ class ChatGPTAgent(Agent):
         reasoning: ChatGPTReasoningConfig | None = None,
         tool_names: list[str] | None = None,
         stream_id: str | None = None,
+        stream_agent: dict[str, str | None] | None = None,
         activity_options: ActivityOptions | None = None,
         chatgpt_activity_options: ActivityOptions | None = None,
         llm_guard_activity_options: ActivityOptions | None = None,
@@ -257,6 +277,7 @@ class ChatGPTAgent(Agent):
             max_tokens=max_tokens,
             tool_names=tool_names,
             stream_id=stream_id,
+            stream_agent=stream_agent,
             activity_options=activity_options,
             llm_guard_activity_options=llm_guard_activity_options,
             pre_llm_guards=pre_llm_guards,
@@ -366,6 +387,7 @@ def _chatgpt_request_to_dict(request: ChatGPTRequest) -> dict[str, Any]:
         "stream_id": request.stream_id,
         "stream_sequence": request.stream_sequence,
         "stream_attempt": request.stream_attempt,
+        "stream_agent": _copy_optional_mapping(request.stream_agent),
         "reasoning": _copy_optional_mapping(request.reasoning),
     }
 
@@ -381,6 +403,10 @@ def _chatgpt_request_from_dict(request: dict[str, Any]) -> ChatGPTRequest:
         stream_id=cast(str | None, request.get("stream_id")),
         stream_sequence=cast(int | None, request.get("stream_sequence")),
         stream_attempt=cast(int | None, request.get("stream_attempt")),
+        stream_agent=cast(
+            dict[str, str | None] | None,
+            _copy_optional_mapping(request.get("stream_agent")),
+        ),
         reasoning=_copy_optional_mapping(request.get("reasoning")),
     )
 
@@ -448,11 +474,22 @@ def _chatgpt_response_from_guard_execution(
 async def call_chatgpt(request: ChatGPTRequest) -> ChatGPTResponse:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise ApplicationError(
+        error = ApplicationError(
             "OPENAI_API_KEY must be set to call ChatGPT",
             type="MissingApiKey",
             non_retryable=True,
         )
+        await AgentStreamWriter.for_provider(
+            stream_id=request.stream_id,
+            provider="chatgpt",
+            attempt=request.stream_attempt,
+            agent=request.stream_agent,
+        ).agent_failed(
+            sequence=request.stream_sequence,
+            model=request.model,
+            error=error,
+        )
+        raise error
 
     create_params: dict[str, Any] = {
         "model": request.model,
@@ -470,17 +507,27 @@ async def call_chatgpt(request: ChatGPTRequest) -> ChatGPTResponse:
         create_params["reasoning"] = request.reasoning
 
     try:
-        from openai import APIStatusError, AsyncOpenAI
+        from openai import APIStatusError
 
-        async with AsyncOpenAI(api_key=api_key, max_retries=0) as client:
-            state = await _stream_chatgpt_response(
-                client,
-                create_params,
-                stream_id=request.stream_id,
-                stream_sequence=request.stream_sequence,
-                stream_attempt=request.stream_attempt,
-            )
+        state = await _stream_chatgpt_response(
+            _chatgpt_client(api_key),
+            create_params,
+            stream_id=request.stream_id,
+            stream_sequence=request.stream_sequence,
+            stream_attempt=request.stream_attempt,
+            stream_agent=request.stream_agent,
+        )
     except APIStatusError as err:
+        await AgentStreamWriter.for_provider(
+            stream_id=request.stream_id,
+            provider="chatgpt",
+            attempt=request.stream_attempt,
+            agent=request.stream_agent,
+        ).agent_failed(
+            sequence=request.stream_sequence,
+            model=request.model,
+            error=err,
+        )
         if _openai_error_is_context_window_exceeded(err):
             raise ApplicationError(
                 str(err),
@@ -493,6 +540,19 @@ async def call_chatgpt(request: ChatGPTRequest) -> ChatGPTResponse:
                 type=err.__class__.__name__,
                 non_retryable=True,
             ) from err
+        raise
+    except BaseException as err:
+        if not isinstance(err, asyncio.CancelledError):
+            await AgentStreamWriter.for_provider(
+                stream_id=request.stream_id,
+                provider="chatgpt",
+                attempt=request.stream_attempt,
+                agent=request.stream_agent,
+            ).agent_failed(
+                sequence=request.stream_sequence,
+                model=request.model,
+                error=err,
+            )
         raise
 
     return ChatGPTResponse(
@@ -513,18 +573,23 @@ async def _stream_chatgpt_response(
     stream_id: str | None,
     stream_sequence: int | None,
     stream_attempt: int | None,
+    stream_agent: dict[str, str | None] | None,
 ) -> _ChatGPTStreamState:
     stream = AgentStreamWriter.for_provider(
         stream_id=stream_id,
         provider="chatgpt",
         attempt=stream_attempt,
+        agent=stream_agent,
     )
     stream_state = _ChatGPTStreamState(sequence=stream_sequence)
     heartbeat_state = _ChatGPTHeartbeatState(sequence=stream_sequence)
     activity.heartbeat(heartbeat_state.payload("starting"))
     heartbeat_task = asyncio.create_task(_heartbeat_chatgpt_stream(heartbeat_state))
 
-    await stream.agent_started(sequence=stream_sequence)
+    await stream.agent_started(
+        sequence=stream_sequence,
+        model=cast(str | None, create_params.get("model")),
+    )
 
     try:
         response_stream = await client.responses.create(**create_params)
@@ -1175,4 +1240,3 @@ def _refusal_details_text(stop_details: dict[str, Any] | None) -> str:
         if isinstance(reason, str) and reason:
             return f"Incomplete reason: {reason}."
     return ""
-
