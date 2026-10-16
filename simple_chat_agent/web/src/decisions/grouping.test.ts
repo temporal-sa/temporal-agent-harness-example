@@ -96,7 +96,7 @@ describe("grouping and folding", () => {
 describe("risk class from the facade", () => {
   it("doesn't offer Always approve while config hasn't loaded", () => {
     const raw = pending("e1", "edit_file", { path: "a.py" });
-    const item = itemOf({ agentId: raw.agentId, messageId: raw.messageId, part: raw.part, riskClass: null });
+    const item = itemOf({ agentId: raw.agentId, messageId: raw.messageId, part: raw.part, riskClass: null, rememberAllowed: false });
     expect(item).toMatchObject({ risk: null, rememberAllowed: false });
     expect(buildStack([item], new Map()).groups[0]!.rememberAllowed).toBe(false);
   });

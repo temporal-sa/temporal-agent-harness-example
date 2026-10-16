@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { Recovery, ToolPart, ToolProgressChunk } from "../session";
 import { exitBadge, liveRows, parseCommandOutput, reattachFor, RunClock, runLines, SANDBOX_DOWN, sandboxDown } from "./terminal";
 
-const out = (text: string, stream: ToolProgressChunk["stream"] = null): ToolProgressChunk => ({ text, stream, at: null });
+const out = (text: string, stream: "stdout" | "stderr" | "note" = "stdout"): ToolProgressChunk => ({ text, stream, at: null });
 
 // CommandResult.model_text, as the harness hands it to the model and the stream.
 const FAILING = [
@@ -75,7 +75,7 @@ describe("live stream markers", () => {
   });
 
   it("names the worker that reattached when telemetry says so", () => {
-    const live = [out("batch 6\n\n[worker restarted; reattaching"), out(" to the command (attempt 2)]\nbatch 7\n")];
+    const live = [out("batch 6\n"), out("\n[worker restarted; reattaching", "note"), out(" to the command (attempt 2)]\n", "note"), out("batch 7\n")];
     const lines = runLines(part("running"), { live, workerAnswering: true, pausedAt: null, sandbox: null, reattach: reattachFor({ agentId: "a", turnNumber: 2 }, [recovery]) });
     expect(lines.map((l) => l.text)).toEqual(["$ pytest -q", "batch 6", "", "── reattached on worker-b · same run, not restarted ──", "batch 7"]);
     expect(reattachFor({ agentId: "a", turnNumber: 3 }, [recovery])).toBeNull();
@@ -98,14 +98,21 @@ describe("live stream markers", () => {
   });
 
   it("colours live stderr from the facade's stream tags, across chunk boundaries", () => {
-    const rows = liveRows([out("collected 27 items\nwarn", "stdout"), out("ing: deprecated\n", "stderr"), out("ok\n", null)]);
+    const rows = liveRows([out("collected 27 items\nwarn", "stdout"), out("ing: deprecated\n", "stderr"), out("ok\n", "stdout")]);
     expect(rows).toEqual([
-      { text: "collected 27 items", stderr: false },
-      { text: "warning: deprecated", stderr: true },
-      { text: "ok", stderr: false },
+      { text: "collected 27 items", kind: "out" },
+      { text: "warning: deprecated", kind: "err" },
+      { text: "ok", kind: "out" },
     ]);
     const lines = runLines(part("running"), { live: [out("boom\n", "stderr")], workerAnswering: true, pausedAt: null, sandbox: null, reattach: null });
     expect(lines[1]).toEqual({ kind: "err", text: "boom" });
+  });
+
+  it("renders note chunks (our own lines) muted, not as stdout", () => {
+    const live = [out("batch 3\n"), out("\n[earlier output dropped: 4,096 chars]\n", "note"), out("\n[live output limit reached; the result has the tail]\n", "note")];
+    const lines = runLines(part("running"), { live, workerAnswering: true, pausedAt: null, sandbox: null, reattach: null });
+    expect(lines.map((l) => l.kind)).toEqual(["cmd", "out", "out", "muted", "out", "muted"]);
+    expect(liveRows([out("a note without brackets\n", "note")])).toEqual([{ text: "a note without brackets", kind: "note" }]);
   });
 
   it("times a run only when it was seen starting", () => {

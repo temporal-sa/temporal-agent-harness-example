@@ -5,7 +5,7 @@ import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "rea
 
 import type { CodingSession, DecisionDockProps, SendRecord } from "../session";
 import { SendStateTrail } from "../recovery/SendStateTrail";
-import { branchFrom } from "../workbench/changes";
+import { currentBranch, DETACHED } from "../workbench/changes";
 import { DiffView } from "../workbench/DiffView";
 import { agentLabel, anythingRunning, toolsOf } from "../workbench/tree";
 import {
@@ -127,11 +127,12 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
     const answered = isAnswered(a);
     const badge = toolBadge(it.toolName, it.risk);
     const files = session.changes?.files.length ?? 0;
+    const branch = currentBranch(session.workspace, tools);
     return (
       <section className="dc-card" aria-label="Needs approval" onPointerEnter={() => setHover(true)} onPointerLeave={() => setHover(false)}>
         <div className="top">
           <span className={`badge ${badge.kind}`}>Needs approval</span>
-          <span className="t">{callTitle(it.toolName, it.input, { branch: branchFrom(tools), files })}</span>
+          <span className="t">{callTitle(it.toolName, it.input, { branch: branch === DETACHED ? null : branch, files })}</span>
           {it.agentId !== session.rootAgentId && <span className="hint">from {agentLabel(agentKey(it))}</span>}
         </div>
         <ReviewBody item={it} />

@@ -254,8 +254,8 @@ export function runLines(part: Pick<ToolPart, "state" | "output" | "input">, ctx
     }
     return lines;
   }
-  // Live: each line takes its stream from the chunks it came from (stderr wins). Chunks the
-  // backend hasn't tagged yet (stream null) read as stdout.
+  // Live: each line takes its stream from the chunks it came from (stderr wins); our own
+  // "note" lines read muted, and the reattach note becomes the reattach marker.
   let sawReattach = false;
   for (const row of liveRows(ctx.live)) {
     const text = row.text;
@@ -264,10 +264,10 @@ export function runLines(part: Pick<ToolPart, "state" | "output" | "input">, ctx
       lines.push({ kind: "reattach", text: reattachLine(ctx.reattach?.resumedOn ?? null) });
     } else if (text === "" && lines[lines.length - 1]?.kind === "reattach") {
       continue;
-    } else if (MUTED_NOTE.test(text)) {
+    } else if (row.kind === "note" || MUTED_NOTE.test(text)) {
       lines.push({ kind: "muted", text });
     } else {
-      lines.push({ kind: row.stderr ? "err" : "out", text });
+      lines.push({ kind: row.kind, text });
     }
   }
   if (!sawReattach && ctx.reattach && running) lines.push({ kind: "reattach", text: reattachLine(ctx.reattach.resumedOn) });
@@ -281,24 +281,37 @@ export function runLines(part: Pick<ToolPart, "state" | "output" | "input">, ctx
   return lines;
 }
 
-/** Split live chunks into lines; a line is stderr if any part of it came from stderr. */
-export function liveRows(chunks: readonly ToolProgressChunk[]): { text: string; stderr: boolean }[] {
-  const rows: { text: string; stderr: boolean }[] = [];
-  let cur = { text: "", stderr: false };
-  let open = false;
+export type LiveRowKind = "out" | "err" | "note";
+
+/**
+ * Split live chunks into lines. A line is stderr if any part of it came from stderr; else a
+ * note if it came from a "note" chunk (our own lines: reattach, dropped output, the live
+ * limit); else stdout.
+ */
+export function liveRows(chunks: readonly ToolProgressChunk[]): { text: string; kind: LiveRowKind }[] {
+  const rows: { text: string; kind: LiveRowKind }[] = [];
+  let cur: { text: string; kind: LiveRowKind } = { text: "", kind: "out" };
+  let started = false;
+  const mark = (stream: ToolProgressChunk["stream"]) => {
+    if (stream === "stderr") cur.kind = "err";
+    else if (stream === "note" && cur.kind === "out" && !started) cur.kind = "note";
+  };
   for (const c of chunks) {
     const parts = c.text.replace(/\r\n/g, "\n").split("\n");
     parts.forEach((part, i) => {
       if (i > 0) {
         rows.push(cur);
-        cur = { text: "", stderr: false };
+        cur = { text: "", kind: "out" };
+        started = false;
       }
-      cur.text += part;
-      if (part && c.stream === "stderr") cur.stderr = true;
-      open = true;
+      if (part) {
+        mark(c.stream);
+        if (c.stream !== "note") started = true;
+        cur.text += part;
+      }
     });
   }
-  if (open && cur.text !== "") rows.push(cur);
+  if (cur.text !== "") rows.push(cur);
   return rows;
 }
 

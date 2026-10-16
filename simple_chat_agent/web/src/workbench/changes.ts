@@ -59,12 +59,20 @@ export function fileStat(f: FileChanges): { added: number; removed: number } {
   );
 }
 
-/** The branch from the latest git_status result ("On branch main"), if any. */
+/** The workspace's branch: the agent state's `branch`, else (while it is still an empty string)
+ *  the latest git_status result. "HEAD (no branch)" when detached. */
+export function currentBranch(workspace: Pick<WorkspaceState, "branch"> | null, tools: readonly LocatedTool[]): string | null {
+  return workspace?.branch || branchFrom(tools);
+}
+
+export const DETACHED = "HEAD (no branch)";
+
+/** The branch from the latest git_status result ("On branch main"), if any. Fallback only. */
 export function branchFrom(tools: readonly LocatedTool[]): string | null {
   let branch: string | null = null;
   for (const t of tools) {
     if (t.part.toolName !== "git_status" || t.part.state !== "done") continue;
-    const m = /^On branch (\S+)/.exec(t.part.output ?? "");
+    const m = /^On branch ([^\s;]+)/.exec(t.part.output ?? "");
     if (m) branch = m[1] ?? null;
   }
   return branch;
@@ -84,7 +92,7 @@ export function workspaceFacts(
 ): WorkspaceFacts {
   const exitCode = workspace?.last_exit_code;
   return {
-    branch: branchFrom(tools),
+    branch: currentBranch(workspace, tools),
     filesChanged: changes?.files.length ?? 0,
     lastCommand: workspace?.last_command || null,
     exit: !workspace?.last_command ? "none yet" : exitCode === null || exitCode === undefined ? "not reported" : String(exitCode),
