@@ -92,12 +92,13 @@ a.view:hover { border-color: var(--slate-500); }
   display: flex; align-items: center; gap: 2.2em; padding: .55em 1.2em; border-bottom: 1px solid var(--border);
   background: rgba(20, 20, 20, .6); font-size: .85em; flex-wrap: wrap; row-gap: .4em; margin: 0; min-height: 2.6em;
 }
+.meter-list { display: flex; align-items: center; gap: 2.2em; flex-wrap: wrap; row-gap: .4em; margin: 0; }
 .meter { display: flex; align-items: baseline; gap: .5em; white-space: nowrap; margin: 0; }
 .meter dt { color: var(--slate-300); font-size: .85em; }
 .meter dd { margin: 0; font-family: var(--mono); font-weight: 500; font-variant-numeric: tabular-nums; }
 .meter dd.g { color: var(--green); }
 .meter dd.nr { color: var(--slate-300); font-weight: 400; }
-.meter .sub { color: var(--slate-300); font-size: .8em; }
+.meter dd.sub { color: var(--slate-300); font-size: .8em; font-family: var(--sans); font-weight: 300; }
 .meter.hero { gap: .7em; padding: .3em .8em; border: 1px solid var(--green); background: rgba(31, 241, 165, .06); }
 .meter.hero dt { color: var(--off-white); font-weight: 500; font-size: .85em; }
 .meter.hero dd { font-size: 1.1em; -webkit-text-fill-color: transparent; background: var(--grad-green); -webkit-background-clip: text; background-clip: text; }
@@ -353,3 +354,19 @@ button.path:hover { border-color: var(--uv-light); }
 .more-lines { font-family: var(--mono); font-size: .72em; color: var(--slate-300); padding: .2em .9em .4em; }
 @media (max-width: 600px) { .session-title .demo { display: none; } }
 .chips .path { max-width: 100%; overflow-wrap: anywhere; text-align: left; }
+
+/* Phone: every tap target in the shell, transcript and composer is at least 44 × 44 px
+   (WCAG target size; validation 3a). Rows keep their look and only gain height. */
+@media (max-width: 600px) {
+  .menu-btn { width: 44px; height: 44px; }
+  :is(.top, .drawer, .sheet > .drawer-head, .transcript-slot, .composer-slot, .slot-sheet)
+    :is(button, a[href], [role="button"], [role="tab"], [role^="menuitem"], [tabindex]:not([tabindex="-1"])) {
+    min-height: 44px;
+    min-width: 44px;
+  }
+  .chips .path, .tool-row, .subagent .head, .thinking, .attempt { display: inline-flex; align-items: center; }
+  .tool-row, .subagent .head { display: grid; }
+  .thinking, .attempt { width: 100%; }
+  .chips .path { justify-content: center; }
+  .output pre { min-height: 0; }
+}

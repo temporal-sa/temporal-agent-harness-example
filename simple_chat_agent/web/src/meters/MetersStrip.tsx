@@ -61,7 +61,8 @@ export function MetersStrip({ telemetry, modelLabel }: { telemetry: SessionTelem
   const v = meterValues(telemetry);
   return (
     <>
-      <dl className="meters meters-full" aria-label="Session meters">
+      <div className="meters meters-full">
+      <dl className="meter-list" aria-label="Session meters">
         {v.hero !== null && (
           <div className="meter hero">
             <dt>Work kept after worker loss (this session)</dt>
@@ -77,15 +78,16 @@ export function MetersStrip({ telemetry, modelLabel }: { telemetry: SessionTelem
         <div className="meter" title={v.cacheByProvider || undefined}>
           <dt>Input read from provider cache</dt>
           <dd className={v.cacheReported ? "g" : "nr"}>{v.cache}</dd>
-          {v.cacheReported && v.cache !== "–" && <span className="sub">billed at a discount</span>}
+          {v.cacheReported && v.cache !== "–" && <dd className="sub">billed at a discount</dd>}
         </div>
         <div className="meter">
           <dt>Recoveries</dt>
           <dd>{v.recoveries}</dd>
         </div>
+      </dl>
         <span className="spacer" />
         {modelLabel && <span className="model">{modelLabel}</span>}
-      </dl>
+      </div>
       <div className="meters-compact" aria-label="Session meters">
         {v.hero !== null && (
           <span>

@@ -34,7 +34,6 @@ test("a call the judge approved is not labelled as approved by you", async ({ pa
   // the Auto-mode judge shows "Approved by you". The harness publishes the judge's
   // tool_approval_resolved like a person's (agent_workflow.py `_resolve_and_publish`, reason
   // "judge …"), so the badge must look at the evaluations, not only `approval.approved`.
-  test.fail();
   const api = await mockApi();
   await openScripted(page, api, working(), { session_id: sessionId("judge-badge") });
   await expect(page.getByText("confidence 0.96")).toBeVisible();

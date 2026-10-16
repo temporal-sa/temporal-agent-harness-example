@@ -6,7 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { ApiError, type ToolPart } from "../session";
 import { DiffView, JudgeCards } from "../app/slots";
 import { useTranscript } from "./context";
-import { argPreview, commandSummary, miniDiff, pathsOf, toolBadge, type MiniDiff } from "./toolInfo";
+import { argPreview, commandSummary, decisionBadge, miniDiff, pathsOf, toolBadge, type MiniDiff } from "./toolInfo";
 
 function useElapsed(running: boolean): number | null {
   const since = useRef<number | null>(null);
@@ -33,7 +33,7 @@ function StateBadge({ part, elapsed }: { part: ToolPart; elapsed: number | null 
     case "evaluating":
       return <span className="badge prog">Judge deciding</span>;
     case "denied":
-      return <span className="badge leaving">{part.approval ? "Declined by you" : "Declined"}</span>;
+      return <span className="badge leaving">{decisionBadge(part) ?? "Declined"}</span>;
     case "requested":
     case "approved":
     case "running":
@@ -48,7 +48,7 @@ function StateBadge({ part, elapsed }: { part: ToolPart; elapsed: number | null 
         if (cmd.exitCode === 0) return <span className="exit ok">exit 0</span>;
         if (cmd.exitCode !== null) return <span className="exit fail">exit {cmd.exitCode}</span>;
       }
-      if (part.approval?.approved) return <span className="badge good">Approved by you</span>;
+      if (part.approval?.approved) return <span className="badge good">{decisionBadge(part)}</span>;
       return null;
   }
 }

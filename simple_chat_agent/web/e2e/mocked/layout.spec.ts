@@ -101,7 +101,6 @@ test.describe("phone", () => {
     // "Sessions and views" button (37×41), "Thought for …" (≈98×18), the explorer cards'
     // header buttons (≈293×32), tool rows (≈294×31), path chips (≈174×19), and the sheet's and
     // drawer's "Close" buttons (50×26). No horizontal scroll was found.
-    test.fail();
     const api = await mockApi();
     await openScripted(page, api, working(), { session_id: sessionId("phone") });
     await expect(page.getByText(DEMO_PROMPT)).toBeVisible();

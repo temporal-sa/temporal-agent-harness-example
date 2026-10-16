@@ -7,6 +7,7 @@ import { Composer } from "../composer/Composer";
 import { MetersStrip } from "../meters/MetersStrip";
 import {
   api,
+  ApiError,
   isUnreachable,
   summaryModel,
   useCodingSession,
@@ -140,22 +141,31 @@ function Shell({ me, auth, onUnreachable }: { me: Me; auth: AuthConfig; onUnreac
     [refresh, select, fail],
   );
 
-  // A session opened by URL that the list doesn't have yet (or that belongs to someone else,
-  // which the API answers with 404).
-  const [extra, setExtra] = useState<SessionSummary | null>(null);
+  // A session opened by URL that the list doesn't have (yet): ask for it before opening its
+  // stream. The API answers 404 for an unknown id and for another user's session alike; then
+  // the app shows a not-found page and never attaches.
+  const [lookup, setLookup] = useState<{ id: string; summary: SessionSummary | null; missing: string | null } | null>(null);
   const listed = useMemo(() => sessions?.find((s) => s.session_id === selected) ?? null, [sessions, selected]);
   useEffect(() => {
-    if (!selected || listed || sessions === null) return;
+    if (!selected || listed) return;
     let live = true;
     api.getSession(selected).then(
-      (s) => live && setExtra(s),
-      (err) => live && fail(err, "That session doesn't exist, or isn't yours.", setActionError),
+      (s) => live && setLookup({ id: selected, summary: s, missing: null }),
+      (err) => {
+        if (!live) return;
+        if (err instanceof ApiError && (err.status === 404 || err.status === 403)) {
+          setLookup({ id: selected, summary: null, missing: err.message || "No such session." });
+        } else {
+          fail(err, "Couldn't open that session. Try again.", (m) => setLookup({ id: selected, summary: null, missing: m }));
+        }
+      },
     );
     return () => {
       live = false;
     };
-  }, [selected, listed, sessions, fail]);
-  const summary = listed ?? (extra?.session_id === selected ? extra : null);
+  }, [selected, listed, fail]);
+  const found = lookup?.id === selected ? lookup : null;
+  const summary = listed ?? found?.summary ?? null;
 
   const modelName = useCallback(
     (choice: Partial<ModelChoice> | null | undefined, withProvider = false): string => {
@@ -186,6 +196,9 @@ function Shell({ me, auth, onUnreachable }: { me: Me; auth: AuthConfig; onUnreac
   };
 
   if (!selected) return <Layout parts={shared} session={null} />;
+  if (!summary) {
+    return <Layout parts={shared} session={null} page={found?.missing ? { kind: "missing", message: found.missing } : { kind: "opening" }} />;
+  }
   return (
     <SessionScreen key={selected} id={selected} summary={summary} config={config} render={(session) => <Layout parts={shared} session={session} />} />
   );
@@ -235,7 +248,9 @@ function SessionScreen({
 
 // -- layout -----------------------------------------------------------------------------------
 
-function Layout({ parts, session }: { parts: ShellParts; session: CodingSession | null }) {
+type Page = { kind: "landing" } | { kind: "opening" } | { kind: "missing"; message: string };
+
+function Layout({ parts, session, page = { kind: "landing" } }: { parts: ShellParts; session: CodingSession | null; page?: Page }) {
   const [presenter, togglePresenter] = usePresenterMode();
   const narrow = useMaxWidth(1600);
   const phone = useMaxWidth(600);
@@ -352,7 +367,9 @@ function Layout({ parts, session }: { parts: ShellParts; session: CodingSession 
             <div className="transcript-slot" data-slot="transcript">
               <div className="col">
                 {notices}
-                <Landing creating={parts.creating} onCreate={parts.create} />
+                {page.kind === "landing" && <Landing creating={parts.creating} onCreate={parts.create} />}
+                {page.kind === "opening" && <p className="hint">Opening the session…</p>}
+                {page.kind === "missing" && <NotFound message={page.message} onBack={() => parts.select(null)} />}
               </div>
             </div>
           )}
@@ -436,6 +453,27 @@ function runningCommand(session: CodingSession): boolean {
   const agents = [session.rootAgentId ? session.agent(session.rootAgentId) : undefined, ...Object.values(session.subagents)];
   return agents.some((a) =>
     a?.messages.some((m) => m.parts.some((p) => p.type === "tool" && p.toolName === "run_command" && p.state === "running")),
+  );
+}
+
+function NotFound({ message, onBack }: { message: string; onBack(): void }) {
+  return (
+    <div className="empty" role="alert">
+      <h1>{message}</h1>
+      <p>It doesn't exist, or it belongs to someone else.</p>
+      <div className="acts">
+        <a
+          className="btn secondary"
+          href={`${import.meta.env.BASE_URL}`}
+          onClick={(e) => {
+            e.preventDefault();
+            onBack();
+          }}
+        >
+          Back to your sessions
+        </a>
+      </div>
+    </div>
   );
 }
 

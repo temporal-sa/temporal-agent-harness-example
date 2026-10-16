@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { argPreview, commandSummary, miniDiff, pathsOf, toolBadge } from "./toolInfo";
+import { argPreview, commandSummary, decisionBadge, miniDiff, pathsOf, toolBadge } from "./toolInfo";
 import { tool } from "./fixtures";
 
 const EDIT_OUT = [
@@ -76,5 +76,31 @@ describe("tool rows", () => {
     expect(pathsOf(tool("read_file", { input: { path: "a.py" } }))).toEqual(["a.py"]);
     expect(pathsOf(tool("run_command", { output: "$ x\nexit 0 · 1s\nchanged: D old.py" }))).toEqual(["old.py"]);
     expect(pathsOf(tool("git_status"))).toEqual([]);
+  });
+});
+
+describe("who decided", () => {
+  const ev = (verdict: "approve" | "deny" | "escalate", status: "ended" | "running" = "ended") => ({
+    id: "e1",
+    evaluator: "judge",
+    status,
+    verdict,
+    reason: null,
+    details: {},
+    error: null,
+  });
+  const ok = { approved: true, reason: null, remember: false };
+
+  it("credits the judge when its evaluation decided the call", () => {
+    expect(decisionBadge({ approval: ok, evaluations: [ev("approve")] })).toBe("Approved by the judge");
+    expect(decisionBadge({ approval: { approved: false, reason: "judge: risky", remember: false }, evaluations: [] })).toBe("Declined by the judge");
+  });
+
+  it("credits the person after an escalation, and says when they chose Always approve", () => {
+    expect(decisionBadge({ approval: ok, evaluations: [ev("escalate")] })).toBe("Approved by you");
+    expect(decisionBadge({ approval: ok, evaluations: [ev("approve", "running")] })).toBe("Approved by you");
+    expect(decisionBadge({ approval: { ...ok, remember: true }, evaluations: [] })).toBe("Always approved");
+    expect(decisionBadge({ approval: { approved: false, reason: "no", remember: false }, evaluations: [] })).toBe("Declined by you");
+    expect(decisionBadge({ approval: null, evaluations: [] })).toBeNull();
   });
 });

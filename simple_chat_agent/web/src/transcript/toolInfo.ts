@@ -219,3 +219,24 @@ export function wordCount(text: string): number {
   const t = text.trim();
   return t ? t.split(/\s+/).length : 0;
 }
+
+// -- who decided a gated call ------------------------------------------------------------------
+
+/**
+ * The badge for a settled gate. The harness publishes the Auto-mode judge's decision exactly
+ * like a person's (tool_approval_resolved), so the evaluations decide who it was: a call the
+ * judge ended with "approve" (or "deny") was decided by the judge. Otherwise a person did,
+ * with "Always approve" when they asked to remember it.
+ */
+export function decisionBadge(part: Pick<ToolPart, "approval" | "evaluations">): string | null {
+  const a = part.approval;
+  if (!a) return null;
+  const judged = part.evaluations.some(
+    (e) => e.status === "ended" && e.verdict === (a.approved ? "approve" : "deny"),
+  ) || /^judge\b/i.test(a.reason ?? "");
+  if (a.approved) {
+    if (judged) return "Approved by the judge";
+    return a.remember ? "Always approved" : "Approved by you";
+  }
+  return judged ? "Declined by the judge" : "Declined by you";
+}

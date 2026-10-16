@@ -181,7 +181,6 @@ test("3k axe: the meters strip is a valid definition list", async ({ page, mockA
   // <dl class="meters meters-full"> has a <span class="spacer"> and the model <span> as direct
   // children; a <dl> may only hold <dt>/<dd> groups (or <div> wrapping them). Move the spacer
   // and model label out of the <dl>, or wrap them in a <div>.
-  test.fail();
   await page.setViewportSize({ width: 1920, height: 1080 });
   const api = await mockApi();
   await openScripted(page, api, working(), { session_id: sessionId("axe-dl") });
