@@ -119,6 +119,8 @@ async def approve(handle: Any, tool_id: str, approved: bool = True, remember: bo
 @dataclass
 class Collected:
     events: list[Any] = field(default_factory=list)
+    # Local monotonic arrival time of each event, parallel to ``events``.
+    arrivals: list[float] = field(default_factory=list)
 
     def of(self, kind: str) -> list[Any]:
         return [e for e in self.events if e.event.type.value == kind]
@@ -155,6 +157,7 @@ class EventCollector:
                 topics=["turn_events"], result_type=AgentEvent, poll_cooldown=timedelta(milliseconds=200)
             ):
                 self.collected.events.append(item.data)
+                self.collected.arrivals.append(asyncio.get_running_loop().time())
 
         self._task = asyncio.create_task(pump())
         return self

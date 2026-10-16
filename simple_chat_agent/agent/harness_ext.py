@@ -9,6 +9,7 @@ tests/test_harness_ext.py pin the shapes these helpers rely on.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import timedelta
@@ -43,6 +44,7 @@ from temporal_agent_harness.ai_sdks.pydantic_ai_harness import (
 from temporal_agent_harness.harness.agent_protocol import (
     SEND_AGENT_MESSAGE_UPDATE,
     AgentMessage,
+    MidTurn,
     ModelInteractionStarted,
     ToolApprovalDecision,
 )
@@ -50,7 +52,9 @@ from temporal_agent_harness.harness.agent_workflow import AgentWorkflowRunner
 
 # Model deltas are flushed to the workflow as one Signal per batch. The harness default is
 # 50 ms; 500 ms keeps a long coding turn inside Temporal's per-run limits (PRD A20, CTO-5).
-STREAM_BATCH_INTERVAL = timedelta(milliseconds=500)
+STREAM_BATCH_INTERVAL = timedelta(
+    milliseconds=int(os.environ.get("AGENT_STREAM_BATCH_MS", "500"))
+)
 
 # How often the model activity heartbeats while a request is in flight (PRD A19). Pair with a
 # heartbeat_timeout of ~10 s on the model activity and a worker heartbeat throttle of ~1 s.
@@ -294,16 +298,42 @@ def per_run_toolset(
 # ---------------------------------------------------------------------------
 
 
-async def admit_message(runner: AgentWorkflowRunner, message: AgentMessage) -> None:
-    """Admit a message exactly as the ``send_agent_message`` Update would.
+def admit_message(runner: AgentWorkflowRunner, message: AgentMessage, *, message_id: str) -> None:
+    """Admit a message as the ``send_agent_message`` Update would, under a caller-chosen id.
 
-    Calls the runner's validator and admission handler (agent_workflow.py
-    ``_validate_send_agent_message`` / ``_handle_send_agent_message``). Admission contains no
-    yielding await, so running it from a Signal handler keeps the same invariants. Raises
-    ApplicationError when the validator rejects the message.
+    A replica of ``AgentWorkflowRunner._handle_send_agent_message`` (agent_workflow.py, 0.7.0)
+    that takes ``message_id`` instead of minting one. The API chooses the id before the Signal
+    is sent, so a browser that sent a message while no worker was running can match the
+    ``message_accepted`` event to its pending message when a worker later admits it. The
+    harness client keys messages only on ``message_id``. Synchronous, like the original: no
+    yield between reading the head offset and publishing ``message_accepted``. Raises
+    ApplicationError when the runner's validator rejects the message.
     """
+    from temporal_agent_harness.harness.agent_protocol import MessageAccepted, MessageDisposition
+    from temporal_agent_harness.harness.agent_workflow import _Admission
+
     runner._validate_send_agent_message(message)
-    await runner._handle_send_agent_message(message)
+    handler = runner._handlers[message.type]
+    status = runner._status
+    if handler.mid_turn is MidTurn.ACCEPT and status.turn_active:
+        turn_id, turn_number = status.join_turn()
+        disposition = MessageDisposition.JOINED
+        runner._joining.append(
+            _Admission(message=message, turn_id=turn_id, turn_number=turn_number, message_id=message_id)
+        )
+    else:
+        turn_id = str(workflow.uuid4())
+        turn_number = status.reserve_turn_number()
+        disposition = MessageDisposition.QUEUED if status.has_pending_work else MessageDisposition.OPENED
+        status.enqueue_message(
+            _Admission(message=message, turn_id=turn_id, turn_number=turn_number, message_id=message_id)
+        )
+    runner._pub(
+        turn_id,
+        turn_number,
+        MessageAccepted(handler=message.type, payload=message.payload, disposition=disposition),
+        message_id=message_id,
+    )
 
 
 async def admit_approval(runner: AgentWorkflowRunner, decision: ToolApprovalDecision) -> None:
@@ -390,6 +420,11 @@ def close_with_note(
 def stream_head(stream: WorkflowStream) -> int:
     """The next offset the stream will assign (``WorkflowStream._on_offset``)."""
     return stream._on_offset()
+
+
+def stream_base(stream: WorkflowStream) -> int:
+    """The oldest offset still held in the stream's log (``WorkflowStream._base_offset``)."""
+    return stream._base_offset
 
 
 def agent_id(runner: AgentWorkflowRunner) -> str:

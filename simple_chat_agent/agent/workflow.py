@@ -56,6 +56,8 @@ with workflow.unsafe.imports_passed_through():
 IDLE_WAKE = timedelta(hours=1)
 # How many front-door request ids to remember for dedup, across continue-as-new.
 RECENT_REQUEST_IDS = 500
+# Stream events carried across continue-as-new (see _continue_as_new).
+CAN_RETAINED_EVENTS = 500
 INTERRUPTED_TOOL_NOTE = "Not run: the user stopped the turn before this tool finished."
 
 
@@ -156,9 +158,12 @@ class CodingAgent:
         self._continuing = True
         self._stream.detach_pollers()
         await workflow.wait_condition(workflow.all_handlers_finished)
-        # Every frame up to the head is already in Redis (the bridge is the record of the
-        # transcript); keep offsets monotonic but don't carry the log.
-        self._stream.truncate(harness_ext.stream_head(self._stream))
+        # Carry only the tail of the event log. Offsets stay monotonic; a reader that was
+        # mid-poll at the handoff resumes inside the retained tail instead of falling behind
+        # the truncation and silently skipping the last turn's closing events. (P2: truncate
+        # to the Redis bridge's acknowledged offset instead of a fixed tail.)
+        head = harness_ext.stream_head(self._stream)
+        self._stream.truncate(max(harness_ext.stream_base(self._stream), head - CAN_RETAINED_EVENTS))
         carried = CarriedState(
             conversation=ModelMessagesTypeAdapter.dump_python(self._history, mode="json"),
             stream_state=self._stream.get_state(),
@@ -180,6 +185,24 @@ class CodingAgent:
             args=[next_config, next_data],
             initial_versioning_behavior=workflow.ContinueAsNewVersioningBehavior.AUTO_UPGRADE,
         )
+
+    @workflow.query(name="history_stats")
+    def history_stats(self) -> dict[str, Any]:
+        """Diagnostics for tests and operators (the product UI never queries)."""
+        responses = [m for m in self._history if m.kind == "response"]
+        return {
+            "messages": len(self._history),
+            "responses": len(responses),
+            "turn_counter": harness_ext.turn_counter(self._runner),
+            "model": self._model.registry_key,
+            "allowed_tools": sorted(self._runner.approval_policy.auto_approve_tools),
+            "rejected": self._rejected,
+            "last_response_text": "".join(
+                getattr(p, "content", "") for p in responses[-1].parts if p.part_kind == "text"
+            )
+            if responses
+            else "",
+        }
 
     # -- Signal front door (PRD S8) -----------------------------------------------
 
@@ -209,8 +232,10 @@ class CodingAgent:
 
     async def _admit(self, message: FrontDoorMessage) -> None:
         try:
-            await harness_ext.admit_message(
-                self._runner, AgentMessage(type=message.type, payload=message.payload)
+            harness_ext.admit_message(
+                self._runner,
+                AgentMessage(type=message.type, payload=message.payload),
+                message_id=message.request_id,
             )
         except ApplicationError as exc:
             self._reject(message.request_id, exc)
@@ -240,7 +265,10 @@ class CodingAgent:
         self._run_task = task
         try:
             return ChatReply(text=await task)
-        except asyncio.CancelledError:
+        except BaseException:
+            # Cancelling the run task surfaces as asyncio.CancelledError or, when the model
+            # activity was in flight, as ActivityError("Activity cancelled"). Either way, once
+            # the user interrupted, the failure *is* the interrupt.
             if not self._interrupted:
                 raise
             # The turn was stopped. If it reached the model, keep everything up to the last
