@@ -53,7 +53,7 @@ DEFAULT_EFFORT = "medium"  # model_registry.settings_for: ``choice.effort or "me
 POSTURES: dict[Posture, tuple[str, str]] = {
     "ask_everything": ("Ask for everything", "Every tool call waits for you."),
     "trust_safe": ("Trust safe tools", "Read-only tools run; everything else waits for you."),
-    "auto": ("Auto", "Read-only tools run; a judge decides the rest and asks you when unsure."),
+    "auto": ("Auto mode", "Read-only tools run; a judge decides the rest and asks you when unsure."),
     "never_ask": ("Never ask", "Every call runs without asking. Local development only."),
 }
 DEFAULT_POSTURE: Posture = "trust_safe"

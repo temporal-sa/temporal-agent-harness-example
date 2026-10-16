@@ -173,16 +173,21 @@ def auto_mode_status(judge: str) -> dict[str, Any]:
     }
 
 
+def posture_refusal(posture: str, environment: str, auto_mode: dict[str, Any]) -> str | None:
+    """Why ``posture`` can't be chosen here, or ``None`` when it can. One rule for the posture
+    menu, ``POST sessions`` and a ``set_posture`` message, so their reasons always match."""
+    if posture not in agent_models.postures_for(environment):
+        return "Local development only."
+    if posture == "auto" and not auto_mode["available"]:
+        return auto_mode["reason"]
+    return None
+
+
 def posture_options(environment: str, auto_mode: dict[str, Any]) -> list[dict[str, Any]]:
     """Every posture, in menu order, with whether it can be chosen here and why not."""
-    allowed = set(agent_models.postures_for(environment))
     options = []
     for posture, (label, description) in agent_models.POSTURES.items():
-        reason = None
-        if posture not in allowed:
-            reason = "Local development only."
-        elif posture == "auto" and not auto_mode["available"]:
-            reason = auto_mode["reason"]
+        reason = posture_refusal(posture, environment, auto_mode)
         options.append(
             {
                 "id": posture,
@@ -1038,8 +1043,9 @@ def create_agent_router(
         # worker re-checks against the models it can actually call.
         if not agent_models.is_allowed(model):
             raise HarnessError(422, "model_not_allowed", f"{model.registry_key} is not available.")
-        if body.posture not in agent_models.postures_for(environment):
-            raise HarnessError(422, "posture_not_allowed", "\"Never ask\" isn't available here.")
+        refusal = posture_refusal(body.posture, environment, auto_mode_status(configured_judge_backend()))
+        if refusal is not None:
+            raise HarnessError(422, "posture_not_allowed", refusal)
 
         if requested_id is not None:
             # Caller-chosen ids are idempotent per user and can't collide across users: the
@@ -1324,6 +1330,15 @@ def create_agent_router(
         if root != body.session_id:
             # Subagents have no front door; their parent drives them.
             raise HarnessError(409, "not_supported", "Messages go to the session, not to a subagent.")
+        if body.message.get("type") == "set_posture":
+            # Same rule as the menu and POST sessions. A malformed payload is left to the
+            # workflow's own validation of SetPosture.
+            payload = body.message.get("payload")
+            posture = payload.get("posture") if isinstance(payload, dict) else None
+            if isinstance(posture, str):
+                refusal = posture_refusal(posture, agent_environment(), auto_mode_status(configured_judge_backend()))
+                if refusal is not None:
+                    raise HarnessError(422, "posture_not_allowed", refusal)
         message_id = body.request_id or str(uuid.uuid4())
         handle = (await temporal()).get_workflow_handle(body.session_id)
         try:

@@ -1517,6 +1517,60 @@ class ProductViewConfigTests(AgentRoutesTestBase):
         self.assertNotIn(secret, r.text)
         self.assertEqual(self.temporal.events, [])
 
+    def test_auto_mode_label(self) -> None:
+        options = {o["id"]: o for o in self.config()["posture_options"]}
+        self.assertEqual(options["auto"]["label"], "Auto mode")
+        self.assertEqual(agent_models.POSTURES["auto"][0], "Auto mode")
+
+    def set_posture(self, sid: str, posture: str, headers: dict[str, str] = A) -> Any:
+        return self.client.post(
+            "/api/agent/messages",
+            json={"session_id": sid, "message": {"type": "set_posture", "payload": {"posture": posture}}},
+            headers=headers,
+        )
+
+    def test_create_refuses_postures_the_menu_greys_out(self) -> None:
+        # never_ask outside local: 422 with the menu's reason.
+        menu = {o["id"]: o for o in self.config()["posture_options"]}
+        r = self.client.post("/api/agent/sessions", json={"posture": "never_ask"}, headers=A)
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"], "posture_not_allowed")
+        self.assertIn(menu["never_ask"]["reason"], r.text)
+        # auto while the judge is unavailable: 422 with the menu's reason; nothing started.
+        with mock.patch.dict(os.environ, {"AGENT_JUDGE_MODEL": "not-a-spec"}):
+            menu = {o["id"]: o for o in self.client.get("/api/agent/config", headers=A).json()["posture_options"]}
+            starts = len(self.temporal.events)
+            r = self.client.post("/api/agent/sessions", json={"posture": "auto"}, headers=A)
+            self.assertEqual(r.status_code, 422, r.text)
+            self.assertEqual(r.json()["error"], "posture_not_allowed")
+            self.assertIn(menu["auto"]["reason"], r.text)
+            self.assertEqual(len(self.temporal.events), starts)
+        # Available again: both create fine where allowed.
+        self.create(posture="auto")
+        with mock.patch.dict(os.environ, {"AGENT_ENVIRONMENT": "local"}):
+            self.create(posture="never_ask")
+
+    def test_set_posture_message_refuses_the_same(self) -> None:
+        sid = self.create()["workflow_id"]
+        sent = len(self.temporal.signals)
+        r = self.set_posture(sid, "never_ask")
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertEqual(r.json()["error"], "posture_not_allowed")
+        self.assertIn("Local development only.", r.text)
+        with mock.patch.dict(os.environ, {"AGENT_JUDGE_MODEL": "not-a-spec"}):
+            r = self.set_posture(sid, "auto")
+            self.assertEqual(r.status_code, 422, r.text)
+            self.assertIn("Auto mode's judge isn't set up here.", r.text)
+        self.assertEqual(len(self.temporal.signals), sent)  # nothing reached Temporal
+        # Allowed postures still go through as a signal.
+        self.assertEqual(self.set_posture(sid, "auto").status_code, 200)
+        _wid, name, arg = self.temporal.signals[-1]
+        self.assertEqual((name, arg.type, arg.payload), ("enqueue_message", "set_posture", {"posture": "auto"}))
+        with mock.patch.dict(os.environ, {"AGENT_ENVIRONMENT": "local"}):
+            self.assertEqual(self.set_posture(sid, "never_ask").status_code, 200)
+        # Ownership is checked first: a foreign session is a 404, not a posture error.
+        self.assertEqual(self.set_posture(sid, "never_ask", headers=B).status_code, 404)
+
     def test_requires_auth(self) -> None:
         r = self.client.get("/api/agent/config")
         self.assertEqual(r.status_code, 401)
