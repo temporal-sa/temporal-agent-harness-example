@@ -586,15 +586,12 @@ class FixPassTests(_RedisCase):
             script.block.set()
         self.assertEqual(await self.store.agent_id_of("child-wf-1"), CHILD)
 
-    async def test_minor1_read_agent_filters_the_root_stream(self) -> None:
+    async def test_minor1_subagent_started_records_the_agent_id(self) -> None:
         b = self.bridge()
         await self.store.acquire_lease("s", b.holder)
         with mock.patch.object(agent_bridge, "AgentClient", Script(turn_script()).client):
             await _Forwarder(b, "s")._forward_once()
-        frames, cursor = await self.store.read_agent("s", CHILD, after="0-0", count=2)
-        self.assertEqual([f.event for f in frames], ["turn_started", "reply_delta"])
-        rest, _ = await self.store.read_agent("s", CHILD, after=cursor)
-        self.assertEqual([f.event for f in rest], ["turn_end"])
+        self.assertEqual(await self.store.root_of("child-wf-1"), "s")
         self.assertEqual(await self.store.agent_id_of("child-wf-1"), CHILD)
 
     async def test_minor9_identical_child_frames_both_survive_takeover(self) -> None:
@@ -660,22 +657,58 @@ class StoreAdditionsTests(_RedisCase):
         await self.store.mark_closed("b")
         in_order = await self.store.metas(["a", "b", "missing"])
         self.assertEqual([m.closed for m in in_order], [False, True, False])
-        got = await self.store.metas_by_id(["a", "b", "missing"])
-        self.assertEqual(list(got), ["a", "b", "missing"])
-        self.assertTrue(got["a"].turn_active)
-        self.assertEqual(got["a"].pending, {"m1"})
-        self.assertTrue(got["b"].closed)
+        self.assertTrue(in_order[0].turn_active)
+        self.assertEqual(in_order[0].pending, {"m1"})
         self.assertEqual(await self.store.metas([]), [])
         with mock.patch.object(self.r, "pipeline", wraps=self.r.pipeline) as pipeline:
             await self.store.metas(["a", "b", "c", "d"])
         self.assertEqual(pipeline.call_count, 1)
 
-    async def test_subagent_agent_id_uses_the_routes_cache_key(self) -> None:
-        from simple_chat_agent.api.agent_routes import _subagent_key
-
+    async def test_subagent_agent_id_key(self) -> None:
+        """The store owns the key (``{prefix}:subaid:{child}``, the format the routes used
+        before they switched to ``agent_id_of``)."""
         await self.store.register_subagent("kid", "s", agent_id="root-k1")
-        self.assertEqual(await self.r.get(_subagent_key("kid")), "root-k1")
+        key = self.store._subaid_key("kid")
+        self.assertEqual(key, f"{self.prefix}:subaid:{{kid}}")
+        self.assertEqual(await self.r.get(key), "root-k1")
         self.assertEqual(await self.store.agent_id_of("kid"), "root-k1")
+
+    async def test_n3_confirming_clear_only_clears_its_own_turn(self) -> None:
+        token_n = await self.store.begin_confirming("s", time.time() + 30)
+        token_n1 = await self.store.begin_confirming("s", time.time() + 31)  # the next turn
+        self.assertFalse(await self.store.end_confirming("s", token_n))
+        self.assertTrue((await self.store.meta("s")).confirming)
+        # Through the bridge: turn N's job finishing late leaves turn N+1's mark alone.
+        b = self.bridge()
+        fwd = _Forwarder(b, "s")
+        job = SimpleNamespace(kind="turn_confirm")
+        await fwd._root_turn_end(job, [], token_n)  # type: ignore[arg-type]
+        self.assertTrue((await self.store.meta("s")).confirming)
+        await fwd._root_turn_end(job, [], token_n1)  # type: ignore[arg-type]
+        self.assertFalse((await self.store.meta("s")).confirming)
+
+    async def test_m4_a_workflow_that_ended_is_marked_closed(self) -> None:
+        b = self.bridge()
+
+        async def completed(_self: Any) -> Any:
+            return SimpleNamespace(status=WorkflowExecutionStatus.COMPLETED)
+
+        with mock.patch.object(FakeHandle, "describe", completed):
+            self.assertTrue(await b._session_closed("s"))
+        self.assertTrue((await self.store.meta("s")).closed)
+        self.assertFalse(await b._session_closed("s"))  # RUNNING (the default fake)
+
+    async def test_n7_idle_watch_stops_when_the_last_reader_leaves(self) -> None:
+        b = self.bridge()
+        fwd = _Forwarder(b, "s")
+        b._readers["s"] += 1
+        with mock.patch.object(agent_bridge, "IDLE_WATCH_SECONDS", 0.3):
+            task = asyncio.create_task(fwd._watch_idle(asyncio.Event()))
+            await asyncio.sleep(0.1)
+            describes = self.temporal.describes  # the baseline read
+            del b._readers["s"]
+            self.assertFalse(await asyncio.wait_for(task, 2))
+        self.assertEqual(self.temporal.describes, describes)  # no Describe after it left
 
     def test_confirming_field_name(self) -> None:
         self.assertIn("confirming", SessionMeta.__dataclass_fields__)

@@ -349,7 +349,6 @@ class AgentStore:
         await pipe.execute()
 
     def _subaid_key(self, child_workflow_id: str) -> str:
-        # The key the routes already cache this under (agent_routes._subagent_key).
         return f"{prefix()}:subaid:{{{child_workflow_id}}}"
 
     async def agent_id_of(self, child_workflow_id: str) -> str | None:
@@ -455,30 +454,6 @@ class AgentStore:
         tail_after = archived[-1].entry_id if archived else after
         return archived + await self.read(session, after=tail_after, count=count - len(archived))
 
-    async def read_agent(
-        self, session_root: str, agent_id: str, *, after: str, count: int = 500, scan: int = 5000
-    ) -> tuple[list[StoredFrame], str]:
-        """Frames of one agent (``data.agent_id``) from the root session's stream, for serving a
-        subagent's attach. Scans at most ``scan`` frames per call. Returns the matching frames
-        and the entry id to pass as ``after`` next time (the last frame scanned, matching or
-        not), so a caller can page through a long stream without rescanning. Backfills from the
-        archive like ``read_backfilled``."""
-        out: list[StoredFrame] = []
-        cursor = after
-        scanned = 0
-        while len(out) < count and scanned < scan:
-            page = await self.read_backfilled(session_root, after=cursor, count=min(500, scan - scanned))
-            if not page:
-                break
-            for frame in page:
-                cursor = frame.entry_id
-                scanned += 1
-                if frame.data.get("agent_id") == agent_id:
-                    out.append(frame)
-                    if len(out) >= count:
-                        break
-        return out, cursor
-
     async def read_at(self, session: str, resume_offset: int) -> list[StoredFrame]:
         """Every frame stored at one resume position."""
         ms = resume_offset + 1
@@ -528,8 +503,7 @@ class AgentStore:
 
     async def metas(self, sessions: list[str]) -> list[SessionMeta]:
         """``meta`` for many sessions in one pipeline (one round trip), in the order given.
-        (The routes' ``closed_flags`` consumes it as a sequence; ``metas_by_id`` is the dict
-        form.)"""
+        (The routes' ``closed_flags`` consumes it as a sequence.)"""
         if not sessions:
             return []
         pipe = self.r.pipeline(transaction=False)
@@ -537,10 +511,6 @@ class AgentStore:
             self._queue_meta(pipe, session)
         results = await pipe.execute()
         return [_meta(*results[i * 4:(i + 1) * 4]) for i in range(len(sessions))]
-
-    async def metas_by_id(self, sessions: list[str]) -> dict[str, SessionMeta]:
-        """``metas`` keyed by session id (one round trip)."""
-        return dict(zip(sessions, await self.metas(sessions)))
 
     async def mark_closed(self, session: str) -> None:
         """The session ended. A key of its own (``…:closed``), so the bridge's whole-JSON meta
@@ -594,6 +564,18 @@ class AgentStore:
         pipe.hset(self._k(session, "t"), mapping=mapping)
         pipe.expire(self._k(session, "t"), session_ttl_seconds())
         await pipe.execute()
+
+    async def begin_confirming(self, session: str, deadline: float) -> str:
+        """Mark a root turn's telemetry as being confirmed until ``deadline`` (epoch s).
+        Returns the token to pass to ``end_confirming``."""
+        token = repr(deadline)
+        await self.set_tracking(session, confirming_until=token)
+        return token
+
+    async def end_confirming(self, session: str, token: str) -> bool:
+        """Clear the confirming mark, only if it is still ``token`` (a later turn's mark is
+        left alone). Atomic compare-and-clear. True if it cleared."""
+        return bool(await self.r.eval(_CLEAR_IF_EQUAL, 1, self._k(session, "t"), "confirming_until", token))
 
     async def note_sent(self, session: str, message_id: str) -> None:
         """A message went out through the front door; it is pending until its turn starts,
@@ -672,6 +654,14 @@ if not ok then
 end
 redis.call('EXPIRE', KEYS[1], ARGV[3])
 return 'ok'
+"""
+
+_CLEAR_IF_EQUAL = """
+if redis.call('HGET', KEYS[1], ARGV[1]) == ARGV[2] then
+  redis.call('HSET', KEYS[1], ARGV[1], '0')
+  return 1
+end
+return 0
 """
 
 _BOUNDED_ADD = """

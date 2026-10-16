@@ -28,6 +28,8 @@ Idle: once an attach finds the agent idle and caught up, the forwarder stops (se
 approvals wake it through ``wake``). While a reader on this replica is attached it stays, and
 notices work started elsewhere (e.g. through the harness Update) by Describe's history length,
 every ``IDLE_WATCH_SECONDS`` backing off to ``IDLE_WATCH_MAX_SECONDS``: no Queries while idle.
+With no local reader, work started out of band (Temporal CLI or UI, the harness Update) isn't
+noticed until the next send or attach.
 
 Lease takeover: a replica that wanted to forward but found the lease taken stands by while the
 session is busy or has local readers, polling the lease every ``STANDBY_POLL_SECONDS``; a
@@ -344,7 +346,12 @@ class Bridge:
             desc = await self._temporal.get_workflow_handle(session).describe()
         except Exception:  # noqa: BLE001 - can't tell; assume open
             return False
-        return desc.status not in (None, WorkflowExecutionStatus.RUNNING)
+        closed = desc.status not in (None, WorkflowExecutionStatus.RUNNING)
+        if closed:
+            # A workflow that ended on its own (or was terminated) shows as closed too.
+            with contextlib.suppress(Exception):
+                await self._store.mark_closed(session)
+        return closed
 
     def has_reader(self, session: str) -> bool:
         return self._readers.get(session, 0) > 0
@@ -414,7 +421,12 @@ class _Forwarder:
 
     async def _watch_idle(self, wake: asyncio.Event) -> bool:
         """Idle with a local reader: wait for a wake, or for Describe to show new history
-        (work started outside our routes). True to attach again, False to stop."""
+        (work started outside our routes). True to attach again, False to stop.
+
+        Work started out of band (the Temporal CLI or UI, the harness Update) is noticed here
+        within ``IDLE_WATCH_SECONDS``..``IDLE_WATCH_MAX_SECONDS`` only while a reader is
+        attached on this replica. With no reader anywhere it isn't noticed until the next
+        send or attach: nothing reads the session then, so nothing is missed by a client."""
         baseline = await self._history_length()
         interval = IDLE_WATCH_SECONDS
         waited = 0.0
@@ -423,6 +435,8 @@ class _Forwarder:
                 await asyncio.wait_for(wake.wait(), timeout=interval)
             if wake.is_set():
                 return True
+            if not self.b.has_reader(self.session):
+                return False  # the last reader left during the wait: no Describe for nobody
             waited += interval
             interval = min(interval * 2, IDLE_WATCH_MAX_SECONDS)
             if (await self.store.meta(self.session)).pending:
@@ -505,10 +519,11 @@ class _Forwarder:
                     if dup:
                         seen[digest] -= 1
                 root_turn_end = is_root and event == "turn_end"
+                confirm_token: str | None = None
                 if root_turn_end and (not dup or resume_offset > meta.acked):
                     # Hold attaches open until this turn's telemetry is confirmed (bounded).
-                    await self.store.set_tracking(
-                        self.session, confirming_until=time.time() + CONFIRM_TIMEOUT_SECONDS
+                    confirm_token = await self.store.begin_confirming(
+                        self.session, time.time() + CONFIRM_TIMEOUT_SECONDS
                     )
                 if not dup:
                     # (A dup was stored by the previous holder. It is still folded below: that
@@ -537,14 +552,14 @@ class _Forwarder:
                     if is_root and event == "turn_end" and resume_offset > meta.acked:
                         # The previous holder died before confirming and acking this turn.
                         for job in obs.jobs:
-                            self._spawn(job, root_turn_end=True)
+                            self._spawn(job, root_turn_end=True, confirm_token=confirm_token)
                     continue
                 if self.worker_state == "suspect":
                     await self._set_worker("ok", "frames are arriving again", None)
                 for x_event, x_data in obs.frames:
                     await self._emit(x_event, x_data)
                 for job in obs.jobs:
-                    self._spawn(job, root_turn_end=is_root and event == "turn_end")
+                    self._spawn(job, root_turn_end=root_turn_end, confirm_token=confirm_token)
         finally:
             await _stop(watcher)
         return count
@@ -578,11 +593,11 @@ class _Forwarder:
 
     # -- background jobs ---------------------------------------------------------------
 
-    def _spawn(self, job: telemetry.Job, *, root_turn_end: bool) -> None:
+    def _spawn(self, job: telemetry.Job, *, root_turn_end: bool, confirm_token: str | None = None) -> None:
         if root_turn_end:
             # Root turn end: confirm, archive, ack, in order, after any earlier jobs.
             prior = list(self._jobs)
-            task = asyncio.create_task(self._root_turn_end(job, prior))
+            task = asyncio.create_task(self._root_turn_end(job, prior, confirm_token))
         else:
             task = asyncio.create_task(self._job(job))
         self._jobs.add(task)
@@ -602,7 +617,9 @@ class _Forwarder:
         except LeaseLost:
             return  # the new holder confirms from history itself
 
-    async def _root_turn_end(self, job: telemetry.Job, prior: list[asyncio.Task[Any]]) -> None:
+    async def _root_turn_end(
+        self, job: telemetry.Job, prior: list[asyncio.Task[Any]], confirm_token: str | None = None
+    ) -> None:
         try:
             async with asyncio.timeout(CONFIRM_TIMEOUT_SECONDS):
                 if prior:
@@ -612,8 +629,10 @@ class _Forwarder:
             log.warning("bridge %s: turn telemetry not confirmed within %.0fs; giving up",
                         self.session, CONFIRM_TIMEOUT_SECONDS)
         finally:
-            with contextlib.suppress(Exception):
-                await self.store.set_tracking(self.session, confirming_until=0)
+            if confirm_token is not None:
+                with contextlib.suppress(Exception):
+                    # Only this turn's mark: a later turn may have set its own meanwhile.
+                    await self.store.end_confirming(self.session, confirm_token)
         await self._archive_and_ack()
 
     async def _settle(self) -> None:

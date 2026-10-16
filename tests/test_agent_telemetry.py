@@ -333,7 +333,10 @@ class HonestyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(t.worker_lost("start_to_close_timeout", "w-a", "w-a"))
         self.assertFalse(t.worker_lost("start_to_close_timeout", None, "w-a"))
         self.assertTrue(t.worker_lost("start_to_close_timeout", "w-a", "w-b"))
-        self.assertTrue(t.worker_lost("application_error:X", "w-a", "w-b"))
+        # N1: a provider or tool error retried on another replica is not a lost worker.
+        self.assertFalse(t.worker_lost("application_error:X", "w-a", "w-b"))
+        self.assertFalse(t.worker_lost(None, "w-a", "w-b"))
+        self.assertFalse(t.worker_lost("other", "w-a", "w-b"))
 
     async def _confirm(self, tel: t.Telemetry, records: list[t.ActivityRecord]) -> list[dict]:
         with mock.patch.object(t, "HistoryReader", lambda client: FakeReader(records)):
@@ -364,6 +367,22 @@ class HonestyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(rec["retracted"])
         self.assertEqual(rec["cause"], "start_to_close_timeout")
         self.assertEqual(rec["lost_worker"], "w-a")
+
+    async def test_n1_provider_error_on_another_replica_is_retracted(self) -> None:
+        tel = t.Telemetry("s")
+        turn = self.turn(tel)
+        turn.calls = [t.Call(index=0, message_id="m", model="c", started_pos=1, retries=1)]
+        tel.note_pending("s", "1", 1, "w-a")
+        err = Failure(application_failure_info=ApplicationFailureInfo(type="ProviderOverloaded"))
+        with mock.patch.object(t, "HistoryReader", lambda client: FakeReader(
+                [record(1, MODEL, attempt=2, closed=3, failure=err, result=response(10, 1))])):
+            frames = await t.confirm_turn(None, tel, turn)  # type: ignore[arg-type]
+        rec = [d for e, d in frames if e == t.X_RECOVERY][0]
+        self.assertTrue(rec["retracted"])
+        self.assertEqual(rec["cause"], "application_error:ProviderOverloaded")
+        # And with no live marker, history alone shows nothing.
+        self.assertEqual(await self._confirm(t.Telemetry("s"), [
+            record(1, MODEL, attempt=2, closed=3, failure=err, result=response(10, 1))]), [])
 
     async def test_live_detection_skips_a_same_worker_timeout(self) -> None:
         tel = t.Telemetry("s")

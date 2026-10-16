@@ -18,10 +18,11 @@ replaces the live one). Fields a provider doesn't report are ``null``, never 0.
 
 Honesty rules (the UI shows recoveries as durability savings):
 
-* A retry counts as a lost worker only when the failed attempt hit its heartbeat timeout, or
-  the attempt ran on a different worker than the one before it. A start-to-close timeout alone
-  is a slow provider or tool: the frame is confirmed with ``cause: "timeout"`` and
-  ``retracted: true``.
+* A retry counts as a lost worker only when the failed attempt hit its heartbeat timeout, or hit
+  its start-to-close timeout and the next attempt ran on another worker. A start-to-close
+  timeout on the same worker is a slow provider or tool (``cause: "timeout"``); any other
+  failure keeps its type as ``cause`` (e.g. ``application_error:RateLimited``). Both are
+  confirmed with ``retracted: true`` when the stream had shown a marker, else not shown.
 * ``kept`` counts only work that finished: model calls that completed and tools that ended
   without error, before the failed attempt. It never includes the repeated call.
 * ``repeated.resent_input_tokens_estimate`` is the retried call's prompt size times the extra
@@ -197,12 +198,15 @@ class ActivityRecord:
 
 
 def worker_lost(cause: str | None, previous_worker: str | None, worker: str | None) -> bool:
-    """Was a retry caused by losing a worker? Yes on a heartbeat timeout (the attempt stopped
-    heartbeating), or when the next attempt ran on another worker than the failed one. A
-    start-to-close timeout on the same worker is a slow call, not a crash."""
+    """Was a retry caused by losing a worker? Only on a heartbeat timeout (the attempt stopped
+    heartbeating), or on a start-to-close timeout followed by an attempt on another worker.
+    A start-to-close timeout on the same worker is a slow call, and any other failure (a
+    provider or tool error) is not a crash even if the retry landed on another replica."""
     if cause == "heartbeat_timeout":
         return True
-    return bool(previous_worker and worker and previous_worker != worker)
+    if cause == "start_to_close_timeout":
+        return bool(previous_worker and worker and previous_worker != worker)
+    return False
 
 
 def shown_cause(cause: str | None, lost: bool) -> str | None:

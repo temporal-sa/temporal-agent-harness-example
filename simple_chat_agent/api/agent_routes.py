@@ -98,6 +98,13 @@ log = logging.getLogger(__name__)
 
 KEEPALIVE_SECONDS = 15.0
 READ_PAGE = 500
+# Demo seeding: the claim's life (a crashed seeder frees it), and how long a concurrent create
+# of the same id waits for the seeder before answering 409 ``creating``.
+SEEDING = "seeding"
+SEED_CLAIM_SECONDS = 120
+SEED_WAIT_SECONDS = 20.0
+SEED_POLL_SECONDS = 0.25
+_UNSET = object()
 NO_STORE = {"Cache-Control": "no-store"}
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
 
@@ -118,6 +125,8 @@ UPLOAD_ENVELOPE_BYTES = 64 * 1024
 SESSIONS_LIST_MAX = 500
 # Rebuilding a lost session list Queries CodingSessions (server-side, rare); at most this often.
 REBUILD_BACKOFF_SECONDS = 600
+# ... but only this long after a failed Query (no worker), so the list comes back soon.
+REBUILD_RETRY_SECONDS = 30
 REBUILD_QUERY_TIMEOUT = timedelta(seconds=5)
 # Describe-fallback misses (unknown or foreign ids) are remembered this long per caller.
 OWNER_MISS_TTL_SECONDS = 30.0
@@ -221,14 +230,23 @@ def _has_body(request: Request) -> bool:
 
 def origin_allowed(request: Request) -> bool:
     """A state-changing request is ours when it carries the custom header, or its ``Origin``
-    (else ``Referer``) is this host or ``SIMPLE_CHAT_PUBLIC_URL``. Browsers always send
-    ``Origin`` on a cross-site POST, and can't add a custom header without a CORS preflight,
-    which this API never grants."""
+    (else, with no ``Origin`` at all, its ``Referer``) is this host or
+    ``SIMPLE_CHAT_PUBLIC_URL``. Browsers always send ``Origin`` on a cross-site POST, and
+    can't add a custom header without a CORS preflight, which this API never grants.
+
+    ``Origin: null`` (sandboxed frames, ``data:`` pages, some redirects) is refused outright;
+    it never falls back to ``Referer``.
+
+    Deployment: the comparison is against the request's ``Host`` header. Behind a proxy that
+    rewrites ``Host`` (to an internal name), set ``SIMPLE_CHAT_PUBLIC_URL`` to the public
+    origin (scheme and host), or every browser request is refused."""
     if request.headers.get(CSRF_HEADER):
         return True
     source = request.headers.get("origin")
-    if not source or source == "null":
-        source = None if source == "null" else request.headers.get("referer")
+    if source == "null":
+        return False
+    if not source:
+        source = request.headers.get("referer")
     if not source:
         return False
     parts = urlsplit(source)
@@ -271,21 +289,60 @@ class HarnessErrorRoute(APIRoute):
                     if multipart and _content_length(request) > MAX_UPLOAD_BYTES + UPLOAD_ENVELOPE_BYTES:
                         # Refused before the multipart parser spools it.
                         return _error(413, "too_large", f"Attachments are limited to {MAX_UPLOAD_BYTES} bytes.")
+            limit = _limit_body(request, MAX_UPLOAD_BYTES + UPLOAD_ENVELOPE_BYTES) if multipart else None
             try:
                 return await handler(request)
-            except HarnessError as exc:
-                return _error(exc.status, exc.code, exc.message, **exc.extra)
-            except RequestValidationError as exc:
-                errors = jsonable_encoder(exc.errors())
-                first = errors[0] if errors else {}
-                where = ".".join(str(p) for p in first.get("loc", ()) if p != "body")
-                message = f"{where}: {first.get('msg')}" if where else str(first.get("msg") or "Invalid request.")
-                return _error(422, "invalid_request", message, errors=errors)
-            except HTTPException as exc:
-                code = _HTTP_CODES.get(exc.status_code, "http_error")
-                return _error(exc.status_code, code, str(exc.detail), headers=exc.headers)
+            except Exception as exc:
+                # A body cut off at the limit surfaces from FastAPI's form parsing as a 400.
+                if limit is not None and limit.over:
+                    return _error(413, "too_large", f"Attachments are limited to {MAX_UPLOAD_BYTES} bytes.")
+                return _harness_error_response(exc)
 
         return wrapped
+
+
+def _harness_error_response(exc: Exception) -> Response:
+    """The harness error body for an exception a route raised; anything else re-raises."""
+    if isinstance(exc, HarnessError):
+        return _error(exc.status, exc.code, exc.message, **exc.extra)
+    if isinstance(exc, RequestValidationError):
+        errors = jsonable_encoder(exc.errors())
+        first = errors[0] if errors else {}
+        where = ".".join(str(p) for p in first.get("loc", ()) if p != "body")
+        message = f"{where}: {first.get('msg')}" if where else str(first.get("msg") or "Invalid request.")
+        return _error(422, "invalid_request", message, errors=errors)
+    if isinstance(exc, HTTPException):
+        code = _HTTP_CODES.get(exc.status_code, "http_error")
+        return _error(exc.status_code, code, str(exc.detail), headers=exc.headers)
+    raise exc
+
+
+class _BodyLimit:
+    """Counts request body bytes as the app reads them and stops at ``limit``: covers chunked
+    bodies (no Content-Length), and stops the multipart parser from spooling past it."""
+
+    def __init__(self, request: Request, limit: int) -> None:
+        self.limit, self.seen, self.over = limit, 0, False
+        self._receive = request._receive
+
+    async def __call__(self) -> Any:
+        message = await self._receive()
+        if message.get("type") == "http.request":
+            self.seen += len(message.get("body", b""))
+            if self.seen > self.limit:
+                self.over = True
+                raise _BodyTooLarge()
+        return message
+
+
+class _BodyTooLarge(Exception):
+    pass
+
+
+def _limit_body(request: Request, limit: int) -> _BodyLimit:
+    guard = _BodyLimit(request, limit)
+    request._receive = guard
+    return guard
 
 
 # -- request bodies ----------------------------------------------------------------------
@@ -494,6 +551,11 @@ class SessionDirectory:
         pipe.hget(records, session_id)
         self._touch(pipe, user_id)
         raw, *_ = await pipe.execute()
+        if raw is None:
+            index, _ = self._keys(user_id)
+            # The whole list is gone (expired, Redis lost): rebuild it, then look again.
+            if not await self.r.exists(index) and await self._rebuild(user_id):
+                raw = await self.r.hget(records, session_id)
         return json.loads(raw) if raw else None
 
     async def list(self, user_id: str) -> list[dict[str, Any]]:
@@ -540,6 +602,12 @@ class SessionDirectory:
         await pipe.execute()
         await self._send(user_id, "remove_session_signal", session_id)
 
+    async def _retry_rebuild_soon(self, user_id: str, exc: Exception) -> None:
+        """The Query failed (workers down, Temporal unreachable): try again after a short
+        wait rather than leaving the list empty for the whole backoff."""
+        log.info("session directory rebuild for %s failed, retrying soon: %s", owner_digest(user_id), exc)
+        await self.r.expire(self._rebuilt_key(user_id), REBUILD_RETRY_SECONDS)
+
     async def _rebuild(self, user_id: str) -> bool:
         """The Redis list is gone (expired or Redis lost): rebuild it from the user's
         ``CodingSessions`` (its ``list_sessions`` Query). A rare, server-side path; at most
@@ -557,8 +625,14 @@ class SessionDirectory:
             found = await handle.query(
                 "list_sessions", result_type=list[SessionRecord], rpc_timeout=REBUILD_QUERY_TIMEOUT
             )
-        except Exception as exc:  # noqa: BLE001 - no manager yet, or no worker: nothing to rebuild
-            log.info("session directory rebuild for %s skipped: %s", owner_digest(user_id), exc)
+        except RPCError as exc:
+            if exc.status == RPCStatusCode.NOT_FOUND:
+                # No manager: the user never had a session. Nothing to rebuild for a while.
+                return False
+            await self._retry_rebuild_soon(user_id, exc)
+            return False
+        except Exception as exc:  # noqa: BLE001 - e.g. no worker to answer the Query
+            await self._retry_rebuild_soon(user_id, exc)
             return False
         if not found:
             return False
@@ -725,12 +799,6 @@ class Ownership:
 # -- the router --------------------------------------------------------------------------
 
 
-async def claim_owner(store: AgentStore, session_id: str, user_id: str) -> bool:
-    """Record ``user_id`` as the session's owner unless someone already is (SET NX). True when
-    this call set it."""
-    return await store.claim_owner(session_id, user_id)
-
-
 def _is_closed(status: WorkflowExecutionStatus | None) -> bool:
     return status is not None and status not in (
         WorkflowExecutionStatus.RUNNING,
@@ -741,11 +809,6 @@ def _is_closed(status: WorkflowExecutionStatus | None) -> bool:
 async def closed_flags(store: AgentStore, session_ids: list[str]) -> list[bool]:
     """``SessionMeta.closed`` for many sessions in one Redis round trip (the list routes)."""
     return [m.closed for m in await store.metas(session_ids)]
-
-
-async def mark_meta_closed(store: AgentStore, session_id: str) -> None:
-    await store.mark_closed(session_id)
-
 
 
 SeedFn = Callable[[str, str], Awaitable[Any]]
@@ -815,7 +878,7 @@ def create_agent_router(
 
     async def mark_closed(session_id: str, uid: str) -> None:
         """The session's workflow closed (or was asked to): ``GET sessions`` shows it."""
-        await mark_meta_closed(store, session_id)
+        await store.mark_closed(session_id)
         await sessions.mark_closed(uid, session_id)
 
     async def require_root(session_id: str, uid: str) -> str:
@@ -888,7 +951,7 @@ def create_agent_router(
 
         # Ownership first (a crash after starting the workflow must not orphan it), claimed
         # atomically: an id another user already holds is theirs (404, like any foreign id).
-        claimed = await claim_owner(store, session_id, uid)
+        claimed = await store.claim_owner(session_id, uid)
         if not claimed and await store.owner_of(session_id) != uid:
             raise not_found()
         if requested_id is not None or not claimed:
@@ -916,24 +979,7 @@ def create_agent_router(
             # Before the workflow starts, so the first message already sees the repo, and a
             # failed seed leaves no session behind. Once per workspace: a retry after the seed
             # succeeded but the start failed skips it.
-            marker = f"{prefix()}:seeded:{session_id}"
-            done = await store.r.get(marker)
-            if done:
-                seeded = json.loads(done)
-            else:
-                try:
-                    result = await seed_fn(session_id, body.demo)
-                except Exception:  # noqa: BLE001 - executor refused or unreachable
-                    log.exception("seeding %s for %s failed", body.demo, session_id)
-                    raise HarnessError(
-                        502, "seed_failed", "Couldn't set up the demo workspace. Try again in a moment."
-                    ) from None
-                seeded = {
-                    "fixture": body.demo,
-                    "files": len(getattr(result, "files", []) or []),
-                    "commit": getattr(result, "commit", ""),
-                }
-                await store.r.set(marker, json.dumps(seeded), ex=session_ttl_seconds())
+            seeded = await seed_once(session_id, body.demo)
         client = await temporal()
         try:
             await client.start_workflow(
@@ -966,6 +1012,38 @@ def create_agent_router(
         if seeded is not None:
             summary["seed"] = seeded
         return JSONResponse(summary, headers=NO_STORE)
+
+    async def seed_once(session_id: str, fixture: str) -> dict[str, Any]:
+        """Seed the workspace exactly once, even across concurrent creates of the same
+        caller-chosen id and retries: the marker is claimed (SET NX "seeding") before seeding
+        and holds the result after. A loser waits for the winner, briefly, else 409."""
+        marker = f"{prefix()}:seeded:{session_id}"
+        if not await store.r.set(marker, SEEDING, nx=True, ex=SEED_CLAIM_SECONDS):
+            deadline = time.monotonic() + SEED_WAIT_SECONDS
+            while True:
+                value = await store.r.get(marker)
+                if value and value != SEEDING:
+                    return json.loads(value)
+                if value is None:
+                    # The winner failed and released it: this request may seed after all.
+                    if await store.r.set(marker, SEEDING, nx=True, ex=SEED_CLAIM_SECONDS):
+                        break
+                elif time.monotonic() >= deadline:
+                    raise HarnessError(409, "creating", "This session is still being set up; try again shortly.")
+                await asyncio.sleep(SEED_POLL_SECONDS)
+        try:
+            result = await seed_fn(session_id, fixture)
+        except Exception:  # noqa: BLE001 - executor refused or unreachable
+            await store.r.delete(marker)
+            log.exception("seeding %s for %s failed", fixture, session_id)
+            raise HarnessError(502, "seed_failed", "Couldn't set up the demo workspace. Try again in a moment.") from None
+        seeded = {
+            "fixture": fixture,
+            "files": len(getattr(result, "files", []) or []),
+            "commit": getattr(result, "commit", ""),
+        }
+        await store.r.set(marker, json.dumps(seeded), ex=session_ttl_seconds())
+        return seeded
 
     async def existing_summary(session_id: str, uid: str) -> dict[str, Any] | None:
         """The summary of an existing session workflow the caller owns (open or closed), or
@@ -1032,7 +1110,7 @@ def create_agent_router(
         except RPCError as exc:
             if exc.status != RPCStatusCode.NOT_FOUND:
                 raise
-        await mark_meta_closed(store, session_id)
+        await store.mark_closed(session_id)
         await sessions.remove(uid, session_id)
         return JSONResponse({"ok": True, "workflow_id": session_id}, headers=NO_STORE)
 
@@ -1212,7 +1290,9 @@ def create_agent_router(
                 ToolApprovalDecision(
                     tool_id=body.tool_id, approved=body.approved, reason=body.reason, remember=body.remember
                 ),
-                id=body.request_id or None,
+                # Stable across retries: a retry after a 503 whose first attempt did apply
+                # dedups to the same Update instead of failing as already decided.
+                id=body.request_id or f"approve:{body.tool_id}",
                 rpc_timeout=CHILD_APPROVAL_TIMEOUT,
             )
         except WorkflowUpdateRPCTimeoutOrCancelledError:
@@ -1351,13 +1431,6 @@ def _belongs(agent_id: Any, subagent: str) -> bool:
     return isinstance(agent_id, str) and (agent_id == subagent or agent_id.startswith(subagent + "-"))
 
 
-def _subagent_key(child: str) -> str:
-    """The Redis key of a subagent's merged-stream agent id. The store owns it now
-    (``AgentStore.agent_id_of`` / ``register_subagent``); kept because
-    tests/test_agent_bridge.py pins the two to the same key."""
-    return f"{prefix()}:subaid:{{{child}}}"
-
-
 async def _subagent_agent_id(store: AgentStore, root: str, child: str) -> str | None:
     """The merged-stream ``agent_id`` of subagent workflow ``child``: the store's registry
     (filled by the bridge from ``subagent_started``), else a scan of the root's stored frames
@@ -1404,6 +1477,10 @@ async def _frames(
     subagent = await _subagent_agent_id(store, session_id, child) if child else None
     loop = asyncio.get_running_loop()
     last_sent = loop.time()
+    # Redis's first entry id when read_backfilled last came back empty (caught up, archive
+    # exhausted past ``after``); _UNSET until then. Only a change in it (Redis gets its first
+    # entry, or is rebuilt) sends a read back through the archive.
+    archive_done: Any = _UNSET
     while True:
         # Meta first, frames second. The bridge appends a frame before it saves the meta that
         # frame produces, so an idle meta read here guarantees the read below already sees the
@@ -1415,7 +1492,13 @@ async def _frames(
         # Every non-blocking read goes through read_backfilled (store contract): from the
         # turn archive while ``after`` is behind what Redis holds (Redis expired, lost or
         # rebuilt), then from Redis. Only an empty result means caught up; only then block.
-        frames = await store.read_backfilled(session_id, after=after, count=READ_PAGE)
+        if archive_done is not _UNSET and await store.first_entry_id(session_id) == archive_done:
+            # The archive had nothing past ``after`` and Redis's stream hasn't (re)started
+            # since: read Redis alone, so an idle poll never lists the archive again.
+            frames = await store.read(session_id, after=after, count=READ_PAGE)
+        else:
+            frames = await store.read_backfilled(session_id, after=after, count=READ_PAGE)
+            archive_done = await store.first_entry_id(session_id) if not frames else _UNSET
         if not frames:
             if not meta.turn_active and not meta.pending and not meta.confirming:
                 return

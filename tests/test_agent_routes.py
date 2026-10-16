@@ -95,12 +95,15 @@ class FakeHandle:
 
     async def execute_update(self, name: str, arg: Any, **kwargs: Any) -> Any:
         self.client.updates.append((self.id, name, arg))
+        self.client.update_ids.append(kwargs.get("id"))
         if self.client.update_error is not None:
             raise self.client.update_error
         return []
 
     async def query(self, name: str, **kwargs: Any) -> Any:
         self.client.queries.append((self.id, name))
+        if self.client.query_error is not None:
+            raise self.client.query_error
         if self.id not in self.client.query_results:
             raise not_found()
         return self.client.query_results[self.id]
@@ -115,6 +118,8 @@ class FakeTemporal:
         self.describes: list[str] = []
         self.events: list[str] = []
         self.update_error: Exception | None = None
+        self.update_ids: list[str | None] = []
+        self.query_error: Exception | None = None
         self.queries: list[tuple[str, str]] = []
         self.query_results: dict[str, Any] = {}
         self.start_error: Exception | None = None
@@ -888,10 +893,8 @@ class MainAppWiringTests(unittest.TestCase):
             self.assertEqual(r.status_code, 200, r.text)
 
 
-class ReviewFixTests(AgentRoutesTestBase):
-    """P2 deep review fix pass: one regression test (or more) per finding."""
-
-    sync_directory = True
+class _RouteHelpers:
+    """Shared helpers for the fix-pass tests (mixed into AgentRoutesTestBase subclasses)."""
 
     def append(self, session: str, event: str, data: dict[str, Any], offset: int, seq: int) -> None:
         self.run_async(self.store.append(session, event, data, offset, seq))
@@ -903,6 +906,33 @@ class ReviewFixTests(AgentRoutesTestBase):
             if "event" in lines:
                 out.append((lines["event"], json.loads(lines["data"])))
         return out
+
+    def use_disk_archive(self) -> Any:
+        from simple_chat_agent.api.agent_store import FrameArchive, _DiskArchive
+
+        archive = FrameArchive(_DiskArchive(Path(self.tmp.name) / "archive"), "test-frames")
+        self.store.archive = archive
+        return archive
+
+    def archived(self, session: str, archive: Any, positions: range, per_object: int = 250) -> None:
+        from simple_chat_agent.api.agent_store import StoredFrame
+
+        frames = [StoredFrame("text_delta", {"agent_id": "aaaaaa", "n": i}, i, f"{i + 1}-0") for i in positions]
+        for i in range(0, len(frames), per_object):
+            self.run_async(archive.put(session, frames[i : i + per_object]))
+
+    def ttl(self, key: str) -> int:
+        return self.run_async(self.redis.ttl(key))
+
+    def harness_create(self, sid: str, headers: dict[str, str] = A, **data: Any) -> Any:
+        body = {"agent_workflow_type": AGENT_WORKFLOW_TYPE, "session_id": sid, "data": data}
+        return self.client.post("/api/agent/sessions", json=body, headers=headers)
+
+
+class ReviewFixTests(_RouteHelpers, AgentRoutesTestBase):
+    """P2 deep review fix pass: one regression test (or more) per finding."""
+
+    sync_directory = True
 
     # B1 -----------------------------------------------------------------------------
 
@@ -939,20 +969,6 @@ class ReviewFixTests(AgentRoutesTestBase):
 
     # M1 (store contract) ------------------------------------------------------------
 
-    def use_disk_archive(self) -> Any:
-        from simple_chat_agent.api.agent_store import FrameArchive, _DiskArchive
-
-        archive = FrameArchive(_DiskArchive(Path(self.tmp.name) / "archive"), "test-frames")
-        self.store.archive = archive
-        return archive
-
-    def archived(self, session: str, archive: Any, positions: range, per_object: int = 250) -> None:
-        from simple_chat_agent.api.agent_store import StoredFrame
-
-        frames = [StoredFrame("text_delta", {"agent_id": "aaaaaa", "n": i}, i, f"{i + 1}-0") for i in positions]
-        for i in range(0, len(frames), per_object):
-            self.run_async(archive.put(session, frames[i : i + per_object]))
-
     def test_m1_attach_pages_through_more_than_500_archived_frames(self) -> None:
         sid = self.create()["workflow_id"]
         archive = self.use_disk_archive()
@@ -980,9 +996,6 @@ class ReviewFixTests(AgentRoutesTestBase):
         self.assertEqual(self.run_async(self.store.agent_id_of(child)), "aaaaaa-eeeeee")
 
     # M2 -----------------------------------------------------------------------------
-
-    def ttl(self, key: str) -> int:
-        return self.run_async(self.redis.ttl(key))
 
     def test_m2_list_get_rename_refresh_the_ttl(self) -> None:
         sid = self.create()["workflow_id"]
@@ -1023,10 +1036,6 @@ class ReviewFixTests(AgentRoutesTestBase):
         self.assertEqual(len([q for q in self.temporal.queries if q[0] != manager]), 1)
 
     # M4 -----------------------------------------------------------------------------
-
-    def harness_create(self, sid: str, headers: dict[str, str] = A, **data: Any) -> Any:
-        body = {"agent_workflow_type": AGENT_WORKFLOW_TYPE, "session_id": sid, "data": data}
-        return self.client.post("/api/agent/sessions", json=body, headers=headers)
 
     def test_m4_retry_and_create_after_delete_never_reseed(self) -> None:
         first = self.harness_create("demo-1", demo="refund_service").json()
@@ -1195,7 +1204,7 @@ class ReviewFixTests(AgentRoutesTestBase):
     def test_minor7_owner_claim_is_nx(self) -> None:
         taken = f"coding-agent-{'f' * 16}"
         self.run_async(self.store.set_owner(taken, "bob"))
-        self.assertFalse(self.run_async(agent_routes.claim_owner(self.store, taken, "alice")))
+        self.assertFalse(self.run_async(self.store.claim_owner(taken, "alice")))
         self.assertEqual(self.run_async(self.store.owner_of(taken)), "bob")
         with mock.patch.object(agent_routes.uuid, "uuid4", return_value=SimpleNamespace(hex="f" * 32)):
             r = self.client.post("/api/agent/sessions", json={}, headers=A)
@@ -1245,6 +1254,165 @@ class ReviewFixTests(AgentRoutesTestBase):
         self.store.meta = no_single_meta  # type: ignore[method-assign]
         listed = self.client.get("/api/agent/sessions", headers=A).json()
         self.assertEqual(sorted(s["workflow_id"] for s in listed), sorted(ids))
+
+
+class VerificationFollowUpTests(_RouteHelpers, AgentRoutesTestBase):
+    """P2 verification follow-ups (N2, N4, N5, N6, m6, N9)."""
+
+    sync_directory = True
+
+    # N2 -----------------------------------------------------------------------------
+
+    def test_n2_idle_polls_do_not_list_the_archive_again(self) -> None:
+        sid = self.create()["workflow_id"]
+        archive = self.use_disk_archive()
+        self.archived(sid, archive, range(3))
+        reads = 0
+        original_read = archive.read
+
+        async def counting(*args: Any, **kwargs: Any) -> Any:
+            nonlocal reads
+            reads += 1
+            return await original_read(*args, **kwargs)
+
+        archive.read = counting  # type: ignore[method-assign]
+        calls = 0
+        original_meta = self.store.meta
+
+        async def meta(session: str) -> Any:
+            nonlocal calls
+            calls += 1
+            m = await original_meta(session)
+            m.turn_active = calls <= 4  # four polls with nothing new, then idle
+            if calls == 3:
+                # Redis gets its first entry: the archive is consulted once more.
+                await self.store.append(session, "text_delta", {"agent_id": "aaaaaa", "n": 99}, 50, 0)
+            return m
+
+        self.store.meta = meta  # type: ignore[method-assign]
+        r = self.client.get("/api/agent/attach", params={"session_id": sid}, headers=A)
+        self.assertEqual([d["n"] for _, d in self.events(r)], [0, 1, 2, 99])
+        self.assertGreaterEqual(calls, 5)
+        # First read (frames), the read that found it exhausted, then once after Redis
+        # got its first entry: never once per idle poll.
+        self.assertLessEqual(reads, 3)
+
+    # N4 -----------------------------------------------------------------------------
+
+    def test_n4_failed_rebuild_query_retries_soon(self) -> None:
+        self.temporal.query_error = RuntimeError("no poller seen for task queue recently")
+        self.assertEqual(self.client.get("/api/agent/sessions", headers=A).json(), [])
+        key = self.directory._rebuilt_key("alice")
+        self.assertLessEqual(self.ttl(key), agent_routes.REBUILD_RETRY_SECONDS)
+        # No manager at all: nothing to rebuild for the whole backoff.
+        self.temporal.query_error = None
+        self.client.get("/api/agent/sessions", headers=B)
+        self.assertGreater(self.ttl(self.directory._rebuilt_key("bob")), agent_routes.REBUILD_RETRY_SECONDS)
+
+    def test_n4_get_session_rebuilds_a_lost_list(self) -> None:
+        from simple_chat_agent.agent.sessions import SessionRecord
+
+        sid = self.create(title="kept")["workflow_id"]
+        index, records = self.directory._keys("alice")
+        self.run_async(self.redis.delete(index, records))
+        manager = f"coding-sessions-{owner_digest('alice')}"
+        self.temporal.query_results[manager] = [
+            SessionRecord(session_id=sid, title="kept", model="anthropic:claude-sonnet-5-5", created_at="2026-10-01T00:00:00+00:00")
+        ]
+        r = self.client.get(f"/api/agent/sessions/{sid}", headers=A)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["label"], "kept")
+
+    # N5 -----------------------------------------------------------------------------
+
+    def test_n5_concurrent_create_waits_for_the_seeder(self) -> None:
+        wid = self.derived_id("race")
+        marker = f"{self.prefix}:seeded:{wid}"
+        self.run_async(self.redis.set(marker, agent_routes.SEEDING))
+        done = json.dumps({"fixture": "refund_service", "files": 13, "commit": "c0ffee"})
+
+        async def winner_finishes() -> None:
+            await asyncio.sleep(0.3)
+            await self.redis.set(marker, done)
+
+        self.client.portal.start_task_soon(winner_finishes)  # type: ignore[union-attr]
+        with mock.patch.object(agent_routes, "SEED_POLL_SECONDS", 0.05):
+            r = self.harness_create("race", demo="refund_service")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.seeds, [])  # the loser never seeds
+        self.assertEqual(r.json()["seed"]["commit"], "c0ffee")
+
+    def test_n5_concurrent_create_gives_up_with_409(self) -> None:
+        wid = self.derived_id("stuck")
+        self.run_async(self.redis.set(f"{self.prefix}:seeded:{wid}", agent_routes.SEEDING))
+        with mock.patch.object(agent_routes, "SEED_WAIT_SECONDS", 0.2), mock.patch.object(agent_routes, "SEED_POLL_SECONDS", 0.05):
+            r = self.harness_create("stuck", demo="refund_service")
+        self.assertEqual((r.status_code, r.json()["error"]), (409, "creating"))
+        self.assertEqual(self.seeds, [])
+        self.assertNotIn(wid, [s["id"] for s in self.temporal.starts])
+
+    def test_n5_failed_seed_releases_the_claim(self) -> None:
+        self.seed_error = RuntimeError("sandbox down")
+        with self.assertLogs(agent_routes.log, "ERROR"):
+            self.harness_create("again", demo="refund_service")
+        self.seed_error = None
+        r = self.harness_create("again", demo="refund_service")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(len(self.seeds), 2)
+
+    def derived_id(self, requested: str) -> str:
+        import hashlib
+
+        digest = hashlib.sha256(f"{owner_digest('alice')}:{requested}".encode()).hexdigest()[:16]
+        return f"coding-agent-{digest}"
+
+    # N6 -----------------------------------------------------------------------------
+
+    def test_n6_subagent_approval_update_id_is_stable(self) -> None:
+        root = self.create()["workflow_id"]
+        child = f"{root}-explorer-1"
+        self.temporal.workflows[child] = FakeWorkflow("ExplorerAgent", parent_id=root)
+        body = {"session_id": child, "tool_id": "t9", "approved": True}
+        self.client.post("/api/agent/approve", json=body, headers=A)
+        self.client.post("/api/agent/approve", json=body, headers=A)
+        self.client.post("/api/agent/approve", json={**body, "request_id": "r1"}, headers=A)
+        self.assertEqual(self.temporal.update_ids, ["approve:t9", "approve:t9", "r1"])
+
+    # m6 -----------------------------------------------------------------------------
+
+    def test_m6_chunked_upload_is_bounded(self) -> None:
+        sid = self.create()["workflow_id"]
+        boundary = "b0undary"
+        body = (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n"
+            f"Content-Type: text/plain\r\n\r\n".encode()
+            + b"x" * 5000
+            + f"\r\n--{boundary}--\r\n".encode()
+        )
+
+        def chunks() -> Any:
+            for i in range(0, len(body), 512):
+                yield body[i : i + 512]
+
+        with mock.patch.object(agent_routes, "MAX_UPLOAD_BYTES", 100), mock.patch.object(
+            agent_routes, "UPLOAD_ENVELOPE_BYTES", 400
+        ):
+            r = self.client.post(
+                f"/api/agent/sessions/{sid}/attachments",
+                content=chunks(),
+                headers={**A, "Content-Type": f"multipart/form-data; boundary={boundary}"},
+            )
+        self.assertEqual((r.status_code, r.json()["error"]), (413, "too_large"))
+
+    # N9 -----------------------------------------------------------------------------
+
+    def test_n9_origin_null_never_falls_back_to_referer(self) -> None:
+        sid = self.create()["workflow_id"]
+        r = self.client.post(
+            f"/api/agent/sessions/{sid}/close",
+            headers={**A, "Origin": "null", "Referer": "http://testserver/app"},
+        )
+        self.assertEqual(r.status_code, 403)
 
 
 if __name__ == "__main__":
