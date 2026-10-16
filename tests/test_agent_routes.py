@@ -620,6 +620,80 @@ class DirectorySyncTests(AgentRoutesTestBase):
         self.assertEqual(starts[2]["start_signal_args"], [sid])
         self.assertEqual(self.temporal.updates, [])
 
+    def send(self, sid: str, kind: str, payload: Any, headers: dict[str, str] = A) -> Any:
+        return self.client.post(
+            "/api/agent/messages", json={"session_id": sid, "message": {"type": kind, "payload": payload}}, headers=headers
+        )
+
+    def listed(self, sid: str) -> dict[str, Any]:
+        entry = next(s for s in self.client.get("/api/agent/sessions", headers=A).json() if s["workflow_id"] == sid)
+        detail = self.client.get(f"/api/agent/sessions/{sid}", headers=A).json()
+        self.assertEqual((detail["model"], detail["posture"]), (entry["model"], entry["posture"]))
+        return entry
+
+    def manager_signals(self) -> list[tuple[str, Any]]:
+        manager = f"coding-sessions-{owner_digest('alice')}"
+        return [(s["start_signal"], s["start_signal_args"][0]) for s in self.temporal.starts if s["id"] == manager]
+
+    def test_model_and_posture_changes_update_the_list(self) -> None:
+        from simple_chat_agent.agent.sessions import SessionUpdate
+
+        sid = self.create()["workflow_id"]
+        self.assertEqual(self.manager_signals()[0][1].posture, "trust_safe")
+        r = self.send(sid, "set_model", {"model": {"provider": "openai", "model": "gpt-5.5", "effort": "high"}})
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.send(sid, "set_posture", {"posture": "auto"})
+        self.assertEqual(r.status_code, 200, r.text)
+        entry = self.listed(sid)
+        self.assertEqual(entry["model"], {"provider": "openai", "model": "gpt-5.5", "effort": "high"})
+        self.assertEqual(entry["posture"], "auto")
+        # Both changes reached Temporal first (enqueue_message), then CodingSessions by Signal.
+        sent = [(n, a.type) for _w, n, a in self.temporal.signals if n == "enqueue_message"]
+        self.assertEqual(sent, [("enqueue_message", "set_model"), ("enqueue_message", "set_posture")])
+        updates = [a for n, a in self.manager_signals() if n == "update_session_signal"]
+        self.assertEqual(
+            updates,
+            [
+                SessionUpdate(session_id=sid, model="openai:gpt-5.5", posture=None),
+                SessionUpdate(session_id=sid, model=None, posture="auto"),
+            ],
+        )
+
+    def test_refused_or_malformed_changes_leave_the_list_alone(self) -> None:
+        sid = self.create()["workflow_id"]
+        before = self.listed(sid)
+        signals = len(self.temporal.signals)
+        r = self.send(sid, "set_model", {"model": {"provider": "openai", "model": "gpt-nope"}})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"], "model_not_allowed")
+        r = self.send(sid, "set_posture", {"posture": "never_ask"})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(len(self.temporal.signals), signals)  # nothing reached Temporal
+        # Malformed payloads go to the workflow (it validates them) but never touch the list.
+        self.assertEqual(self.send(sid, "set_model", {"model": "not-an-object"}).status_code, 200)
+        self.assertEqual(self.send(sid, "set_posture", {}).status_code, 200)
+        self.assertEqual(self.listed(sid), before)
+        self.assertNotIn("update_session_signal", [n for n, _ in self.manager_signals()])
+        # Another user's session: 404, and alice's entry is unchanged.
+        self.assertEqual(self.send(sid, "set_posture", {"posture": "auto"}, headers=B).status_code, 404)
+        self.assertEqual(self.listed(sid), before)
+
+    def test_a_removed_session_is_not_recreated_by_a_change(self) -> None:
+        sid = self.create()["workflow_id"]
+        self.run_async(self.directory.remove("alice", sid))
+        self.assertIsNone(self.run_async(self.directory.update_settings("alice", sid, posture="auto")))
+        self.assertNotIn("update_session_signal", [n for n, _ in self.manager_signals()])
+
+    def test_rebuild_keeps_the_current_posture(self) -> None:
+        from simple_chat_agent.agent.sessions import SessionRecord
+
+        manager = f"coding-sessions-{owner_digest('alice')}"
+        self.temporal.query_results[manager] = [
+            SessionRecord(session_id="coding-agent-a", model="openai:gpt-5.5", posture="auto", created_at="2026-10-01T00:00:00+00:00"),
+        ]
+        entry = self.client.get("/api/agent/sessions", headers=A).json()[0]
+        self.assertEqual((entry["model"], entry["posture"]), ({"provider": "openai", "model": "gpt-5.5"}, "auto"))
+
     def test_temporal_failure_keeps_the_redis_list(self) -> None:
         async def broken(*args: Any, **kwargs: Any) -> Any:
             if kwargs.get("start_signal"):
@@ -685,6 +759,43 @@ class DirectoryNoWorkerTests(unittest.IsolatedAsyncioTestCase):
                 if keys:
                     await r.delete(*keys)
                 await r.aclose()
+
+
+@unittest.skipUnless(REDIS_UP and _temporal_up(), "needs Redis and the Temporal dev server")
+class CodingSessionsUpdateTests(unittest.IsolatedAsyncioTestCase):
+    """The real CodingSessions workflow applies update_session_signal; old records (no
+    posture) still load."""
+
+    async def test_update_session_signal(self) -> None:
+        from temporalio.worker import Worker
+
+        from simple_chat_agent.agent.sessions import (
+            CodingSessions,
+            SessionRecord,
+            SessionsState,
+            SessionUpdate,
+        )
+
+        with mock.patch.dict(os.environ, {"TEMPORAL_ADDRESS": TEMPORAL_ADDRESS}):
+            client = await agent_routes.connect_agent_client()
+        queue = f"sessions-update-{uuid.uuid4().hex[:6]}"
+        wid = f"coding-sessions-test-{uuid.uuid4().hex[:8]}"
+        old = {"session_id": "s-old", "title": "old", "model": "anthropic:claude-haiku-5-5", "created_at": ""}
+        state = SessionsState(owner_digest="d", sessions=[SessionRecord.model_validate(old)])
+        async with Worker(client, task_queue=queue, workflows=[CodingSessions]):
+            handle = await client.start_workflow(CodingSessions.run, state, id=wid, task_queue=queue)
+            try:
+                await handle.signal("update_session_signal", SessionUpdate(session_id="s-old", posture="auto"))
+                await handle.signal(
+                    "update_session_signal", SessionUpdate(session_id="s-old", model="openai:gpt-5.5")
+                )
+                await handle.signal("update_session_signal", SessionUpdate(session_id="missing", posture="auto"))
+                found = await handle.query("list_sessions", result_type=list[SessionRecord])
+                self.assertEqual(len(found), 1)
+                self.assertEqual((found[0].model, found[0].posture, found[0].title), ("openai:gpt-5.5", "auto", "old"))
+            finally:
+                with contextlib.suppress(Exception):
+                    await handle.terminate("test cleanup")
 
 
 class ConfigTests(AgentRoutesTestBase):
@@ -1570,6 +1681,13 @@ class ProductViewConfigTests(AgentRoutesTestBase):
             self.assertEqual(self.set_posture(sid, "never_ask").status_code, 200)
         # Ownership is checked first: a foreign session is a 404, not a posture error.
         self.assertEqual(self.set_posture(sid, "never_ask", headers=B).status_code, 404)
+
+    def test_session_retention(self) -> None:
+        c = self.config()
+        self.assertEqual((c["session_ttl_days"], c["session_ttl_seconds"]), (15, 15 * 24 * 3600))
+        c = self.config(AGENT_SESSION_TTL_SECONDS=str(7 * 24 * 3600))
+        self.assertEqual(c["session_ttl_days"], 7)
+        self.assertEqual(self.config(AGENT_SESSION_TTL_SECONDS="129600")["session_ttl_days"], 1.5)
 
     def test_requires_auth(self) -> None:
         r = self.client.get("/api/agent/config")

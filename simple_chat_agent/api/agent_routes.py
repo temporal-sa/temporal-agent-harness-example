@@ -696,6 +696,29 @@ class SessionDirectory:
         await self._send(user_id, "rename_session_signal", {"session_id": session_id, "title": title})
         return record
 
+    async def update_settings(
+        self, user_id: str, session_id: str, *, model: ModelChoice | None = None, posture: str | None = None
+    ) -> dict[str, Any] | None:
+        """The session's current model or posture, after the API accepted a change: Redis at
+        once, then ``update_session_signal`` (signal-with-start, so workers can be down)."""
+        fields: dict[str, Any] = {}
+        if model is not None:
+            fields["model"] = model.registry_key
+            fields["model_choice"] = model.model_dump(mode="json", exclude_none=True)
+        if posture is not None:
+            fields["posture"] = posture
+        if not fields:
+            return None
+        record = await self._update_record(user_id, session_id, **fields)
+        if record is None:
+            return None
+        await self._send(
+            user_id,
+            "update_session_signal",
+            {"session_id": session_id, "model": fields.get("model"), "posture": posture},
+        )
+        return record
+
     async def mark_closed(self, user_id: str, session_id: str) -> None:
         await self._update_record(user_id, session_id, closed=True)
 
@@ -757,6 +780,7 @@ class SessionDirectory:
                 "created_at": created,
                 "model": rec.model,
                 "model_choice": {"provider": provider, "model": model} if model else {},
+                "posture": getattr(rec, "posture", "") or None,
                 "rebuilt": True,
             }
             pipe.zadd(index, {rec.session_id: created}, nx=True)
@@ -779,6 +803,7 @@ class SessionDirectory:
             RenameRequest,
             SessionRecord,
             SessionsState,
+            SessionUpdate,
             sessions_workflow_id,
         )
 
@@ -787,10 +812,13 @@ class SessionDirectory:
                 session_id=arg["session_id"],
                 title=arg.get("title") or "New session",
                 model=arg.get("model", ""),
+                posture=arg.get("posture") or "",
                 created_at=datetime.fromtimestamp(float(arg["created_at"]), timezone.utc).isoformat(),
             )
         elif signal == "rename_session_signal":
             payload = RenameRequest(**arg)
+        elif signal == "update_session_signal":
+            payload = SessionUpdate(**arg)
         else:
             payload = arg
         digest = owner_digest(user_id)
@@ -1006,6 +1034,10 @@ def create_agent_router(
         body["posture_options"] = posture_options(environment, auto_mode)
         body["auto_mode"] = auto_mode
         body["links"] = view_links()
+        # How long an idle session and its list entry are kept (the store's own TTL).
+        ttl = session_ttl_seconds()
+        body["session_ttl_seconds"] = ttl
+        body["session_ttl_days"] = ttl // 86400 if ttl % 86400 == 0 else round(ttl / 86400, 1)
         return JSONResponse(body, headers=NO_STORE)
 
     # -- sessions ------------------------------------------------------------------------
@@ -1330,15 +1362,25 @@ def create_agent_router(
         if root != body.session_id:
             # Subagents have no front door; their parent drives them.
             raise HarnessError(409, "not_supported", "Messages go to the session, not to a subagent.")
-        if body.message.get("type") == "set_posture":
-            # Same rule as the menu and POST sessions. A malformed payload is left to the
-            # workflow's own validation of SetPosture.
-            payload = body.message.get("payload")
-            posture = payload.get("posture") if isinstance(payload, dict) else None
-            if isinstance(posture, str):
-                refusal = posture_refusal(posture, agent_environment(), auto_mode_status(configured_judge_backend()))
-                if refusal is not None:
-                    raise HarnessError(422, "posture_not_allowed", refusal)
+        # set_posture / set_model get the same checks as POST sessions, and once accepted
+        # they update the session list. A malformed payload is left to the workflow's own
+        # validation and doesn't touch the list.
+        kind = body.message.get("type")
+        payload = body.message.get("payload")
+        new_posture: str | None = None
+        new_model: ModelChoice | None = None
+        if kind == "set_posture" and isinstance(payload, dict) and isinstance(payload.get("posture"), str):
+            refusal = posture_refusal(payload["posture"], agent_environment(), auto_mode_status(configured_judge_backend()))
+            if refusal is not None:
+                raise HarnessError(422, "posture_not_allowed", refusal)
+            new_posture = payload["posture"]
+        elif kind == "set_model" and isinstance(payload, dict):
+            try:
+                new_model = ModelChoice.model_validate(payload.get("model"))
+            except ValidationError:
+                new_model = None
+            if new_model is not None and not agent_models.is_allowed(new_model):
+                raise HarnessError(422, "model_not_allowed", f"{new_model.registry_key} is not available.")
         message_id = body.request_id or str(uuid.uuid4())
         handle = (await temporal()).get_workflow_handle(body.session_id)
         try:
@@ -1355,6 +1397,11 @@ def create_agent_router(
                 raise not_found("The session has ended.") from None
             raise
         await store.note_sent(body.session_id, message_id)
+        if new_posture is not None or new_model is not None:
+            try:
+                await sessions.update_settings(uid, body.session_id, model=new_model, posture=new_posture)
+            except Exception as exc:  # noqa: BLE001 - the change is in Temporal; the list catches up next time
+                log.warning("session list not updated for %s: %s", body.session_id, exc)
         await _wake(await bridge(), body.session_id)
         meta = await store.meta(body.session_id)
         # The real turn number and disposition arrive on the stream with message_accepted;

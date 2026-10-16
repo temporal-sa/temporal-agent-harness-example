@@ -32,6 +32,7 @@ class SessionRecord(BaseModel):
     session_id: str
     title: str = "New session"
     model: str = ""
+    posture: str = ""
     created_at: str = ""
     archived: bool = False
 
@@ -47,6 +48,15 @@ class SessionsState(BaseModel):
 class RenameRequest(BaseModel):
     session_id: str
     title: str
+
+
+class SessionUpdate(BaseModel):
+    """The session's current model or posture, after the API accepted a change. ``None``
+    leaves a field as it is."""
+
+    session_id: str
+    model: str | None = None
+    posture: str | None = None
 
 
 @workflow.defn(name=SESSIONS_WORKFLOW_TYPE)
@@ -93,6 +103,16 @@ class CodingSessions:
         return self._state.sessions
 
     @workflow.update
+    async def update_session(self, request: SessionUpdate) -> list[SessionRecord]:
+        for s in self._state.sessions:
+            if s.session_id == request.session_id:
+                if request.model:
+                    s.model = request.model[:200]
+                if request.posture:
+                    s.posture = request.posture[:50]
+        return self._state.sessions
+
+    @workflow.update
     async def remove_session(self, session_id: str) -> list[SessionRecord]:
         self._state.sessions = [s for s in self._state.sessions if s.session_id != session_id]
         return self._state.sessions
@@ -113,6 +133,10 @@ class CodingSessions:
     @workflow.signal(name="rename_session_signal")
     async def rename_session_signal(self, request: RenameRequest) -> None:
         await self.rename_session(request)
+
+    @workflow.signal(name="update_session_signal")
+    async def update_session_signal(self, request: SessionUpdate) -> None:
+        await self.update_session(request)
 
     @workflow.signal(name="remove_session_signal")
     async def remove_session_signal(self, session_id: str) -> None:
