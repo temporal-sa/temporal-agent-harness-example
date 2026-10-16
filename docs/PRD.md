@@ -13,6 +13,7 @@
 
 | Date | Version | Change | By |
 |---|---|---|---|
+| 2026-10-16 | 1.2 | **Owner approved P2 (API and streaming)** by `/yes` in chat. | Owner |
 | 2026-10-16 | 1.2 | **P1 complete** (`docs/phases/P1-report.md`). All validation steps pass, including the scripted fix-the-bug task 15/15 across Claude, GPT and Gemini. Deep review (1 blocker, 4 majors, 17 minors) → fix pass → verification → follow-up; git tools now fail closed on non-allowlisted repo config. Claude thinking display set to summarized. Deferred items listed in the report. Awaiting owner go for P2. | PM |
 | 2026-10-16 | 1.1 | **Owner approved P1 (agent core)** by `/yes` in chat. | Owner |
 | 2026-10-16 | 1.1 | **P0 spike complete; go/no-go memo recommends GO for P1** (`docs/decisions/P0-go-no-go.md`). All 9 validation steps passed and no kill criterion fired. Design inputs for P1: per-turn byte growth (enforce A17/A20 plus offload, re-measure with a 30-tool Sonnet turn), and bridge-acknowledged truncation at continue-as-new (P2). Seven ecosystem bugs to file upstream. Awaiting owner go for P1. | PM |

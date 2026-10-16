@@ -769,6 +769,65 @@ def _raise_http_error(response: httpx.Response, accepted: bool) -> None:
     )
 
 
+class ExecutionLogNotFound(LookupError):
+    """The executor holds no output for this execution id in this workspace (unknown id,
+    another workspace's id, or expired by the state TTL)."""
+
+
+class ExecutorRequestError(RuntimeError):
+    """The executor was unreachable or answered with an unexpected error."""
+
+
+async def read_execution_log(
+    workspace_id: str,
+    execution_id: str,
+    *,
+    stream: Literal["stdout", "stderr", "both"] = "both",
+    offset: int = 0,
+    limit: int = 262_144,
+) -> dict[str, Any]:
+    """Read a command's stored output (``CommandResult.log_ref``) from the executor (S7).
+
+    A plain async function for the API process, not a tool: call it only after checking
+    that the caller owns ``workspace_id``. The executor scopes ids to the workspace.
+
+    Returns the executor's page: ``text``, ``offset``, ``next_offset`` (None when
+    everything is read and the job finished), ``total_chars``, ``finished``, ``exit_code``,
+    ``timed_out``, ``error_type``, ``truncated_at_capture`` and ``interleaved``.
+
+    Raises ExecutionLogNotFound (show "Output no longer retained") or
+    ExecutorRequestError.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                f"{_executor_url()}/execute/log",
+                json={
+                    "workspace_id": workspace_id,
+                    "execution_id": execution_id,
+                    "stream": stream,
+                    "offset": max(0, int(offset)),
+                    "limit": max(1, min(int(limit), 262_144)),
+                },
+                headers=_executor_headers(),
+            )
+    except httpx.HTTPError as exc:
+        raise ExecutorRequestError(f"The sandbox isn't answering: {exc}") from exc
+    if response.status_code == 404:
+        raise ExecutionLogNotFound(execution_id)
+    if response.status_code == 422:
+        # A malformed id cannot exist in any workspace.
+        raise ExecutionLogNotFound(execution_id)
+    if response.status_code >= 400:
+        raise ExecutorRequestError(
+            f"The sandbox refused the log request (HTTP {response.status_code})."
+        )
+    try:
+        return dict(response.json())
+    except ValueError as exc:
+        raise ExecutorRequestError("The sandbox returned an unreadable log page.") from exc
+
+
 async def _cancel_execution(workspace_id: str, execution_id: str) -> None:
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:

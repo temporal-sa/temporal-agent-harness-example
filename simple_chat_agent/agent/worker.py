@@ -28,6 +28,7 @@ from temporal_agent_harness.plugin import AgentHarnessPlugin
 from simple_chat_agent.agent.approvals import APPROVAL_ACTIVITIES, typesafe_plugin_if_configured
 from simple_chat_agent.agent.harness_ext import payload_storage
 from simple_chat_agent.agent.runtime import CODING_AGENT
+from simple_chat_agent.agent.sessions import CodingSessions
 from simple_chat_agent.agent.subagents import SUBAGENT_WORKFLOWS
 from simple_chat_agent.agent.tools.artifacts import ARTIFACT_TOOLS
 from simple_chat_agent.agent.tools.research import RESEARCH_TOOLS
@@ -107,7 +108,7 @@ def build_worker(client: Client, queue: str) -> Worker:
     return Worker(
         client,
         task_queue=queue,
-        workflows=[CodingAgent, *SUBAGENT_WORKFLOWS],
+        workflows=[CodingAgent, CodingSessions, *SUBAGENT_WORKFLOWS],
         activities=[*WORKSPACE_ACTIVITIES, *APPROVAL_ACTIVITIES],
         plugins=[AgentPlugin(CODING_AGENT)],
         deployment_config=deployment_config(queue),

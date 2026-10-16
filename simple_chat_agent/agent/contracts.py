@@ -21,6 +21,9 @@ Posture = Literal["ask_everything", "trust_safe", "auto", "never_ask"]
 # the agent admits them into the harness runner when it next runs.
 ENQUEUE_MESSAGE_SIGNAL = "enqueue_message"
 ENQUEUE_APPROVAL_SIGNAL = "enqueue_approval"
+# The Redis bridge reports the highest stream offset it has stored, once per turn end. The
+# agent then trims only what the bridge holds when it continues as new (P2 decision 4).
+STREAM_ACKED_SIGNAL = "stream_acked"
 
 # Bumped whenever CarriedState changes shape. Every field keeps a default so a newer
 # version can read input written by an older one (PINNED + continue-as-new, PRD §6).
@@ -58,6 +61,7 @@ class CarriedState(BaseModel):
     conversation: list[dict[str, Any]] = Field(default_factory=list)
     stream_state: WorkflowStreamState | None = None
     turn_counter: int = 0
+    stream_acked: int = 0
     recent_request_ids: list[str] = Field(default_factory=list)
     model: ModelChoice = Field(default_factory=ModelChoice)
     pending_model: ModelChoice | None = None
@@ -146,6 +150,12 @@ class Ack(BaseModel):
 
     ok: bool = True
     detail: str = ""
+
+
+class StreamAck(BaseModel):
+    """Payload of the stream_acked signal."""
+
+    offset: int
 
 
 class FrontDoorApproval(BaseModel):

@@ -71,6 +71,7 @@ async def running_worker(client: Any, task_queue: str) -> AsyncIterator[Any]:
     from temporalio.worker import Worker
 
     from simple_chat_agent.agent.runtime import CODING_AGENT
+    from simple_chat_agent.agent.sessions import CodingSessions
     from simple_chat_agent.agent.subagents import SUBAGENT_WORKFLOWS
     from simple_chat_agent.agent.workflow import CodingAgent
 
@@ -80,7 +81,7 @@ async def running_worker(client: Any, task_queue: str) -> AsyncIterator[Any]:
     worker = Worker(
         client,
         task_queue=task_queue,
-        workflows=[CodingAgent, *SUBAGENT_WORKFLOWS],
+        workflows=[CodingAgent, CodingSessions, *SUBAGENT_WORKFLOWS],
         activities=[*WORKSPACE_ACTIVITIES, *APPROVAL_ACTIVITIES],
         plugins=[AgentPlugin(CODING_AGENT)],
         max_heartbeat_throttle_interval=timedelta(seconds=1),

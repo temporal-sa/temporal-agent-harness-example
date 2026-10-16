@@ -37,6 +37,7 @@ with workflow.unsafe.imports_passed_through():
         CARRIED_STATE_VERSION,
         ENQUEUE_APPROVAL_SIGNAL,
         ENQUEUE_MESSAGE_SIGNAL,
+        STREAM_ACKED_SIGNAL,
         Ack,
         CarriedState,
         ChatMessage,
@@ -49,6 +50,7 @@ with workflow.unsafe.imports_passed_through():
         SetModel,
         SetPosture,
         SteerMessage,
+        StreamAck,
     )
     from simple_chat_agent.agent.prompts import CODING_AGENT_INSTRUCTIONS
     from simple_chat_agent.agent.runtime import (
@@ -78,8 +80,12 @@ with workflow.unsafe.imports_passed_through():
 IDLE_WAKE = timedelta(hours=1)
 # How many front-door request ids to remember for dedup, across continue-as-new.
 RECENT_REQUEST_IDS = 500
-# Stream events carried across continue-as-new (see _continue_as_new).
-CAN_RETAINED_EVENTS = 500
+# Stream events carried across continue-as-new (see _continue_as_new): a small tail past what
+# the Redis bridge acknowledged, a larger tail when no bridge has acknowledged anything
+# (tests, or Redis unavailable), and a hard cap so the carried log stays bounded.
+CAN_TAIL_PAST_ACK = 50
+CAN_RETAINED_WITHOUT_ACK = 500
+CAN_MAX_RETAINED = 2000
 INTERRUPTED_TOOL_NOTE = (
     "Stopped by the user before this result was used. The call may or may not have completed;\n"
     "check before relying on its effect."
@@ -115,6 +121,7 @@ class CodingAgent:
             if name in carried.observable:
                 ref.set(type(ref.current).model_validate(carried.observable[name]))
         self._steer: list[str] = list(carried.steer_queue)
+        self._stream_acked = carried.stream_acked
         self._stream = WorkflowStream(prior_state=carried.stream_state)
         criteria = approvals.default_criteria(data.environment)
         session_id = data.session_id or workflow.info().workflow_id
@@ -238,11 +245,17 @@ class CodingAgent:
         # the truncation and silently skipping the last turn's closing events. (P2: truncate
         # to the Redis bridge's acknowledged offset instead of a fixed tail.)
         head = harness_ext.stream_head(self._stream)
-        self._stream.truncate(max(harness_ext.stream_base(self._stream), head - CAN_RETAINED_EVENTS))
+        if self._stream_acked > 0:
+            cutoff = min(self._stream_acked, head - CAN_TAIL_PAST_ACK)
+        else:
+            cutoff = head - CAN_RETAINED_WITHOUT_ACK
+        cutoff = max(cutoff, head - CAN_MAX_RETAINED, harness_ext.stream_base(self._stream))
+        self._stream.truncate(min(cutoff, head))
         carried = CarriedState(
             conversation=ModelMessagesTypeAdapter.dump_python(self._history, mode="json"),
             stream_state=self._stream.get_state(),
             turn_counter=harness_ext.turn_counter(self._runner),
+            stream_acked=self._stream_acked,
             recent_request_ids=list(self._seen_requests),
             model=self._model,
             pending_model=self._pending_model,
@@ -275,6 +288,9 @@ class CodingAgent:
             "messages": len(self._history),
             "responses": len(responses),
             "turn_counter": harness_ext.turn_counter(self._runner),
+            "stream_base": harness_ext.stream_base(self._stream),
+            "stream_head": harness_ext.stream_head(self._stream),
+            "stream_acked": self._stream_acked,
             "model": self._model.registry_key,
             "allowed_tools": sorted(self._runner.approval_policy.auto_approve_tools),
             "rejected": self._rejected,
@@ -296,6 +312,12 @@ class CodingAgent:
             self._deferred.append(message)
             return
         self._admit(message)
+
+    @workflow.signal(name=STREAM_ACKED_SIGNAL)
+    async def stream_acked(self, ack: StreamAck) -> None:
+        """The bridge has stored the stream up to ``ack.offset`` (monotonic)."""
+        self._signals_this_run += 1
+        self._stream_acked = max(self._stream_acked, ack.offset)
 
     @workflow.signal(name=ENQUEUE_APPROVAL_SIGNAL)
     async def enqueue_approval(self, approval: FrontDoorApproval) -> None:

@@ -27,6 +27,7 @@ from simple_chat_agent.agent.approvals import APPROVAL_ACTIVITIES
 from simple_chat_agent.agent.tools.artifacts import ARTIFACT_TOOLS
 from simple_chat_agent.agent.tools.research import RESEARCH_TOOLS
 from simple_chat_agent.agent.tools.workspace import TEST_TOOLS, WORKSPACE_ACTIVITIES, WORKSPACE_TOOLS
+from simple_chat_agent.agent.sessions import CodingSessions
 from simple_chat_agent.agent.subagents import SUBAGENT_WORKFLOWS
 from simple_chat_agent.agent.workflow import CodingAgent
 
@@ -46,7 +47,7 @@ async def main() -> None:
     worker = Worker(
         client,
         task_queue=args.task_queue,
-        workflows=[CodingAgent, *SUBAGENT_WORKFLOWS],
+        workflows=[CodingAgent, CodingSessions, *SUBAGENT_WORKFLOWS],
         activities=[*WORKSPACE_ACTIVITIES, *APPROVAL_ACTIVITIES],
         plugins=[AgentPlugin(CODING_AGENT)],
         identity=args.identity,
