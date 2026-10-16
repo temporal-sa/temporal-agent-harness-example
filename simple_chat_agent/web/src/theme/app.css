@@ -370,3 +370,6 @@ button.path:hover { border-color: var(--uv-light); }
   .chips .path { justify-content: center; }
   .output pre { min-height: 0; }
 }
+
+.msg-files { list-style: none; margin: .5em 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: .35em; justify-content: flex-end; }
+.msg-files .path { max-width: 100%; overflow-wrap: anywhere; }

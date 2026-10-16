@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { alwaysApprovedText, pickerState, postureLabel, postureOptions } from "./choices";
-import { withAttachments } from "./Composer";
 import { advance, landed, startRecord } from "../session/sendStates";
 import type { AgentConfig } from "../session";
 
@@ -45,10 +44,3 @@ describe("posture menu", () => {
   });
 });
 
-describe("attachments", () => {
-  it("mentions attached files so the agent can read them", () => {
-    const a = { attachment_id: "att_1", name: "spec.md", mime_type: "text/markdown", size_bytes: 10, content_kind: "text" };
-    expect(withAttachments("Read this", [a])).toBe("Read this\n\nAttached files (read them with read_attachment):\n- spec.md (attachment_id: att_1)");
-    expect(withAttachments("plain", [])).toBe("plain");
-  });
-});

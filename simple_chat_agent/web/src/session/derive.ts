@@ -74,16 +74,6 @@ function* toolParts(agents: Readonly<Record<string, AgentNode>>): Generator<Tool
   }
 }
 
-/** Tool names the user approved with "Always approve" this session. The agent narrows
- *  `remember` to workspace edits, so only resolved approvals that kept it count. */
-export function alwaysApproved(agents: Readonly<Record<string, AgentNode>>): string[] {
-  const names = new Set<string>();
-  for (const p of toolParts(agents)) {
-    if (p.approval?.approved && p.approval.remember) names.add(p.toolName);
-  }
-  return [...names].sort();
-}
-
 /** Every tool part in the tree by tool id. */
 export function toolIndex(agents: Readonly<Record<string, AgentNode>>): Map<string, ToolPart> {
   const index = new Map<string, ToolPart>();
@@ -135,4 +125,39 @@ export function withRiskClass<T extends { part: { toolName: string } }>(
 /** Root messages without the workflow's rejection carriers ("x_rejected:<request_id>"). */
 export function visibleMessages<T extends Pick<Message, "id">>(messages: readonly T[]): readonly T[] {
   return messages.some((m) => m.id.startsWith("x_rejected:")) ? messages.filter((m) => !m.id.startsWith("x_rejected:")) : messages;
+}
+
+/**
+ * Tools the user approved with "Always approve" in the root agent, as of the latest frame.
+ * Folded in stream order from tool_approval_resolved (approved and remembered; the agent
+ * narrows `remember` before it resolves, so the frame says what actually stuck). An admitted
+ * forget_always_allowed message clears the list.
+ */
+export function alwaysApprovedFrom(frames: readonly { event: string; data: unknown }[], rootAgentId: string | null): string[] {
+  const names = new Set<string>();
+  for (const f of frames) {
+    const d = isObj(f.data) ? f.data : null;
+    if (!d || (rootAgentId !== null && d.agent_id !== rootAgentId)) continue;
+    if (f.event === "tool_approval_resolved" && d.approved === true && d.remember === true && typeof d.tool_name === "string") {
+      names.add(d.tool_name);
+    } else if (f.event === "message_accepted" && d.handler === FORGET_HANDLER) {
+      names.clear();
+    }
+  }
+  return [...names].sort();
+}
+
+export const FORGET_HANDLER = "forget_always_allowed";
+
+/** The chat payload's attachments (contracts.ChatAttachment) from upload results; at most 20. */
+export const MAX_ATTACHMENTS = 20;
+export function toChatAttachments(
+  uploads: readonly { attachment_id: string; name?: string | null; size_bytes?: number | null; mime_type?: string | null }[],
+): { attachment_id: string; name?: string; size?: number | null; content_type?: string | null }[] {
+  return uploads.slice(0, MAX_ATTACHMENTS).map((u) => ({
+    attachment_id: u.attachment_id,
+    ...(u.name ? { name: u.name } : {}),
+    ...(u.size_bytes !== undefined ? { size: u.size_bytes } : {}),
+    ...(u.mime_type !== undefined ? { content_type: u.mime_type } : {}),
+  }));
 }

@@ -155,7 +155,7 @@ export type SessionStatus =
 
 /** What a local action was. Messages and approvals are Signals that land in Temporal before
  *  any worker runs them (PRD S8). */
-export type SendKind = "message" | "steer" | "interrupt" | "set_model" | "set_posture" | "approval";
+export type SendKind = "message" | "steer" | "interrupt" | "set_model" | "set_posture" | "approval" | "forget_always_allowed";
 
 /**
  * - `sending`: clicked; the request hasn't returned.
@@ -413,7 +413,8 @@ export interface CodingSession {
   /** True while a set_model sent during the open turn waits for the next turn. */
   modelAppliesNextTurn: boolean;
   posture: Posture | null;
-  /** Tool names approved with "Always approve" this session (from resolved approvals). */
+  /** Tool names approved with "Always approve" this session (root agent), emptied once a
+   *  forget_always_allowed is admitted. */
   alwaysApproved: readonly string[];
 
   /** When one model call ran (from the stream's timestamps), by its agent, message and its
@@ -424,7 +425,10 @@ export interface CodingSession {
   /** Upload a file to the session; mention it in the next message so the agent reads it. */
   attach(file: File): Promise<Attachment>;
 
-  send(text: string): Promise<SendRecord>;
+  /** Send a chat message; `attachments` are upload results (at most 20 are sent). */
+  send(text: string, attachments?: readonly Attachment[]): Promise<SendRecord>;
+  /** Forget this session's "Always approve" rules. Calls already waiting stay waiting. */
+  forgetAlwaysAllowed(): Promise<SendRecord>;
   steer(text: string): Promise<SendRecord>;
   interrupt(reason?: string): Promise<SendRecord>;
   setModel(choice: ModelChoice): Promise<SendRecord>;

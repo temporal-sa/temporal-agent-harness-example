@@ -1,11 +1,13 @@
 // The composer (PRD U4, U7; owner decision C). Send, or Stop (Esc) while a turn runs; text
 // typed mid-turn offers "Steer now" or "Queue". The model picker applies from the next turn.
-// The posture menu decides which tool calls ask at all. "+ File" uploads to the session and
-// mentions the file in the next message. Every control changes state on the click itself, so
+// The posture menu decides which tool calls ask at all, and its Clear forgets "Always
+// approve" rules. "+ File" uploads to the session; the files go with the next message (up
+// to 20). Every control changes state on the click itself, so
 // it acknowledges well within 100 ms; the send states follow from the facade.
 
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { AgentConfig, Attachment, CodingSession, ModelChoice, Posture, SendRecord } from "../session";
+import { MAX_ATTACHMENTS } from "../session/derive";
 import { Menu } from "./Menu";
 import {
   alwaysApprovedText,
@@ -24,13 +26,6 @@ interface Upload {
   state: "uploading" | "ready" | "failed";
   attachment?: Attachment;
   error?: string;
-}
-
-/** The lines added to a message so the agent knows what was attached and how to read it. */
-export function withAttachments(text: string, attachments: readonly Attachment[]): string {
-  if (attachments.length === 0) return text;
-  const lines = attachments.map((a) => `- ${a.name} (attachment_id: ${a.attachment_id})`);
-  return `${text}\n\nAttached files (read them with read_attachment):\n${lines.join("\n")}`;
 }
 
 function ModelPicker({ session, config }: { session: CodingSession; config: AgentConfig | null }) {
@@ -131,6 +126,16 @@ function PostureMenu({ session, config }: { session: CodingSession; config: Agen
   const always = alwaysApprovedText(session.alwaysApproved, config);
   const failed = record?.phase === "failed";
 
+  // Clear: until the agent admits it, the list stays and the link says "Clearing…".
+  const [clearId, setClearId] = useState<string | null>(null);
+  const clearRecord = clearId ? session.sends.find((r) => r.id === clearId) : undefined;
+  const clearing = clearId !== null && (!clearRecord || clearRecord.phase === "sending" || clearRecord.phase === "in_temporal");
+  async function clear() {
+    setClearId("pending");
+    const r = await session.forgetAlwaysAllowed();
+    setClearId(r.id);
+  }
+
   async function choose(p: Posture) {
     setPending({ posture: p, recordId: null });
     const r = await session.setPosture(p);
@@ -182,8 +187,17 @@ function PostureMenu({ session, config }: { session: CodingSession; config: Agen
             {always && (
               <>
                 {" · "}
-                <button type="button" className="link-btn" aria-disabled="true" title="Clearing isn't available yet. Start a new session to reset it.">
-                  Clear
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="link-btn"
+                  disabled={clearing}
+                  onClick={() => {
+                    close();
+                    void clear();
+                  }}
+                >
+                  {clearing ? "Clearing…" : "Clear"}
                 </button>
               </>
             )}
@@ -229,12 +243,15 @@ export function Composer({ session, config }: { session: CodingSession; config: 
     if (!text || uploading) return null;
     setDraft("");
     setUploads([]);
-    return withAttachments(text, ready);
+    return text;
   }
 
+  // Attachments go with a chat message (sent now or queued); steering carries text only, so
+  // "Steer now" is offered without files.
   const send = () => {
+    const files = ready;
     const text = take();
-    if (text) void session.send(text);
+    if (text) void session.send(text, files);
   };
   const steer = () => {
     const text = take();
@@ -250,7 +267,8 @@ export function Composer({ session, config }: { session: CodingSession; config: 
   }
 
   async function onFiles(files: FileList | null) {
-    for (const file of Array.from(files ?? [])) {
+    const room = Math.max(0, MAX_ATTACHMENTS - uploads.length);
+    for (const file of Array.from(files ?? []).slice(0, room)) {
       const key = `${file.name}:${Date.now()}:${Math.random()}`;
       setUploads((u) => [...u, { key, name: file.name, state: "uploading" }]);
       try {
@@ -293,7 +311,7 @@ export function Composer({ session, config }: { session: CodingSession; config: 
         <div className="bar">
           <ModelPicker session={session} config={config} />
           <PostureMenu session={session} config={config} />
-          <button type="button" className="ctl" onClick={() => fileInput.current?.click()}>
+          <button type="button" className="ctl" onClick={() => fileInput.current?.click()} disabled={uploads.length >= MAX_ATTACHMENTS}>
             + File
           </button>
           <input ref={fileInput} type="file" multiple hidden onChange={(e) => void onFiles(e.target.files)} />
@@ -303,7 +321,13 @@ export function Composer({ session, config }: { session: CodingSession; config: 
               <button type="button" className="btn secondary small" onClick={send} disabled={uploading}>
                 Queue
               </button>
-              <button type="button" className="btn primary small" onClick={steer} disabled={uploading}>
+              <button
+                type="button"
+                className="btn primary small"
+                onClick={steer}
+                disabled={uploading || ready.length > 0}
+                title={ready.length > 0 ? "Steering sends text only. Queue the message to send the files with it." : undefined}
+              >
                 Steer now
               </button>
             </span>

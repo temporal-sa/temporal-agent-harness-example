@@ -16,7 +16,9 @@ import { HarnessProvider, HttpTransport, SessionStore, useAgentSession } from "@
 
 import { AGENT_API_BASE, CLIENT_HEADERS, getStatus, readLog, uploadAttachment } from "./api";
 import {
-  alwaysApproved as deriveAlwaysApproved,
+  alwaysApprovedFrom,
+  FORGET_HANDLER,
+  toChatAttachments,
   currentModel,
   currentPosture,
   modelAppliesNextTurn as deriveModelAppliesNextTurn,
@@ -32,6 +34,7 @@ import { TimingFolder, timingKey } from "./timings";
 import { ProgressFolder } from "./progress";
 import type {
   ApproveOptions,
+  Attachment,
   ChangesState,
   CodingSession,
   ModelChoice,
@@ -226,7 +229,7 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
   const messages = useMemo(() => visibleMessages(h.messages), [h.messages]);
   const model = useMemo(() => currentModel(h.messages, seed.model ?? null), [h.messages, seed.model]);
   const posture = useMemo(() => currentPosture(h.messages, seed.posture ?? null), [h.messages, seed.posture]);
-  const always = useMemo(() => deriveAlwaysApproved(h.agents), [h.agents]);
+  const always = useMemo(() => alwaysApprovedFrom(h.frames, h.rootAgentId), [h.frames, h.rootAgentId]);
 
   const session: CodingSession = {
     sessionId,
@@ -286,7 +289,9 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
     readLog: (logRef, options) => readLog(sessionId, logRef, options),
     attach: (file) => uploadAttachment(sessionId, file),
 
-    send: (text: string) => runMessage("message", "chat", { text }),
+    send: (text: string, attachments?: readonly Attachment[]) =>
+      runMessage("message", "chat", attachments?.length ? { text, attachments: toChatAttachments(attachments) } : { text }),
+    forgetAlwaysAllowed: () => runMessage("forget_always_allowed", FORGET_HANDLER, {}),
     steer: (text: string) => runMessage("steer", "steer", { text }),
     interrupt: (reason?: string) => runMessage("interrupt", "interrupt", reason ? { reason } : {}),
     setModel: (choice: ModelChoice) => runMessage("set_model", "set_model", { model: { ...choice } }),

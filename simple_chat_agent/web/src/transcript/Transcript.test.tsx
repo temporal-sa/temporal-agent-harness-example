@@ -68,4 +68,19 @@ describe("Transcript", () => {
     expect(html).toContain("Discarded: the reply after you pressed Stop (3 words)");
     expect(html).not.toContain("half a thought");
   });
+
+  it("shows attached files as chips on the user's message, not in its text", () => {
+    const html = render([message([], { input: { text: "Read the spec", attachments: [{ attachment_id: "att_1", name: "spec.md" }] } })]);
+    expect(html).toContain("Read the spec");
+    expect(html).toContain('aria-label="Attached files"');
+    expect(html).toContain(">spec.md</li>");
+    expect(html).not.toContain("att_1");
+  });
+
+  it("shows the agent's answer to Clear as a line", () => {
+    const html = render([
+      message([], { id: "f1", handler: "forget_always_allowed", input: {}, output: { ok: true, detail: "These ask again: edit_file, write_file.", forgotten: ["edit_file", "write_file"] } }),
+    ]);
+    expect(html).toContain("These ask again: edit_file, write_file.");
+  });
 });

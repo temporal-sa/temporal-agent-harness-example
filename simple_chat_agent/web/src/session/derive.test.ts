@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { currentModel, currentPosture, sessionStatus, subagentsOf, visibleMessages } from "./derive";
+import { alwaysApprovedFrom, currentModel, currentPosture, sessionStatus, subagentsOf, toChatAttachments, visibleMessages } from "./derive";
 import { HEALTHY } from "./telemetry";
 import type { AgentNode, Message, PendingApproval } from "./types";
 
@@ -49,5 +49,34 @@ describe("rejection carriers", () => {
     expect(visibleMessages(list).map((m) => m.id)).toEqual(["m1"]);
     const clean = [{ id: "m1" }];
     expect(visibleMessages(clean)).toBe(clean);
+  });
+});
+
+describe("always approved", () => {
+  const resolved = (tool_name: string, remember: boolean, agent_id = "root", approved = true) => ({
+    event: "tool_approval_resolved",
+    data: { agent_id, tool_id: `t-${tool_name}`, tool_name, approved, reason: null, remember },
+  });
+  const forget = { event: "message_accepted", data: { agent_id: "root", handler: "forget_always_allowed", message_id: "f1", payload: {} } };
+
+  it("lists remembered approvals of the root agent only", () => {
+    const frames = [resolved("edit_file", true), resolved("run_command", false), resolved("write_file", true, "root-explorer-1"), resolved("read_file", true, "root", false)];
+    expect(alwaysApprovedFrom(frames, "root")).toEqual(["edit_file"]);
+  });
+
+  it("empties once a forget is admitted, and refills from later approvals", () => {
+    expect(alwaysApprovedFrom([resolved("edit_file", true), resolved("write_file", true), forget], "root")).toEqual([]);
+    expect(alwaysApprovedFrom([resolved("edit_file", true), forget, resolved("write_file", true)], "root")).toEqual(["write_file"]);
+  });
+});
+
+describe("chat attachments", () => {
+  it("map upload results to the chat payload, at most 20", () => {
+    expect(toChatAttachments([{ attachment_id: "a1", name: "spec.md", size_bytes: 120, mime_type: "text/markdown" }])).toEqual([
+      { attachment_id: "a1", name: "spec.md", size: 120, content_type: "text/markdown" },
+    ]);
+    expect(toChatAttachments([{ attachment_id: "a2" }])).toEqual([{ attachment_id: "a2" }]);
+    const many = Array.from({ length: 25 }, (_, i) => ({ attachment_id: `a${i}` }));
+    expect(toChatAttachments(many)).toHaveLength(20);
   });
 });

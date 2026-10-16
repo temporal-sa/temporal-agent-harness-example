@@ -35,12 +35,36 @@ function Trail({ record }: { record: SendRecord }) {
   return <SendStateTrail record={record} workerAnswering={session.telemetry.worker.answering} />;
 }
 
+/** The files attached to a chat message (ChatMessage.attachments). */
+export function attachmentsOf(m: Pick<Message, "input">): { id: string; name: string }[] {
+  const input = m.input as unknown;
+  const list = isObj(input) && Array.isArray(input.attachments) ? input.attachments : [];
+  return list
+    .filter((a): a is Record<string, unknown> => isObj(a) && typeof a.attachment_id === "string")
+    .map((a) => ({ id: String(a.attachment_id), name: typeof a.name === "string" && a.name ? a.name : String(a.attachment_id) }));
+}
+
+function AttachmentChips({ message }: { message: Message }) {
+  const files = attachmentsOf(message);
+  if (files.length === 0) return null;
+  return (
+    <ul className="msg-files" aria-label="Attached files">
+      {files.map((f) => (
+        <li key={f.id} className="path">
+          {f.name}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function UserMessage({ message, record }: { message: Message; record: SendRecord | undefined }) {
   const showTrail = record && record.phase !== "done" && record.phase !== "running";
   return (
     <div className="user-turn">
       <div className="msg-user">
         {inputText(message)}
+        <AttachmentChips message={message} />
         {!showTrail && <span className="when">{clockTime(message.acceptedAt)}</span>}
       </div>
       {showTrail && <SendNote record={record} />}
@@ -158,6 +182,16 @@ function ControlLine({ message }: { message: Message }) {
       );
     case "interrupt":
       return <div className="sys-line">You pressed Stop</div>;
+    case "forget_always_allowed": {
+      const out = isObj(message.output) ? message.output : null;
+      const detail = typeof out?.detail === "string" ? out.detail : null;
+      const text = failed
+        ? `Couldn't clear always-approved tools: ${message.error ?? ""}`
+        : message.status === "done"
+          ? detail ?? "Always approve cleared."
+          : "Clearing always-approved tools…";
+      return <div className="sys-line">{text}</div>;
+    }
     default:
       return null;
   }
@@ -198,7 +232,10 @@ function UnsentMessage({ message, session }: { message: Message; session: Coding
   const record = session.sendFor({ messageId: message.id });
   return (
     <div className="user-turn">
-      <div className={`msg-user${message.handler === "steer" ? " steer" : ""}`}>{inputText(message)}</div>
+      <div className={`msg-user${message.handler === "steer" ? " steer" : ""}`}>
+        {inputText(message)}
+        <AttachmentChips message={message} />
+      </div>
       {message.status === "error" ? (
         <div className="notice err" role="alert">
           Not sent: {message.error}
