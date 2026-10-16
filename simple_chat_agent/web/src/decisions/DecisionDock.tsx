@@ -98,14 +98,17 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
   // decline form or an answer then scrolls the list instead of growing the card, which sits on
   // the composer and would push its header (and Approve all) up (owner decision B).
   const [lockH, setLockH] = useState<number | null>(null);
-  const engaged = hover || focusIn;
+  // Not on a phone: there the card starts collapsed and its header is already pinned, and a
+  // tap's compatibility mouse events would lock the collapsed height, leaving the opened list
+  // no room (its rows then fell under the shell's sheet strip).
+  const lockable = (hover || focusIn) && !phone;
   useLayoutEffect(() => {
-    if (!engaged) {
+    if (!lockable) {
       if (lockH !== null) setLockH(null);
       return;
     }
     if (lockH === null && root.current) setLockH(root.current.getBoundingClientRect().height);
-  }, [engaged, lockH]);
+  }, [lockable, lockH]);
   // Wheel over the card scrolls its list, never the transcript behind it.
   useEffect(() => {
     const el = root.current;

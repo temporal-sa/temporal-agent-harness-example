@@ -224,6 +224,30 @@ describe("review follow-ups", () => {
     expect(card.querySelectorAll('[data-group-toggle][aria-expanded="true"]')).toHaveLength(0);
   });
 
+  it("phone: the pointer (a tap's compatibility mouse events) never locks the card's height", () => {
+    phoneWidth(true);
+    render(session(waiting([E1, E2, C1, C2, C3])));
+    const card = host.querySelector<HTMLElement>("section.dc-card")!;
+    act(() => {
+      card.dispatchEvent(new PointerEvent("pointerover", { bubbles: true }));
+      card.dispatchEvent(new PointerEvent("pointerenter"));
+    });
+    const review = [...card.querySelectorAll("button")].find((b) => b.textContent?.includes("Review the 5 calls"))!;
+    act(() => review.click());
+    expect(card.style.height).toBe("");
+  });
+
+  it("desktop: the pointer on the card locks its height, so the header can't move", () => {
+    phoneWidth(false);
+    render(session(waiting([E1, E2, C1, C2, C3])));
+    const card = host.querySelector<HTMLElement>("section.dc-card")!;
+    act(() => {
+      card.dispatchEvent(new PointerEvent("pointerover", { bubbles: true }));
+      card.dispatchEvent(new PointerEvent("pointerenter"));
+    });
+    expect(card.style.height).toMatch(/px$/);
+  });
+
   it("desktop: no Review toggle, the groups show at once", () => {
     phoneWidth(false);
     render(session(waiting([E1, E2, C1, C2, C3])));

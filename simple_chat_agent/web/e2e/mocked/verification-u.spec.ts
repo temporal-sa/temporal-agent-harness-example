@@ -228,7 +228,6 @@ test.describe("phone footer", () => {
     // locked card; its rows lie below the card's box, under the sheet strip, and a tap there
     // lands on "Changes (n)". The shell's footer stacks correctly (tests above). The lock
     // should not apply across the Review toggle (or should re-measure when it opens).
-    test.fail();
     const api = await mockApi();
     await openScripted(page, api, stacked(), { session_id: sessionId("phone-footer-click"), posture: "trust_safe" });
     await expect(page.locator("section.dc-card")).toBeVisible();
