@@ -1,0 +1,5 @@
+# Playwright output: results, traces, the HTML report, and the layout screenshots (3a), which
+# are regenerated on every run for review rather than diffed.
+.results/
+.report/
+__screenshots__/

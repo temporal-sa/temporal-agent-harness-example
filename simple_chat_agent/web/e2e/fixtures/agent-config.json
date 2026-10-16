@@ -1,0 +1,367 @@
+{
+ "environment": "local",
+ "default_model": {
+  "provider": "anthropic",
+  "model": "claude-sonnet-5-5"
+ },
+ "providers": [
+  {
+   "provider": "anthropic",
+   "label": "Anthropic",
+   "default_model": "claude-sonnet-5-5",
+   "models": [
+    {
+     "provider": "anthropic",
+     "id": "claude-sonnet-5-5",
+     "registry_key": "anthropic:claude-sonnet-5-5",
+     "display_name": "Claude Sonnet 5.5",
+     "tier": "mid",
+     "max_input_tokens": 1000000,
+     "max_output_tokens": 128000,
+     "effort_options": [
+      "low",
+      "medium",
+      "high"
+     ],
+     "default_effort": "medium"
+    },
+    {
+     "provider": "anthropic",
+     "id": "claude-haiku-5-5",
+     "registry_key": "anthropic:claude-haiku-5-5",
+     "display_name": "Claude Haiku 5.5",
+     "tier": "fast",
+     "max_input_tokens": 1000000,
+     "max_output_tokens": 128000,
+     "effort_options": [
+      "low",
+      "medium",
+      "high"
+     ],
+     "default_effort": "medium"
+    },
+    {
+     "provider": "anthropic",
+     "id": "claude-opus-5-5",
+     "registry_key": "anthropic:claude-opus-5-5",
+     "display_name": "Claude Opus 5.5",
+     "tier": "top",
+     "max_input_tokens": 1000000,
+     "max_output_tokens": 128000,
+     "effort_options": [
+      "low",
+      "medium",
+      "high"
+     ],
+     "default_effort": "medium"
+    }
+   ]
+  },
+  {
+   "provider": "openai",
+   "label": "OpenAI",
+   "default_model": "gpt-5.5",
+   "models": [
+    {
+     "provider": "openai",
+     "id": "gpt-5.5",
+     "registry_key": "openai:gpt-5.5",
+     "display_name": "GPT-5.5",
+     "tier": "mid",
+     "max_input_tokens": 272000,
+     "max_output_tokens": 128000,
+     "effort_options": [
+      "low",
+      "medium",
+      "high"
+     ],
+     "default_effort": "medium"
+    },
+    {
+     "provider": "openai",
+     "id": "gpt-5.4-mini",
+     "registry_key": "openai:gpt-5.4-mini",
+     "display_name": "GPT-5.4 mini",
+     "tier": "fast",
+     "max_input_tokens": 272000,
+     "max_output_tokens": 128000,
+     "effort_options": [
+      "low",
+      "medium",
+      "high"
+     ],
+     "default_effort": "medium"
+    }
+   ]
+  },
+  {
+   "provider": "google",
+   "label": "Google",
+   "default_model": "gemini-3.5-flash",
+   "models": [
+    {
+     "provider": "google",
+     "id": "gemini-3.5-flash",
+     "registry_key": "google:gemini-3.5-flash",
+     "display_name": "Gemini 3.5 Flash",
+     "tier": "fast",
+     "max_input_tokens": 1048576,
+     "max_output_tokens": 65536,
+     "effort_options": [
+      "low",
+      "medium",
+      "high"
+     ],
+     "default_effort": "medium"
+    },
+    {
+     "provider": "google",
+     "id": "gemini-3.1-pro-preview",
+     "registry_key": "google:gemini-3.1-pro-preview",
+     "display_name": "Gemini 3.1 Pro (preview)",
+     "tier": "top",
+     "max_input_tokens": 1048576,
+     "max_output_tokens": 65536,
+     "effort_options": [
+      "low",
+      "medium",
+      "high"
+     ],
+     "default_effort": "medium"
+    }
+   ]
+  }
+ ],
+ "models": [
+  {
+   "provider": "anthropic",
+   "id": "claude-sonnet-5-5",
+   "registry_key": "anthropic:claude-sonnet-5-5",
+   "display_name": "Claude Sonnet 5.5",
+   "tier": "mid",
+   "max_input_tokens": 1000000,
+   "max_output_tokens": 128000,
+   "effort_options": [
+    "low",
+    "medium",
+    "high"
+   ],
+   "default_effort": "medium"
+  },
+  {
+   "provider": "anthropic",
+   "id": "claude-haiku-5-5",
+   "registry_key": "anthropic:claude-haiku-5-5",
+   "display_name": "Claude Haiku 5.5",
+   "tier": "fast",
+   "max_input_tokens": 1000000,
+   "max_output_tokens": 128000,
+   "effort_options": [
+    "low",
+    "medium",
+    "high"
+   ],
+   "default_effort": "medium"
+  },
+  {
+   "provider": "anthropic",
+   "id": "claude-opus-5-5",
+   "registry_key": "anthropic:claude-opus-5-5",
+   "display_name": "Claude Opus 5.5",
+   "tier": "top",
+   "max_input_tokens": 1000000,
+   "max_output_tokens": 128000,
+   "effort_options": [
+    "low",
+    "medium",
+    "high"
+   ],
+   "default_effort": "medium"
+  },
+  {
+   "provider": "openai",
+   "id": "gpt-5.5",
+   "registry_key": "openai:gpt-5.5",
+   "display_name": "GPT-5.5",
+   "tier": "mid",
+   "max_input_tokens": 272000,
+   "max_output_tokens": 128000,
+   "effort_options": [
+    "low",
+    "medium",
+    "high"
+   ],
+   "default_effort": "medium"
+  },
+  {
+   "provider": "openai",
+   "id": "gpt-5.4-mini",
+   "registry_key": "openai:gpt-5.4-mini",
+   "display_name": "GPT-5.4 mini",
+   "tier": "fast",
+   "max_input_tokens": 272000,
+   "max_output_tokens": 128000,
+   "effort_options": [
+    "low",
+    "medium",
+    "high"
+   ],
+   "default_effort": "medium"
+  },
+  {
+   "provider": "google",
+   "id": "gemini-3.5-flash",
+   "registry_key": "google:gemini-3.5-flash",
+   "display_name": "Gemini 3.5 Flash",
+   "tier": "fast",
+   "max_input_tokens": 1048576,
+   "max_output_tokens": 65536,
+   "effort_options": [
+    "low",
+    "medium",
+    "high"
+   ],
+   "default_effort": "medium"
+  },
+  {
+   "provider": "google",
+   "id": "gemini-3.1-pro-preview",
+   "registry_key": "google:gemini-3.1-pro-preview",
+   "display_name": "Gemini 3.1 Pro (preview)",
+   "tier": "top",
+   "max_input_tokens": 1048576,
+   "max_output_tokens": 65536,
+   "effort_options": [
+    "low",
+    "medium",
+    "high"
+   ],
+   "default_effort": "medium"
+  }
+ ],
+ "effort_options": [
+  "low",
+  "medium",
+  "high"
+ ],
+ "default_effort": "medium",
+ "postures": [
+  {
+   "id": "ask_everything",
+   "label": "Ask for everything",
+   "description": "Every tool call waits for you."
+  },
+  {
+   "id": "trust_safe",
+   "label": "Trust safe tools",
+   "description": "Read-only tools run; everything else waits for you."
+  },
+  {
+   "id": "auto",
+   "label": "Auto mode",
+   "description": "Read-only tools run; a judge decides the rest and asks you when unsure."
+  },
+  {
+   "id": "never_ask",
+   "label": "Never ask",
+   "description": "Every call runs without asking. Local development only."
+  }
+ ],
+ "default_posture": "trust_safe",
+ "research_tools": [
+  "fetch_url"
+ ],
+ "judge": "llm",
+ "demos": [
+  {
+   "id": "refund_service",
+   "label": "Refund service (planted bug)"
+  }
+ ],
+ "model_source": "allowlist",
+ "posture_options": [
+  {
+   "id": "ask_everything",
+   "label": "Ask for everything",
+   "description": "Every tool call waits for you.",
+   "available": true,
+   "reason": null,
+   "default": false
+  },
+  {
+   "id": "trust_safe",
+   "label": "Trust safe tools",
+   "description": "Read-only tools run; everything else waits for you.",
+   "available": true,
+   "reason": null,
+   "default": true
+  },
+  {
+   "id": "auto",
+   "label": "Auto mode",
+   "description": "Read-only tools run; a judge decides the rest and asks you when unsure.",
+   "available": true,
+   "reason": null,
+   "default": false
+  },
+  {
+   "id": "never_ask",
+   "label": "Never ask",
+   "description": "Every call runs without asking. Local development only.",
+   "available": true,
+   "reason": null,
+   "default": false
+  }
+ ],
+ "auto_mode": {
+  "available": true,
+  "judge": "llm",
+  "judge_model": "anthropic:claude-haiku-5-5",
+  "reason": null
+ },
+ "links": {
+  "console": {
+   "enabled": true,
+   "url_template": "/console/?s={session_id}",
+   "reason": null
+  },
+  "temporal_ui": {
+   "enabled": true,
+   "url_template": "http://127.0.0.1:8244/namespaces/default/workflows/{workflow_id}",
+   "reason": null
+  }
+ },
+ "risk_classes": [
+  "read_only",
+  "workspace_edit",
+  "shell",
+  "network",
+  "external_side_effect"
+ ],
+ "tool_risk_classes": {
+  "create_artifact": "external_side_effect",
+  "edit_file": "workspace_edit",
+  "explorer_investigate": "read_only",
+  "fetch_url": "network",
+  "git_commit": "shell",
+  "git_diff": "read_only",
+  "git_status": "read_only",
+  "import_attachment_to_workspace": "workspace_edit",
+  "list_files": "read_only",
+  "read_attachment": "read_only",
+  "read_file": "read_only",
+  "reviewer_review": "read_only",
+  "run_command": "shell",
+  "search_code": "read_only",
+  "search_web": "network",
+  "start_explorer": "read_only",
+  "start_reviewer": "read_only",
+  "stop_explorer": "read_only",
+  "stop_reviewer": "read_only",
+  "write_file": "workspace_edit"
+ },
+ "default_tool_risk_class": "external_side_effect",
+ "remember_allowed_classes": [
+  "workspace_edit"
+ ]
+}
