@@ -508,7 +508,7 @@ _REPO = Path(__file__).resolve().parents[1]
 _OLD_HARNESS_IMPORT = re.compile(r"^\s*(?:from|import)\s+agent_harness\b", re.MULTILINE)
 # Files still on the old harness, owned by others; each entry must be removed once its file
 # is ported (the test fails if an entry no longer imports agent_harness).
-_PENDING_OLD_HARNESS_IMPORTS = {"simple_chat_agent/common/streaming.py"}
+_PENDING_OLD_HARNESS_IMPORTS: set[str] = set()
 
 
 class NoOldHarnessImportTests(unittest.TestCase):
@@ -533,36 +533,6 @@ class NoOldHarnessImportTests(unittest.TestCase):
         self.assertIsNone(_OLD_HARNESS_IMPORT.search("from temporal_agent_harness.harness import agent"))
         self.assertIsNotNone(_OLD_HARNESS_IMPORT.search("    from agent_harness.attachments import X"))
         self.assertIsNotNone(_OLD_HARNESS_IMPORT.search("import agent_harness"))
-
-
-class AttachmentRefCompatTests(unittest.TestCase):
-    """The old API sends common's AttachmentRef over a signal and the old worker decodes it
-    into agent_harness's; the field layout must match until P5 removes the old app."""
-
-    def test_common_attachment_ref_matches_the_old_one(self) -> None:
-        import dataclasses
-
-        try:
-            from agent_harness.attachments import AttachmentRef as OldRef
-        except ImportError:  # pragma: no cover - after P5 deletes agent_harness
-            self.skipTest("agent_harness is gone")
-        from simple_chat_agent.common.attachments import AttachmentRef as NewRef
-
-        def layout(cls: type) -> list[tuple[str, str, Any]]:
-            return [
-                (f.name, str(f.type), f.default if f.default is not dataclasses.MISSING else f.default_factory)
-                for f in dataclasses.fields(cls)
-            ]
-
-        self.assertEqual(layout(NewRef), layout(OldRef))
-
-    def test_old_app_import_paths_still_work(self) -> None:
-        from simple_chat_agent.common.attachments import (  # noqa: F401
-            AttachmentContentKind,
-            AttachmentRef,
-            attachment_dict,
-            attachment_ref_from_artifact,
-        )
 
 
 REFUND_SERVICE_FILES = [

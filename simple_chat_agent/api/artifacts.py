@@ -1,13 +1,52 @@
 from __future__ import annotations
 
 import re
-from typing import Literal
+from collections.abc import Callable
+from typing import Any, Literal
 from urllib.parse import quote
 
-from fastapi import HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
+from simple_chat_agent.common.attachments import artifact_is_user_attachment
 from simple_chat_agent.common.store import AppStore, ArtifactRecord, artifact_is_expired
+
+_HTML_MIME_TYPES = ("text/html", "application/xhtml+xml")
+_HTML_SUFFIXES = (".html", ".htm", ".xhtml")
+
+
+def create_artifacts_router(
+    *,
+    store: Callable[[], AppStore],
+    current_user: Callable[[Request], Any],
+) -> APIRouter:
+    """/api/artifacts/{id}[/preview|/download]: an agent-created artifact, for its owner only.
+    User uploads (attachments) are never served here."""
+    router = APIRouter()
+
+    def owned(request: Request, artifact_id: str) -> ArtifactRecord:
+        user = current_user(request)
+        artifact = store().get_artifact(user_id=user.user_id, artifact_id=artifact_id)
+        if artifact is None or artifact_is_user_attachment(artifact):
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        return artifact
+
+    @router.get("/api/artifacts/{artifact_id}")
+    async def view_artifact(request: Request, artifact_id: str) -> Response:
+        return artifact_response(store(), owned(request, artifact_id), disposition="inline")
+
+    @router.get("/api/artifacts/{artifact_id}/preview")
+    async def preview_html_artifact(request: Request, artifact_id: str) -> Response:
+        artifact = owned(request, artifact_id)
+        if artifact.mime_type.lower() not in _HTML_MIME_TYPES and not artifact.name.lower().endswith(_HTML_SUFFIXES):
+            raise HTTPException(status_code=415, detail="Artifact is not an HTML document")
+        return artifact_response(store(), artifact, disposition="html-preview")
+
+    @router.get("/api/artifacts/{artifact_id}/download")
+    async def download_artifact(request: Request, artifact_id: str) -> Response:
+        return artifact_response(store(), owned(request, artifact_id), disposition="attachment")
+
+    return router
 
 
 def artifact_response(

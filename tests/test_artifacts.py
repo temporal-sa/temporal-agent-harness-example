@@ -8,12 +8,9 @@ from unittest.mock import Mock
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from simple_chat_agent.api.artifacts import artifact_response
+from simple_chat_agent.api.artifacts import artifact_response, create_artifacts_router
 from simple_chat_agent.api.auth import AuthenticatedUser
-from simple_chat_agent.api.routes.sessions import (
-    SessionRouteDeps,
-    create_sessions_router,
-)
+from simple_chat_agent.common.attachments import USER_ATTACHMENT_SOURCE
 from simple_chat_agent.common.store import ArtifactRecord
 
 
@@ -38,28 +35,12 @@ class ArtifactResponseTests(unittest.TestCase):
         self.store.get_artifact.return_value = self.artifact
         app = FastAPI()
         app.include_router(
-            create_sessions_router(
-                SessionRouteDeps(
-                    client=Mock(),
-                    store=lambda: self.store,
-                    stream_broker=Mock(),
-                    current_user=lambda request: AuthenticatedUser(
-                        user_id="user-1",
-                        username="researcher@example.com",
-                    ),
-                    require_conversation_owner=Mock(),
-                    ensure_user_chats_workflow=Mock(),
-                    list_user_chats=Mock(),
-                    query_state=Mock(),
-                    query_snapshot=Mock(),
-                    query_transcript_page=Mock(),
-                    query_transcript_deltas_since=Mock(),
-                    signal_workflow=Mock(),
-                    touch_conversation=Mock(),
-                    forget_conversation=Mock(),
-                    is_temporal_not_found=Mock(),
-                    github_connection_id_for_user=Mock(),
-                )
+            create_artifacts_router(
+                store=lambda: self.store,
+                current_user=lambda request: AuthenticatedUser(
+                    user_id="user-1",
+                    username="researcher@example.com",
+                ),
             )
         )
         self.client = TestClient(app)
@@ -120,6 +101,16 @@ class ArtifactResponseTests(unittest.TestCase):
             "text/plain; charset=utf-8",
         )
         self.assertNotIn("content-security-policy", response.headers)
+
+    def test_download_and_user_uploads(self) -> None:
+        response = self.client.get("/api/artifacts/artifact-1/download")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-disposition"].startswith("attachment;"))
+        # A user's own upload (an attachment) is never served as an artifact.
+        self.store.get_artifact.return_value = replace(self.artifact, metadata={"source": USER_ATTACHMENT_SOURCE})
+        self.assertEqual(self.client.get("/api/artifacts/artifact-1").status_code, 404)
+        self.store.get_artifact.return_value = None
+        self.assertEqual(self.client.get("/api/artifacts/artifact-1/download").status_code, 404)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,6 @@ from starlette.requests import Request
 from simple_chat_agent.api.auth import SESSION_COOKIE, AuthenticatedUser, create_session_token
 from simple_chat_agent.api.main import _current_user
 from simple_chat_agent.api.auth import user_from_catalog_headers
-from simple_chat_agent.worker.user_chats_workflow import user_chats_workflow_id
 from simple_chat_agent.common.external_storage import simple_chat_data_converter
 from simple_chat_agent.api.temporal_ui import temporal_ui_url, temporal_ui_user_workflows_url
 from urllib.parse import parse_qs, urlsplit
@@ -39,7 +38,6 @@ class CatalogIntegrationTests(unittest.TestCase):
         self.assertEqual(user, again)
         self.assertEqual(user.username, "user@temporal.io")
         self.assertNotEqual(user.user_id, workspace.user_id)
-        self.assertNotEqual(user_chats_workflow_id(user.user_id), user_chats_workflow_id(workspace.user_id))
 
     def test_catalog_auth_does_not_accept_an_app_session_cookie(self) -> None:
         with patch.dict(os.environ, {"SIMPLE_CHAT_AUTH_MODE": "catalog"}):

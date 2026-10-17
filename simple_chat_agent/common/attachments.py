@@ -8,11 +8,7 @@ from typing import Any, Literal
 
 from .store import AppStore, ArtifactRecord, artifact_expires_at
 
-# Defined here rather than imported from the old in-tree ``agent_harness`` package, which
-# P5 deletes. The field layout matches ``agent_harness.attachments.AttachmentRef`` exactly:
-# the old API serializes these into a ChatSignalRequest and the old worker decodes them
-# into its own class, so the two must stay wire-compatible until P5
-# (tests/test_tools_artifacts.py pins this).
+# A user's upload as the API describes it (attachment_dict).
 AttachmentContentKind = Literal[
     "text",
     "code",
@@ -177,22 +173,6 @@ def attachment_dict(artifact: ArtifactRecord) -> dict[str, Any]:
         "view_url": f"/api/attachments/{ref.attachment_id}",
         "download_url": f"/api/attachments/{ref.attachment_id}/download",
     }
-
-
-def attachment_dicts(artifacts: list[ArtifactRecord]) -> list[dict[str, Any]]:
-    return [
-        attachment_dict(artifact)
-        for artifact in artifacts
-        if artifact_is_user_attachment(artifact)
-    ]
-
-
-def generated_artifacts(artifacts: list[ArtifactRecord]) -> list[ArtifactRecord]:
-    return [
-        artifact
-        for artifact in artifacts
-        if not artifact_is_user_attachment(artifact)
-    ]
 
 
 def detect_content_kind(

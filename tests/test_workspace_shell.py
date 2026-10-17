@@ -28,69 +28,6 @@ from simple_chat_agent.worker.sandbox.executor import (
     _StreamBudget,
     _workspace_key,
 )
-from simple_chat_agent.worker.tools import (
-    PYTHON_SANDBOX_TOOL,
-    WORKSPACE_SHELL_TOOL,
-    tool_names_for_connections,
-)
-from simple_chat_agent.worker.tools.workspace_shell import (
-    MAX_COMMAND_CHARS,
-    MAX_STDIN_CHARS,
-    _validated_request,
-)
-
-
-class WorkspaceShellToolTests(unittest.TestCase):
-    def test_new_conversations_advertise_workspace_shell_not_legacy_python(
-        self,
-    ) -> None:
-        with patch.dict("os.environ", {"SIMPLE_CHAT_WORKSPACE_SHELL_ENABLED": "1"}):
-            names = tool_names_for_connections(github_connection_id=None)
-
-        self.assertIn(WORKSPACE_SHELL_TOOL, names)
-        self.assertNotIn(PYTHON_SANDBOX_TOOL, names)
-
-    def test_unconfigured_local_runtime_does_not_advertise_shell(self) -> None:
-        with patch.dict("os.environ", {}, clear=True):
-            names = tool_names_for_connections(github_connection_id=None)
-
-        self.assertNotIn(WORKSPACE_SHELL_TOOL, names)
-
-    def test_tool_request_is_bounded_and_keeps_network_choice(self) -> None:
-        request = _validated_request(
-            workspace_id="workflow-1",
-            execution_id="workspace_shell:abc",
-            command="python - <<'PY'\nprint('hello')\nPY",
-            cwd="/workspace",
-            timeout_seconds=10_000,
-            network=False,
-            stdin=None,
-        )
-
-        self.assertEqual(request["timeout_seconds"], 900)
-        self.assertFalse(request["network"])
-
-    def test_tool_request_rejects_oversized_command_and_stdin(self) -> None:
-        with self.assertRaisesRegex(ValueError, "Command is too large"):
-            _validated_request(
-                workspace_id="workflow-1",
-                execution_id="workspace_shell:abc",
-                command="x" * (MAX_COMMAND_CHARS + 1),
-                cwd="/workspace",
-                timeout_seconds=30,
-                network=True,
-                stdin=None,
-            )
-        with self.assertRaisesRegex(ValueError, "stdin is too large"):
-            _validated_request(
-                workspace_id="workflow-1",
-                execution_id="workspace_shell:abc",
-                command="python -",
-                cwd="/workspace",
-                timeout_seconds=30,
-                network=True,
-                stdin="x" * (MAX_STDIN_CHARS + 1),
-            )
 
 
 class WorkspaceExecutorTests(unittest.TestCase):
