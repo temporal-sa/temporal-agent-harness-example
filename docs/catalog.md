@@ -28,16 +28,16 @@ Keys are brokered by the catalog; the app never asks a user for one.
 | `WORKSPACE_EXECUTOR_TOKEN` | API, worker, executor | Bearer token for the executor. From the project runtime secret. |
 | `SIMPLE_CHAT_JWT_SECRET` | API | Local login only. Not used in the catalog. |
 
-`SIMPLE_CHAT_STREAM_TOKEN` and `SIMPLE_CHAT_GOOD_PLACE` are no longer read; drop them.
+`SIMPLE_CHAT_GOOD_PLACE` is no longer read. Keep `SIMPLE_CHAT_STREAM_TOKEN` in the runtime secret: the app no longer reads it, but the catalog yaml uses it as the Redis password.
 
 ### Temporal, Task Queue and Worker Deployment
 
 | Variable | Container | Value |
 |---|---|---|
 | `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_API_KEY`, `TEMPORAL_TLS` | API, worker | From the catalog |
-| `CODING_AGENT_TASK_QUEUE` | API **and** worker | Default `coding-agent`. Each crashable environment injects its own into both. |
+| `CODING_AGENT_TASK_QUEUE` | API **and** worker | Map it to the same value: `"$(SIMPLE_CHAT_TASK_QUEUE)"`, listed after `SIMPLE_CHAT_TASK_QUEUE`. Crashable clones override `SIMPLE_CHAT_TASK_QUEUE` and this follows, so the queue the worker polls is the one KEDA autoscales on. |
 | `SIMPLE_CHAT_TASK_QUEUE` | API **and** worker | Keep injecting it: user identity and the Redis key prefix include it, so a clone's users and data can't collide with the always-on demo. |
-| `TEMPORAL_DEPLOYMENT_NAME` | worker | A **new** name for the coding agent (not the old app's). |
+| `TEMPORAL_DEPLOYMENT_NAME` | worker | Set by the catalog from `worker.versioning.deploymentName`. Keep `advanced-ai-agent`: the new build is a new version of the same Deployment, old pinned chats stay on the old version, and the workflow types differ. |
 | `TEMPORAL_WORKER_BUILD_ID` | worker | **Required**; the worker refuses to start without it. Derived from the source plus `uv.lock`; never reused for different code. |
 | `CODING_AGENT_WORKER_VERSIONING_ENABLED` | worker | Default `true`. Workflows are PINNED; there is no patching. |
 
@@ -82,44 +82,15 @@ One demo run uses about 130k tokens (see the README), so a user can do roughly 3
 | `AGENT_SESSION_TTL_SECONDS` | API, worker | Default 1,296,000 (15 days) |
 | `AGENT_ARCHIVE_PREFIX` | API | Default `agent-frames/<redis prefix>` |
 | `WORKSPACE_EXECUTOR_URL` | API, worker | The executor Service |
-| `SIMPLE_CHAT_CODEC_AUTH_ENABLED=1`, `SIMPLE_CHAT_CODEC_JWKS_URL`, `SIMPLE_CHAT_CODEC_ALLOWED_ORIGINS` | worker | **Required in the catalog.** The codec server's `/decode` can fetch S3 payloads, so it must check the Temporal Cloud token (JWKS) and only allow the Temporal UI origin (e.g. `https://cloud.temporal.io`). The code defaults to auth off and CORS `*` for local use. |
+| `SIMPLE_CHAT_CODEC_AUTH_ENABLED=true` | worker | Keep it on. The codec server listens on the worker pod (8001) and isn't exposed outside the cluster; `/decode` can fetch S3 payloads, so it checks the Temporal Cloud token (JWKS). `SIMPLE_CHAT_CODEC_ALLOWED_ORIGINS` only matters if a browser ever calls it directly. |
 | `SIMPLE_CHAT_API_HOST`, `SIMPLE_CHAT_CODEC_SERVER_HOST` | API, worker | `0.0.0.0` so Services and probes can reach them |
 | `SIMPLE_CHAT_PUBLIC_URL` | API | Public base URL (OAuth callbacks) |
 
 Identity comes from the catalog's `X-Temporal-Auth-Subject` and `X-Temporal-Auth-Email` headers. Ingress strips browser-supplied copies; never expose the API Service directly.
 
-## Executor egress (NetworkPolicy)
+## Executor egress
 
-The executor runs model-chosen commands, so it holds no credentials and reaches only the public internet on HTTP and HTTPS (package installs, `git clone` over HTTPS). It must not reach cluster services, the node, private ranges or the metadata endpoint. Its own startup check probes these and fails if they're reachable. Only the API and worker may call it.
-
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: advanced-ai-agent-executor
-spec:
-  podSelector:
-    matchLabels: {app.kubernetes.io/component: executor}
-  policyTypes: [Ingress, Egress]
-  ingress:
-    - from:
-        - podSelector:
-            matchExpressions:
-              - {key: app.kubernetes.io/component, operator: In, values: [api, worker]}
-      ports: [{protocol: TCP, port: 8082}]
-  egress:
-    - to:   # cluster DNS only
-        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
-          podSelector: {matchLabels: {k8s-app: kube-dns}}
-      ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
-    - to:   # public internet on 80/443 only
-        - ipBlock:
-            cidr: 0.0.0.0/0
-            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 127.0.0.0/8, 0.0.0.0/8]
-      ports: [{protocol: TCP, port: 80}, {protocol: TCP, port: 443}]
-```
-
-Match the labels to the catalog's chart. The catalog's `isolatedExecutor` profile also applies: non-root, read-only root filesystem, no service-account token, and writable `/workspaces` and `/tmp` only.
+The executor runs model-chosen commands, so it holds no credentials and must reach only the public internet on HTTP and HTTPS. The catalog's `isolatedExecutor: true` profile already does this: a pod-local firewall allows public HTTP/HTTPS and DNS and blocks private, link-local, metadata and IPv6 destinations, with a non-root, read-only root filesystem and no service-account token. No extra NetworkPolicy is needed. The executor's own startup check fails if it can reach those destinations or see an LLM key.
 
 ## S3 lifecycle
 

@@ -9,8 +9,8 @@ This runbook moves the catalog from the old chat app (`SimpleChatWorkflow`, `Use
 | | Old app | Coding agent |
 |---|---|---|
 | Workflow types | `SimpleChatWorkflow`, `UserChatsWorkflow` | `CodingSessions`, `CodingAgent`, `Explorer`, `Reviewer` |
-| Task Queue | `SIMPLE_CHAT_TASK_QUEUE` (default `simple-chat-agent`) | `CODING_AGENT_TASK_QUEUE` (default `coding-agent`) |
-| Worker Deployment | `TEMPORAL_DEPLOYMENT_NAME` (old name) | a **new** `TEMPORAL_DEPLOYMENT_NAME` |
+| Task Queue | `SIMPLE_CHAT_TASK_QUEUE` | `CODING_AGENT_TASK_QUEUE`, mapped in the catalog to `$(SIMPLE_CHAT_TASK_QUEUE)`, so the same queue |
+| Worker Deployment | `advanced-ai-agent` | the same Deployment, a new version (new Build ID) |
 | Build ID | `TEMPORAL_WORKER_BUILD_ID` | `TEMPORAL_WORKER_BUILD_ID`, now **required** (`CODING_AGENT_BUILD_ID` is still read as an alias; the old `1.0.0` default is gone) |
 | Workflow ID prefixes | the old app's chat and user ids | `coding-agent-…`, `coding-sessions-…` |
 | Versioning flag | the old app's flag | `CODING_AGENT_WORKER_VERSIONING_ENABLED` (default on, PINNED) |
@@ -23,7 +23,7 @@ This runbook moves the catalog from the old chat app (`SimpleChatWorkflow`, `Use
 
 1. The owner has given `/go release`.
 2. The new image is built (`make image`) and the executor image (`make executor-image`, or the catalog's build).
-3. The catalog project yaml is updated (see [catalog.md](catalog.md)): the brokered `OPENAI_API_KEY` is requested, `CODING_AGENT_TASK_QUEUE` and the new Deployment name are set, codec auth is on (`SIMPLE_CHAT_CODEC_AUTH_ENABLED=1`), the executor NetworkPolicy and the S3 lifecycle rule are in place, and `SIMPLE_CHAT_STREAM_TOKEN` is removed.
+3. The catalog project yaml is updated (see [catalog.md](catalog.md)): the shared `openai` key is requested, `CodingAgentOwner` is a search attribute, `CODING_AGENT_TASK_QUEUE` maps to `$(SIMPLE_CHAT_TASK_QUEUE)`, and the S3 lifecycle rule on `agent-frames/` is in place.
 4. The `CodingAgentOwner` Keyword search attribute exists in the namespace. Session list rebuilds and the owner check depend on it.
 5. Pick the new Worker Deployment name. It must not be the old one. The Build ID comes from the source plus `uv.lock` and is never reused for different code (PRD §6).
 6. Count what will be terminated, and tell users that old chats end:
@@ -35,16 +35,16 @@ This runbook moves the catalog from the old chat app (`SimpleChatWorkflow`, `Use
 
 ## Steps
 
-### 1. Ship the new worker on its own Task Queue and Deployment
+### 1. Ship the new worker as a new version of the same Deployment
 
-Deploy the API and worker with `CODING_AGENT_TASK_QUEUE`, the new `TEMPORAL_DEPLOYMENT_NAME` and the new `TEMPORAL_WORKER_BUILD_ID`. Make the new version current for its deployment:
+Deploy from `main`. The catalog builds a new Build ID for the same Deployment (`advanced-ai-agent`); old pinned chats stay on the old version until step 3 terminates them, and new sessions start on the new version. If the catalog doesn't make the new version current itself:
 
 ```sh
 temporal worker deployment set-current-version --namespace "$NS" \
-  --deployment-name "$NEW_DEPLOYMENT" --build-id "$BUILD_ID" --yes
+  --deployment-name advanced-ai-agent --build-id "$BUILD_ID" --yes
 ```
 
-Check: open the product view, start a session, and confirm in Temporal UI that `CodingSessions` and `CodingAgent` run PINNED on `$NEW_DEPLOYMENT:$BUILD_ID`.
+Check: open the product view, start a session, and confirm in Temporal UI that `CodingSessions` and `CodingAgent` run PINNED on `advanced-ai-agent:$BUILD_ID`.
 
 ### 2. Keep the old deployment running
 
@@ -74,11 +74,11 @@ temporal worker deployment delete --namespace "$NS" --name "$OLD_DEPLOYMENT"
 
 ## Rollback
 
-Before step 3, roll back by pointing the catalog at the old image and queue again; nothing has been terminated. After step 3, old chats are gone by design (D4). Rolling back the coding agent itself means making the previous Build ID current again: PINNED sessions keep their version, and a continue-as-new run on a newer version waits (fails its workflow task) until a version that understands its `CarriedState` is current again.
+Before step 3, roll back by making the old Build ID current again (`temporal worker deployment set-current-version --deployment-name advanced-ai-agent --build-id <old>`); nothing has been terminated. After step 3, old chats are gone by design (D4). Rolling back the coding agent itself means making the previous Build ID current again: PINNED sessions keep their version, and a continue-as-new run on a newer version waits (fails its workflow task) until a version that understands its `CarriedState` is current again.
 
 ## Dry run, 2026-10-16
 
-Run once on the local dev server (`127.0.0.1:7244`, never 7233), in a fresh namespace, by Eng H. The old app's code had already been deleted, so stub workflows with the old type names stood in for it (a scratch script, not committed). The CLI was run with `--disable-config-file --disable-config-env` so that it couldn't pick up a cloud profile.
+Run once on the local dev server. It used a separate queue and Deployment name; the catalog keeps the same ones (see step 1), which only changes the names, not the steps. It ran (`127.0.0.1:7244`, never 7233), in a fresh namespace, by Eng H. The old app's code had already been deleted, so stub workflows with the old type names stood in for it (a scratch script, not committed). The CLI was run with `--disable-config-file --disable-config-env` so that it couldn't pick up a cloud profile.
 
 | Step | Command | Result |
 |---|---|---|
