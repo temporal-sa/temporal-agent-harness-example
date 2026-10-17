@@ -7,12 +7,14 @@ export interface HeaderProps {
   demo: string | null;
   status: SessionStatus | null;
   views: ReactNode;
+  /** Extra header controls (P4: "MCP servers"). */
+  tools?: ReactNode;
   presenter: boolean;
   onPresenter(): void;
   onMenu(): void;
 }
 
-export function Header({ title, demo, status, views, presenter, onPresenter, onMenu }: HeaderProps) {
+export function Header({ title, demo, status, views, tools, presenter, onPresenter, onMenu }: HeaderProps) {
   return (
     <header className="top">
       <button type="button" className="menu-btn" aria-label="Sessions and views" onClick={onMenu}>
@@ -33,6 +35,7 @@ export function Header({ title, demo, status, views, presenter, onPresenter, onM
       {status && <StatusPill status={status} />}
       <div className="spacer" />
       {views}
+      {tools}
       <button type="button" className="toggle" aria-pressed={presenter} onClick={onPresenter} title="Larger text for screen sharing">
         Presenter mode
       </button>

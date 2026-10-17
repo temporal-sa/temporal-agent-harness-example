@@ -12,6 +12,8 @@ export interface TranscriptContextValue {
   providerOfModel(model: string | null): string | null;
   postureLabel(id: string): string;
   workerAnswering: boolean;
+  /** Open the MCP servers dialog at a server's Reconnect (P4). Absent when MCP is off. */
+  openMcp?(server: string): void;
 }
 
 export const TranscriptContext = createContext<TranscriptContextValue | null>(null);

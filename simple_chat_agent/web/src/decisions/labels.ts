@@ -1,5 +1,6 @@
 // Copy for the stacked approval card. Pure.
 
+import { SCRIPT_TOOL, toolDisplayName } from "../session/extras";
 import { count } from "../recovery/format";
 import { argSummary } from "./describe";
 import type { Fold, Group } from "./grouping";
@@ -44,10 +45,16 @@ export function groupTitle(group: Group): GroupTitle {
       return same
         ? { text: "Commit", code: argSummary("git_commit", same.input), fold: foldHint() }
         : { text: count(n, "commit"), code: null, fold: null };
-    default:
+    case SCRIPT_TOOL:
       return same
-        ? { text: group.toolName, code: argSummary(group.toolName, same.input) || null, fold: foldHint() }
-        : { text: `${group.toolName} · ${count(n, "call")}`, code: null, fold: null };
+        ? { text: "Run a script", code: argSummary(SCRIPT_TOOL, same.input) || null, fold: foldHint() }
+        : { text: `Run ${count(n, "script")}`, code: null, fold: null };
+    default: {
+      const name = toolDisplayName(group.toolName);
+      return same
+        ? { text: name, code: argSummary(group.toolName, same.input) || null, fold: foldHint() }
+        : { text: `${name} · ${count(n, "call")}`, code: null, fold: null };
+    }
   }
 }
 

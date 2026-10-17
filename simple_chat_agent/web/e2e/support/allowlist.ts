@@ -9,6 +9,8 @@ export interface AllowedRoute {
   backing: string;
   /** Set when the route can reach a Query on some path (server-side). */
   queryNote?: string;
+  /** Reached only when a P4 feature is used (callbacks, MCP), so the demo walk can miss it. */
+  feature?: string;
 }
 
 const ID = "[^/]+";
@@ -44,6 +46,21 @@ export const ALLOWED: readonly AllowedRoute[] = [
   { method: "POST", path: /^\/api\/agent\/approve$/, route: "POST /api/agent/approve", backing: "Signal enqueue_approval (subagent: Update)" },
   { method: "GET", path: new RegExp(`^/api/agent/status/${ID}$`), route: "GET /api/agent/status/{id}", backing: "Redis status meta" },
   { method: "GET", path: new RegExp(`^/api/agent/workflow-status/${ID}$`), route: "GET /api/agent/workflow-status/{id}", backing: "Describe" },
+  // P4 (A12): callback answers and pick_files uploads.
+  { method: "POST", path: /^\/api\/agent\/callback-result$/, route: "POST /api/agent/callback-result", backing: "Signal enqueue_callback_result", feature: "callbacks" },
+  {
+    method: "POST",
+    path: new RegExp(`^/api/agent/sessions/${ID}/callbacks/${ID}/files$`),
+    route: "POST /api/agent/sessions/{id}/callbacks/{tool_id}/files",
+    backing: "executor write + Redis set",
+    feature: "pick_files",
+  },
+  // P4 (A8): MCP servers, local only.
+  { method: "GET", path: /^\/api\/agent\/mcp\/servers$/, route: "GET /api/agent/mcp/servers", backing: "Redis (rebuilt from the CodingSessions memo by Describe)", feature: "mcp" },
+  { method: "POST", path: /^\/api\/agent\/mcp\/servers$/, route: "POST /api/agent/mcp/servers", backing: "MCP probe + per-user MCP settings", feature: "mcp" },
+  { method: "DELETE", path: new RegExp(`^/api/agent/mcp/servers/${ID}$`), route: "DELETE /api/agent/mcp/servers/{name}", backing: "per-user MCP settings", feature: "mcp" },
+  { method: "GET", path: new RegExp(`^/api/agent/mcp/servers/${ID}/status$`), route: "GET /api/agent/mcp/servers/{name}/status", backing: "MCP probe", feature: "mcp" },
+  { method: "POST", path: /^\/api\/agent\/mcp\/oauth\/start$/, route: "POST /api/agent/mcp/oauth/start", backing: "in-process OAuth flow", feature: "mcp" },
 ];
 
 /** Paths that are known to issue Queries (the old frontend's routes). Called out by name. */

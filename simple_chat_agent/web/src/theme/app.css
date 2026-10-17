@@ -433,3 +433,41 @@ button.path:hover { border-color: var(--uv-light); }
   .composer .bar .posture-menu { flex: 0 0 auto; }
   .composer .bar .model-menu { flex: 0 1 auto; }
 }
+
+/* P4: Code Mode script rows, sources, the web search toggle, and the MCP dialog. */
+.script, .host-calls { padding: 0 .8em .55em; display: grid; gap: .3em; }
+.host-calls .tool.nest { margin-left: .6em; }
+.script-src { margin: 0; padding: .6em .9em; font-family: var(--mono); font-size: .72em; line-height: 1.6; white-space: pre; overflow: auto; max-height: 24em; background: #111116; border: 1px solid var(--border); color: var(--indigo-100); }
+.chips .reconnect { color: var(--yellow); border-color: var(--yellow); }
+.sources { display: grid; gap: .25em; font-size: .82em; border-left: 2px solid var(--border); padding: .2em .8em; }
+.sources ul { list-style: none; margin: 0; padding: 0; display: grid; gap: .2em; }
+.sources li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sources a { color: var(--indigo-200); }
+.sources .domain { font-family: var(--mono); font-size: .85em; color: var(--slate-300); }
+.ctl.search[aria-pressed="true"] { border-color: var(--green); color: var(--green); }
+.search-on { font-family: var(--mono); font-size: .72em; color: var(--green); }
+
+.mcp-dialog {
+  position: fixed; z-index: 21; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(40em, calc(100vw - 32px));
+  max-height: calc(100vh - 48px); overflow: auto; background: var(--ink); border: 1px solid var(--uv-light); display: grid; align-content: start;
+}
+.mcp-dialog:focus { outline: none; }
+.mcp-dialog .mcp-body { display: grid; gap: .9em; padding: .9em 1em 1.1em; font-size: .9em; }
+.mcp-dialog h2 { font-size: 1em; margin: 0; }
+.mcp-dialog .servers { list-style: none; margin: 0; padding: 0; display: grid; gap: .4em; }
+.mcp-dialog .server { border: 1px solid var(--border); padding: .55em .7em; display: grid; gap: .3em; }
+.mcp-dialog .server .row { display: flex; gap: .6em; align-items: center; flex-wrap: wrap; }
+.mcp-dialog .server .url { font-family: var(--mono); font-size: .8em; color: var(--slate-300); overflow-wrap: anywhere; }
+.mcp-dialog .status.connected { color: var(--green); }
+.mcp-dialog .status.needs_reauth, .mcp-dialog .status.unreachable, .mcp-dialog .status.blocked { color: var(--yellow); }
+.mcp-dialog form { display: grid; gap: .55em; border-top: 1px solid var(--border); padding-top: .9em; }
+.mcp-dialog label { display: grid; gap: .25em; font-size: .85em; color: var(--indigo-100); }
+.mcp-dialog input, .mcp-dialog select {
+  font: inherit; font-size: .95em; color: var(--off-white); background: var(--space-black, #000); border: 1px solid var(--slate-500); padding: .45em .6em; border-radius: 0;
+}
+.mcp-dialog .err { color: var(--red); font-size: .85em; margin: 0; }
+.mcp-dialog .acts { display: flex; gap: .6em; flex-wrap: wrap; align-items: center; }
+.mcp-dialog .spacer { flex: 1; }
+@media (max-width: 600px) {
+  .mcp-dialog .btn, .mcp-dialog input, .mcp-dialog select { min-height: 44px; }
+}

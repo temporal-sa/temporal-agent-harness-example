@@ -9,6 +9,7 @@
 //   leaves, so the buttons never move under the cursor. Held calls are never answered by
 //   Approve all: you approve only what you saw.
 
+import { toolArgs } from "../session/extras";
 import type { PendingApproval, SendPhase, SendRecord } from "../session";
 import { canonical, type Risk } from "./describe";
 
@@ -40,7 +41,8 @@ export function itemOf(p: PendingApproval): ApprovalItem {
   return {
     toolId: p.part.toolId,
     toolName: p.part.toolName,
-    input: p.part.input,
+    // MCP calls wrap their arguments as {"arguments": {...}}: review the tool's own.
+    input: toolArgs(p.part.toolName, p.part.input),
     agentId: p.agentId,
     messageId: p.messageId,
     risk: p.riskClass ?? null,

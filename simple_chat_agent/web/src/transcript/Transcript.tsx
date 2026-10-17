@@ -11,6 +11,7 @@ import { StreamingMarkdown } from "./Markdown";
 import { ErrorNote } from "./ErrorNote";
 import { errorCopy } from "../session/errors";
 import { settingsAck } from "../session/derive";
+import { replySources, type WebSource } from "../session/extras";
 import { recordForUnsent } from "../session/sendStates";
 import { SubagentCard } from "./SubagentCard";
 import { Thinking } from "./Thinking";
@@ -93,7 +94,7 @@ function ItemView({ item, message, agentId }: { item: Item; message: Message; ag
     case "text":
       return <StreamingMarkdown text={item.text} streaming={item.streaming} />;
     case "tool":
-      return <ToolRow part={item.part} />;
+      return <ToolRow part={item.part} hostCalls={item.hostCalls} />;
     case "group":
       return <ToolGroup label={item.label} parts={item.parts} />;
     case "subagents":
@@ -143,11 +144,44 @@ function ChatTurn({ message, recoveries }: { message: Message; recoveries: TurnR
       ))}
       {/* A reply that never streamed (e.g. a checkpoint or an explained failure). */}
       {!hasText && finalText && <StreamingMarkdown text={finalText} streaming={false} />}
+      <Sources sources={replySources(message.output)} />
       {message.status === "error" && message.error && (
         <ErrorNote alert text="The agent couldn't finish this message. Its work so far is kept in Temporal; send it again or ask for something else." detail={message.error} />
       )}
     </>
   );
+}
+
+/** The pages the provider's web search used for a reply. */
+function Sources({ sources }: { sources: readonly WebSource[] }) {
+  if (sources.length === 0) return null;
+  return (
+    <div className="sources">
+      <span className="hint" aria-hidden="true">
+        Sources
+      </span>
+      <ul aria-label="Sources">
+        {sources.map((s) => (
+          <li key={s.url}>
+            <a href={s.url} target="_blank" rel="noopener noreferrer" title={s.url}>
+              {s.title}
+            </a>{" "}
+            <span className="domain">{s.domain}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** The web search line: the agent's ack, else what was asked while it's on its way. */
+export function webSearchLine(message: Pick<Message, "input" | "output" | "status" | "error">): string {
+  const ack = settingsAck(message);
+  if (ack?.detail) return ack.detail;
+  const input = isObj(message.input) ? message.input : {};
+  const on = input.enabled === true;
+  if (message.status === "error") return `Couldn't turn web search ${on ? "on" : "off"}. The previous setting still applies.`;
+  return on ? "Turning web search on…" : "Turning web search off…";
 }
 
 /** The agent refused a model or posture change: its reason, and that nothing changed. */
@@ -201,6 +235,8 @@ function ControlLine({ message, nextTurnStarted }: { message: Message; nextTurnS
       );
     case "interrupt":
       return <div className="sys-line">You pressed Stop</div>;
+    case "set_web_search":
+      return <div className="sys-line">{webSearchLine(message)}</div>;
     case "forget_always_allowed": {
       const out = isObj(message.output) ? message.output : null;
       const detail = typeof out?.detail === "string" ? out.detail : null;

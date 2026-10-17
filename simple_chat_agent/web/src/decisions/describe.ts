@@ -2,6 +2,7 @@
 // and whether "Always approve" applies. Pure.
 
 import type { Evaluation } from "../session";
+import { SCRIPT_TOOL, mcpTool, toolDisplayName } from "../session/extras";
 import { count } from "../recovery/format";
 import { addedFilePreview, countLines, editPreview, type DiffLine } from "../workbench/diff";
 
@@ -88,6 +89,8 @@ export function toolBadge(toolName: string, risk: Risk): { kind: BadgeKind; text
   if (risk === "workspace_edit") return { kind: "edit", text: "Edit" };
   if (risk === "network") return { kind: "net", text: "Network" };
   if (toolName === "create_artifact") return { kind: "art", text: "Artifact" };
+  if (toolName === SCRIPT_TOOL) return { kind: "read", text: "Script" };
+  if (mcpTool(toolName)) return { kind: "net", text: "MCP" };
   if (risk === "read_only") return { kind: "read", text: "Read" };
   return { kind: "shell", text: "Tool" };
 }
@@ -131,6 +134,10 @@ export function argSummary(toolName: string, input: Record<string, unknown>): st
       return str(input, "url");
     case "search_web":
       return short(str(input, "query"));
+    case SCRIPT_TOOL: {
+      const first = str(input, "script").split("\n").map((l) => l.trim()).find((l) => l && !l.startsWith("#")) ?? "";
+      return short(first, 90);
+    }
     default: {
       const json = JSON.stringify(input);
       return short(json === "{}" ? "" : json);
@@ -156,8 +163,16 @@ export function reviewOf(toolName: string, input: Record<string, unknown>): Revi
     if (input.add_all === false) rows.push("stages: only what is already staged");
     return { kind: "args", text: rows.join("\n") };
   }
-  return { kind: "args", text: `${toolName}\n${JSON.stringify(input, null, 2)}` };
+  if (toolName === SCRIPT_TOOL) return { kind: "args", text: str(input, "script") };
+  return { kind: "args", text: `${toolDisplayName(toolName)}\n${JSON.stringify(input, null, 2)}` };
 }
+
+/** "Always approve" isn't offered at all for a script: its one approval covers its host calls. */
+export function offersAlways(toolName: string): boolean {
+  return toolName !== SCRIPT_TOOL;
+}
+
+export const SCRIPT_WHY = "Approving the script also lets it make its host calls (read-only workspace tools) without asking again.";
 
 /** "+1 −1" for a file edit's preview. */
 export function editStat(toolName: string, input: Record<string, unknown>): string | null {
@@ -186,7 +201,9 @@ export function callTitle(toolName: string, input: Record<string, unknown>, ctx:
       return "Search the web";
     case "create_artifact":
       return "Publish an artifact";
+    case SCRIPT_TOOL:
+      return "Run a script";
     default:
-      return `Call ${toolName}`;
+      return `Call ${toolDisplayName(toolName)}`;
   }
 }

@@ -17,7 +17,9 @@ import {
   callNoun,
   callTitle,
   editStat,
+  offersAlways,
   reviewOf,
+  SCRIPT_WHY,
   toolBadge,
   type Risk,
 } from "./describe";
@@ -41,6 +43,7 @@ import {
 import { answeredText, groupTitle, SAME, stackHeading } from "./labels";
 import { JudgeChecking } from "./JudgeChecking";
 import { StopCards } from "./StopCards";
+import { CallbackCards } from "./CallbackCards";
 import "./decisions.css";
 
 export function DecisionDock({ session }: DecisionDockProps) {
@@ -49,6 +52,7 @@ export function DecisionDock({ session }: DecisionDockProps) {
       {/* Above the card, so rows coming and going never move the card's buttons. */}
       <JudgeChecking session={session} />
       <ApprovalCard session={session} />
+      <CallbackCards session={session} />
       <StopCards session={session} />
     </div>
   );
@@ -266,9 +270,11 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
           ) : (
             <>
               <button type="button" className="btn green small" data-answer="item" onClick={() => approve("one", [it.toolId])}>
-                Approve
+                {offersAlways(it.toolName) ? "Approve" : "Approve script"}
               </button>
-              <AlwaysButton risk={it.risk} toolName={it.toolName} allowed={it.rememberAllowed} onClick={() => approve("one", [it.toolId], true)} />
+              {offersAlways(it.toolName) && (
+                <AlwaysButton risk={it.risk} toolName={it.toolName} allowed={it.rememberAllowed} onClick={() => approve("one", [it.toolId], true)} />
+              )}
               <button
                 type="button"
                 className="btn ghost small"
@@ -282,7 +288,7 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
         </div>
         {declineForm("one")}
         <SendError answer={a} />
-        <p className="why">{it.rememberAllowed ? alwaysWhy(it.risk) : `${alwaysApproveReason(it.risk, it.toolName)}.`}</p>
+        <p className="why">{!offersAlways(it.toolName) ? SCRIPT_WHY : it.rememberAllowed ? alwaysWhy(it.risk) : `${alwaysApproveReason(it.risk, it.toolName)}.`}</p>
         {footer}
       </section>
     );
@@ -513,13 +519,15 @@ function GroupRows(p: GroupRowsProps) {
             <button type="button" className="btn green small" data-answer="group" aria-label={`Approve ${n} ${noun}`} onClick={() => p.onApprove(key, groupTargets(g))}>
               Approve {n}
             </button>
-            <AlwaysButton
-              risk={g.risk}
-              toolName={g.toolName}
-              allowed={g.rememberAllowed}
-              name={`${alwaysApproveLabel(g.risk)}, approving these ${n}`}
-              onClick={() => p.onApprove(key, groupTargets(g), true)}
-            />
+            {offersAlways(g.toolName) && (
+              <AlwaysButton
+                risk={g.risk}
+                toolName={g.toolName}
+                allowed={g.rememberAllowed}
+                name={`${alwaysApproveLabel(g.risk)}, approving these ${n}`}
+                onClick={() => p.onApprove(key, groupTargets(g), true)}
+              />
+            )}
             <button
               type="button"
               className="btn ghost small"
@@ -537,7 +545,7 @@ function GroupRows(p: GroupRowsProps) {
       {p.declineForm(key)}
       {expanded && (
         <div className="items-wrap" id={panel}>
-          {!g.rememberAllowed && n > 0 && <p className="why">{alwaysApproveReason(g.risk, g.toolName)}.</p>}
+          {!g.rememberAllowed && n > 0 && <p className="why">{offersAlways(g.toolName) ? `${alwaysApproveReason(g.risk, g.toolName)}.` : SCRIPT_WHY}</p>}
           {only ? (
             <FoldBody {...p} fold={only} />
           ) : (

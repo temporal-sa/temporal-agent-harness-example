@@ -3,6 +3,7 @@
 // simple_chat_agent/agent/tools/workspace.py (`model_text()` is what reaches the stream).
 
 import type { ToolPart } from "../session";
+import { mcpTool, toolArgs } from "../session/extras";
 
 export type BadgeKind = "read" | "edit" | "shell" | "git" | "agent" | "good" | "prog";
 
@@ -27,9 +28,13 @@ const BADGES: Record<string, ToolBadge> = {
   git_diff: { label: "Git", kind: "git" },
   git_commit: { label: "Git", kind: "git" },
   wait_seconds: { label: "Wait", kind: "read" },
+  run_script: { label: "Script", kind: "prog" },
+  ask_user: { label: "Ask", kind: "agent" },
+  pick_files: { label: "Files", kind: "agent" },
 };
 
 export function toolBadge(name: string): ToolBadge {
+  if (mcpTool(name)) return { label: "MCP", kind: "agent" };
   return BADGES[name] ?? { label: "Tool", kind: "read" };
 }
 
@@ -65,7 +70,19 @@ export function oneLine(s: string, max = 160): string {
 /** The argument preview beside the tool name. */
 export function argPreview(part: Pick<ToolPart, "toolName" | "input">): string {
   const i = part.input ?? {};
+  if (mcpTool(part.toolName)) {
+    const json = JSON.stringify(toolArgs(part.toolName, i));
+    return json === "{}" ? "" : oneLine(json, 120);
+  }
   switch (part.toolName) {
+    case "run_script": {
+      const lines = str(i, "script").split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+      return oneLine(lines[0] ?? "", 100);
+    }
+    case "ask_user":
+      return oneLine(str(i, "question"), 120);
+    case "pick_files":
+      return oneLine(str(i, "prompt"), 120);
     case "run_command":
       return oneLine(str(i, "command"));
     case "search_code":

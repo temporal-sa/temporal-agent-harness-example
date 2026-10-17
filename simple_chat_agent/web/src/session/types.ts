@@ -162,7 +162,7 @@ export type SessionStatus =
 
 /** What a local action was. Messages and approvals are Signals that land in Temporal before
  *  any worker runs them (PRD S8). */
-export type SendKind = "message" | "steer" | "interrupt" | "set_model" | "set_posture" | "approval" | "forget_always_allowed";
+export type SendKind = "message" | "steer" | "interrupt" | "set_model" | "set_posture" | "set_web_search" | "approval" | "forget_always_allowed";
 
 /**
  * - `sending`: clicked; the request hasn't returned.
@@ -302,11 +302,12 @@ export interface WorkerHealth {
 /** A front-door request the agent refused (`x_rejected`). */
 export interface Rejection {
   requestId: string;
-  kind: "approval" | "message" | null;
+  kind: "approval" | "message" | "callback" | null;
   toolId: string | null;
   messageId: string | null;
   /** unknown_approval, already_resolved, unknown_function, malformed_message, busy,
-   *  session_closed or rejected. */
+   *  session_closed or rejected; for a callback: invalid_answer, invalid_result,
+   *  unknown_callback or already_resolved. */
   code: string | null;
   /** Kept for the 3.1 shape: same as `code`. */
   type: string | null;
@@ -362,6 +363,23 @@ export interface SessionTelemetry {
   unknownFrames: Record<string, number>;
 }
 
+// -- callbacks (P4, A12) --------------------------------------------------------------------
+
+import type { CallbackRequest, CallbackStatus } from "./extras";
+import type { PickedFile } from "./api";
+export type { CallbackRequest, CallbackStatus, ChoiceOption, WebSource } from "./extras";
+export type { PickedFile } from "./api";
+
+/** A callback tool call (ask_user, pick_files) waiting on the person, from the stream, so it
+ *  survives a reload. `status`: this browser's last answer to it. */
+export interface PendingCallback {
+  agentId: string;
+  messageId: string;
+  part: ToolPart;
+  request: CallbackRequest;
+  status: CallbackStatus;
+}
+
 // -- the facade -----------------------------------------------------------------------------
 
 export interface ApproveOptions {
@@ -403,6 +421,17 @@ export interface CodingSession {
 
   /** Raw, in the order they started waiting. */
   pendingApprovals: readonly PendingApproval[];
+  /** ask_user / pick_files calls waiting on the person, in the order they started waiting. */
+  pendingCallbacks: readonly PendingCallback[];
+  /** Answer a waiting callback (`{option_id}` or `{paths}`). */
+  answerCallback(toolId: string, result: Record<string, unknown>): Promise<void>;
+  /** Decline a waiting callback; the agent sees `reason`. */
+  declineCallback(toolId: string, reason?: string): Promise<void>;
+  /** Upload one file for a pick_files call; `onProgress` gets 0..1. */
+  uploadPicked(toolId: string, file: File, onProgress?: (fraction: number) => void): Promise<PickedFile>;
+  /** Provider web search for the next turn (P4). */
+  webSearch: boolean;
+  setWebSearch(enabled: boolean): Promise<SendRecord>;
   /** Every live output chunk per tool id, accumulated (the harness keeps only the latest). */
   toolProgress: Readonly<Record<string, string>>;
   toolProgressChunks: Readonly<Record<string, readonly ToolProgressChunk[]>>;

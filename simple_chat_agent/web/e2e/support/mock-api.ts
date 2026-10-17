@@ -62,6 +62,10 @@ export interface MockOptions {
   onApprove?(body: Record<string, unknown>): Promise<void> | void;
   /** A session created through POST /sessions. */
   created?: Summary;
+  /** Fields merged over GET /api/agent/config (P4: web_search, mcp). */
+  config?: Record<string, unknown>;
+  /** P4: the MCP servers GET /mcp/servers lists. */
+  mcpServers?: Record<string, unknown>[];
 }
 
 let ids = 0;
@@ -70,6 +74,7 @@ export class MockApi {
   readonly calls: Captured[] = [];
   sessions: Summary[];
   signedIn: boolean;
+  mcpServers: Record<string, unknown>[];
   status = { current_turn: 1, turn_active: true, pending_turns: [] as unknown[], run_id: "run-1", worker: null as unknown };
 
   constructor(
@@ -80,6 +85,7 @@ export class MockApi {
   ) {
     this.sessions = [...(opts.sessions ?? [])];
     this.signedIn = !opts.signedOut;
+    this.mcpServers = [...(opts.mcpServers ?? [])];
   }
 
   /** Requests of one route, by method and a path prefix. */
@@ -141,7 +147,7 @@ export class MockApi {
       this.signedIn = true;
       return this.json(route, 200, { status: "ok", user_id: "local:demo", username: "demo" });
     }
-    if (path === "/api/agent/config") return this.json(route, 200, AGENT_CONFIG);
+    if (path === "/api/agent/config") return this.json(route, 200, { ...AGENT_CONFIG, ...(this.opts.config ?? {}) });
 
     if (path === "/api/agent/sessions" && method === "GET") return this.json(route, 200, this.sessions);
     if (path === "/api/agent/sessions" && method === "POST") {
@@ -175,6 +181,33 @@ export class MockApi {
       if (this.opts.postDelayMs) await new Promise((r) => setTimeout(r, this.opts.postDelayMs));
       await this.opts.onApprove?.(call.body ?? {});
       return this.json(route, 200, { tool_id: call.body?.tool_id ?? null, accepted: true });
+    }
+    // -- P4: callbacks and MCP ----------------------------------------------------------------
+    if (path === "/api/agent/callback-result" && method === "POST") {
+      return this.json(route, 200, { tool_id: call.body?.tool_id ?? null, accepted: true, request_id: call.body?.request_id ?? "req" });
+    }
+    m = /^\/api\/agent\/sessions\/([^/]+)\/callbacks\/([^/]+)\/files$/.exec(path);
+    if (m && method === "POST") {
+      const name = /filename="([^"]+)"/.exec(req.postData() ?? "")?.[1] ?? "file.txt";
+      return this.json(route, 200, { path: `uploads/${name}`, name, size: 12 });
+    }
+    if (path === "/api/agent/mcp/servers" && method === "GET") return this.json(route, 200, { enabled: true, reason: null, servers: this.mcpServers });
+    if (path === "/api/agent/mcp/servers" && method === "POST") {
+      const b = call.body ?? {};
+      const server = { name: b.name, url: b.url, auth_mode: b.auth_mode, has_credentials: b.auth_mode === "bearer", added_at: Date.now() / 1000, tool_prefix: `mcp__${String(b.name)}__` };
+      this.mcpServers = [server, ...this.mcpServers.filter((x) => x.name !== b.name)];
+      return this.json(route, 200, { server: { ...server, status: "connected", tools: [{ name: `mcp__${String(b.name)}__echo`, mcp_name: "echo" }] } });
+    }
+    m = /^\/api\/agent\/mcp\/servers\/([^/]+)\/status$/.exec(path);
+    if (m) {
+      const s = this.mcpServers.find((x) => x.name === decodeURIComponent(m![1]!));
+      return s ? this.json(route, 200, { ...s, status: "connected", code: null, message: null, tools: [] }) : this.json(route, 404, { error: "not_found", message: "No such MCP server." });
+    }
+    m = /^\/api\/agent\/mcp\/servers\/([^/]+)$/.exec(path);
+    if (m && method === "DELETE") {
+      const name = decodeURIComponent(m[1]!);
+      this.mcpServers = this.mcpServers.filter((x) => x.name !== name);
+      return this.json(route, 200, { removed: true, name });
     }
     return this.json(route, 404, { error: "not_mocked", message: `${method} ${path} is not mocked` });
   }

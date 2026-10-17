@@ -12,12 +12,13 @@
 // * After Stop, the reply text that followed the last tool call is folded as "Discarded".
 
 import type { Message, ModelInteractionPart, SubagentPart, ToolPart, TurnRecovery } from "../session";
+import { nestHostCalls } from "../session/extras";
 import { GROUPABLE, SUBAGENT_TOOLS, wordCount } from "./toolInfo";
 
 export type Item =
   | { kind: "thinking"; key: string; callIndex: number; model: string | null; text: string; thoughtTokens: number | null; running: boolean }
   | { kind: "text"; key: string; text: string; streaming: boolean }
-  | { kind: "tool"; key: string; part: ToolPart }
+  | { kind: "tool"; key: string; part: ToolPart; hostCalls?: ToolPart[] }
   | { kind: "group"; key: string; label: string; parts: ToolPart[] }
   | { kind: "subagents"; key: string; parts: SubagentPart[] }
   | { kind: "attempt"; key: string; attempt: number; words: number; text: string }
@@ -58,7 +59,9 @@ export interface BuildOptions {
 }
 
 export function buildItems(message: Pick<Message, "id" | "parts">, options: BuildOptions): Item[] {
-  const segs = segments(message.parts);
+  // A Code Mode script's host calls (`<script id>/<n>`) sit under the script's row.
+  const nested = nestHostCalls(message.parts);
+  const segs = segments(nested.parts);
   const lastCall = Math.max(-1, ...segs.map((s) => s.callIndex));
   const items: Item[] = [];
   let attempts = 0;
@@ -93,6 +96,12 @@ export function buildItems(message: Pick<Message, "id" | "parts">, options: Buil
       }
     }
     pushContent(items, seg.parts, key, options.live);
+  }
+  for (const it of items) {
+    if (it.kind === "tool") {
+      const calls = nested.hostCalls.get(it.part.toolId);
+      if (calls) it.hostCalls = calls;
+    }
   }
 
   // Stop: the trailing reply text (after the last tool call) was thrown away.

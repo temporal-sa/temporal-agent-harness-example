@@ -30,6 +30,7 @@ import { ViewLinks, viewDefs } from "../shell/ViewLinks";
 import { TranscriptPane } from "../transcript/Transcript";
 import type { TranscriptContextValue } from "../transcript/context";
 import { postureLabel } from "../composer/choices";
+import { McpDialog, mcpReturnNotice } from "../mcp/McpDialog";
 import { DecisionDock, Workbench, WorkerBanner } from "./slots";
 
 type Boot =
@@ -91,6 +92,14 @@ function Shell({ me, auth, onUnreachable }: { me: Me; auth: AuthConfig; onUnreac
   const [selected, setSelected] = useState<string | null>(sessionFromUrl);
   const [creating, setCreating] = useState<"demo" | "empty" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  // Back from an MCP OAuth sign-in: say how it went, then clear the query (keeping ?s=).
+  const [mcpNotice, setMcpNotice] = useState(() => mcpReturnNotice(window.location.search));
+  useEffect(() => {
+    if (!mcpNotice) return;
+    const url = new URL(window.location.href);
+    for (const k of ["mcp", "mcp_server", "mcp_error"]) url.searchParams.delete(k);
+    window.history.replaceState({}, "", url);
+  }, [mcpNotice]);
 
   const fail = useCallback(
     (err: unknown, fallback: string, set: (m: string) => void) => {
@@ -191,6 +200,8 @@ function Shell({ me, auth, onUnreachable }: { me: Me; auth: AuthConfig; onUnreac
     creating,
     actionError,
     clearActionError: () => setActionError(null),
+    mcpNotice,
+    clearMcpNotice: () => setMcpNotice(null),
     select,
     create,
     refresh,
@@ -218,6 +229,8 @@ interface ShellParts {
   creating: "demo" | "empty" | null;
   actionError: string | null;
   clearActionError(): void;
+  mcpNotice: { ok: boolean; text: string } | null;
+  clearMcpNotice(): void;
   select(id: string | null): void;
   create(kind: "demo" | "empty"): Promise<void>;
   refresh(): Promise<void>;
@@ -260,6 +273,9 @@ function Layout({ parts, session, page = { kind: "landing" } }: { parts: ShellPa
   const phone = useMaxWidth(600);
   const [drawer, setDrawer] = useState(false);
   const [sheet, setSheet] = useState<"changes" | "terminal" | null>(null);
+  // The MCP servers dialog; `reconnect` when a transcript chip opened it for one server.
+  const [mcp, setMcp] = useState<{ reconnect: string | null } | null>(null);
+  const mcpFeature = parts.config?.mcp?.enabled ? parts.config.mcp : null;
   const rail = (presenter || narrow) && !phone;
 
   // A stream that gave up: is the app down, or only this session's stream?
@@ -324,19 +340,32 @@ function Layout({ parts, session, page = { kind: "landing" } }: { parts: ShellPa
         },
         postureLabel: (id: string) => postureLabel(config, id),
         workerAnswering: session.status !== "worker_unresponsive",
+        ...(config?.mcp?.enabled ? { openMcp: (server: string) => setMcp({ reconnect: server }) } : {}),
       },
     [session, config, modelName, phone],
   );
-  const notices = parts.actionError && (
-    <div className="notice" role="alert">
-      <span>{parts.actionError}</span>
-      <button type="button" className="btn ghost small" onClick={parts.clearActionError}>
-        Dismiss
-      </button>
-    </div>
+  const notices = (
+    <>
+      {parts.actionError && (
+        <div className="notice" role="alert">
+          <span>{parts.actionError}</span>
+          <button type="button" className="btn ghost small" onClick={parts.clearActionError}>
+            Dismiss
+          </button>
+        </div>
+      )}
+      {parts.mcpNotice && (
+        <div className={`notice${parts.mcpNotice.ok ? "" : " err"}`} role={parts.mcpNotice.ok ? "status" : "alert"}>
+          <span>{parts.mcpNotice.text}</span>
+          <button type="button" className="btn ghost small" onClick={parts.clearMcpNotice}>
+            Dismiss
+          </button>
+        </div>
+      )}
+    </>
   );
 
-  const modal = drawer || (sheet !== null && !!session && phone);
+  const modal = drawer || (sheet !== null && !!session && phone) || (mcp !== null && mcpFeature !== null);
 
   // The agent applies (or refuses) a model or posture change when its handler ends; then the
   // session list carries the new value, so refetch it once per such reply.
@@ -355,6 +384,13 @@ function Layout({ parts, session, page = { kind: "landing" } }: { parts: ShellPa
         demo={demo}
         status={session?.status ?? null}
         views={<ViewLinks views={views} />}
+        tools={
+          mcpFeature && (
+            <button type="button" className="toggle" aria-haspopup="dialog" onClick={() => setMcp({ reconnect: null })}>
+              MCP servers
+            </button>
+          )
+        }
         presenter={presenter}
         onPresenter={togglePresenter}
         onMenu={() => setDrawer(true)}
@@ -444,6 +480,8 @@ function Layout({ parts, session, page = { kind: "landing" } }: { parts: ShellPa
           </div>
         </Dialog>
       )}
+
+      {mcp && mcpFeature && <McpDialog feature={mcpFeature} reconnect={mcp.reconnect} onClose={() => setMcp(null)} />}
 
       {sheet && session && phone && (
         <Dialog className="sheet" label="Workbench" onClose={() => setSheet(null)}>

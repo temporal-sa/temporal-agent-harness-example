@@ -14,7 +14,8 @@ import {
 } from "react";
 import { HarnessProvider, HttpTransport, SessionStore, useAgentSession } from "@temporalio/agent-harness-react";
 
-import { AGENT_API_BASE, CLIENT_HEADERS, getStatus, readLog, uploadAttachment } from "./api";
+import { AGENT_API_BASE, ApiError, CLIENT_HEADERS, getStatus, readLog, sendCallbackResult, uploadAttachment, uploadPickedFile } from "./api";
+import { callbackRequest, callbackStatus, webSearchOn, type CallbackSend } from "./extras";
 import {
   alwaysApprovedFrom,
   FORGET_HANDLER,
@@ -40,6 +41,7 @@ import type {
   ChangesState,
   CodingSession,
   ModelChoice,
+  PendingCallback,
   PlanState,
   Posture,
   SendKind,
@@ -143,6 +145,52 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
       });
     },
     [sessionId],
+  );
+
+  // This browser's answers to callbacks (ask_user, pick_files), per session, by tool id.
+  const [callbackState, setCallbackState] = useState<{ id: string; byTool: Readonly<Record<string, CallbackSend>> }>({ id: sessionId, byTool: {} });
+  const callbackSends = callbackState.id === sessionId ? callbackState.byTool : {};
+  const putCallback = useCallback(
+    (send: CallbackSend) => {
+      setCallbackState((s) => {
+        const byTool = s.id === sessionId ? s.byTool : {};
+        // A later answer replaces an earlier one; a stale reply for an earlier one is dropped.
+        const current = byTool[send.toolId];
+        if (current && current.requestId !== send.requestId && send.phase !== "sending") return s;
+        return { id: sessionId, byTool: { ...byTool, [send.toolId]: send } };
+      });
+    },
+    [sessionId],
+  );
+  const callbackRun = useCallback(
+    async (toolId: string, action: "answer" | "decline", payload: { result?: unknown; error?: string }) => {
+      const requestId = `cb-${Date.now().toString(36)}-${++localIds}`;
+      const base: CallbackSend = { toolId, requestId, action, phase: "sending", error: null, errorCode: null, errorStatus: null };
+      putCallback(base);
+      try {
+        await sendCallbackResult({ session_id: sessionId, tool_id: toolId, request_id: requestId, ...payload });
+        putCallback({ ...base, phase: "sent" });
+      } catch (err) {
+        const e = err instanceof ApiError ? err : null;
+        putCallback({
+          ...base,
+          phase: "failed",
+          error: err instanceof Error ? err.message : String(err),
+          errorCode: e?.code ?? null,
+          errorStatus: e ? e.status : 0,
+        });
+      }
+    },
+    [sessionId, putCallback],
+  );
+  const pendingCallbacks = useMemo<PendingCallback[]>(
+    () =>
+      h.pendingCallbacks.map((w) => ({
+        ...w,
+        request: callbackRequest(w.part.toolName, w.part.input),
+        status: callbackStatus(callbackSends[w.part.toolId], telemetry.rejections),
+      })),
+    [h.pendingCallbacks, callbackSends, telemetry.rejections],
   );
 
   // Advance records from what the stream shows.
@@ -255,6 +303,7 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
 
     status: sessionStatus({
       pendingApprovals,
+      pendingCallbacks: pendingCallbacks.length,
       anyBusy,
       worker: telemetry.worker,
       waitingForWorker: stuckInTemporal(sends, now),
@@ -274,6 +323,12 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
     workspace: asObject<WorkspaceState>(states.workspace),
 
     pendingApprovals,
+    pendingCallbacks,
+    answerCallback: (toolId, result) => callbackRun(toolId, "answer", { result }),
+    declineCallback: (toolId, reason) => callbackRun(toolId, "decline", { error: reason?.trim() || "The user declined." }),
+    uploadPicked: (toolId, file, onProgress) => uploadPickedFile(sessionId, toolId, file, onProgress),
+    webSearch: webSearchOn(h.messages, false),
+    setWebSearch: (enabled: boolean) => runMessage("set_web_search", "set_web_search", { enabled }),
     toolProgress: progress.text,
     toolProgressChunks: progress.chunks,
     sandbox: progress.sandbox,

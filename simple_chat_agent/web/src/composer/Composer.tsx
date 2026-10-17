@@ -237,6 +237,41 @@ function PostureMenu({ session, config }: { session: CodingSession; config: Agen
   );
 }
 
+/** The provider's web search, per session (P4). Its searches run inside the provider, so they
+ *  are never approved one by one; it applies from the next turn. */
+function WebSearchToggle({ session }: { session: CodingSession }) {
+  const [pending, setPending] = useState<{ on: boolean; recordId: string | null } | null>(null);
+  const record = pending?.recordId ? session.sends.find((r) => r.id === pending.recordId) : undefined;
+  useEffect(() => {
+    if (record && record.phase !== "sending" && record.phase !== "in_temporal") setPending(null);
+  }, [record]);
+  const on = pending?.on ?? session.webSearch;
+  async function toggle() {
+    const next = !on;
+    setPending({ on: next, recordId: null });
+    const r = await session.setWebSearch(next);
+    setPending((p) => (p && p.on === next ? { on: next, recordId: r.id } : p));
+  }
+  return (
+    <>
+      <button
+        type="button"
+        className="ctl search"
+        aria-pressed={on}
+        title="The model provider searches the web itself. Its searches aren't approved one by one. Applies from the next turn."
+        onClick={() => void toggle()}
+      >
+        Web search
+      </button>
+      {on && (
+        <span className="search-on" role="status">
+          Web search on
+        </span>
+      )}
+    </>
+  );
+}
+
 export function Composer({ session, config }: { session: CodingSession; config: AgentConfig | null }) {
   const [draft, setDraft] = useState("");
   const [uploads, setUploads] = useState<Upload[]>([]);
@@ -347,6 +382,7 @@ export function Composer({ session, config }: { session: CodingSession; config: 
             <span className="ctl-text"> File</span>
           </button>
           <input ref={fileInput} type="file" multiple hidden onChange={(e) => void onFiles(e.target.files)} />
+          {config?.web_search?.available && <WebSearchToggle session={session} />}
           <span className="spacer" />
           {busy && typed && (
             <span className="split">

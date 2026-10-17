@@ -113,6 +113,17 @@ export interface AgentConfig extends AgentCatalog {
   default_tool_risk_class?: string;
   /** How long sessions are kept (days). */
   session_ttl_days?: number;
+  /** P4: the provider's built-in web search (off by default, per session). */
+  web_search?: { available: boolean; default: boolean };
+  /** P4: MCP servers (local only). */
+  mcp?: McpFeature;
+}
+
+export interface McpFeature {
+  enabled: boolean;
+  reason: string | null;
+  max_servers?: number;
+  auth_modes?: McpAuthMode[];
 }
 
 export const getAgentConfig = () => request<AgentConfig>(`${AGENT_API_BASE}config`);
@@ -148,6 +159,7 @@ export interface CreateSessionBody {
   title?: string;
   model?: ModelChoice;
   posture?: Posture;
+  web_search?: boolean;
 }
 
 export const createSession = (body: CreateSessionBody) =>
@@ -189,3 +201,81 @@ export interface AgentStatus {
 }
 
 export const getStatus = (workflowId: string) => request<AgentStatus>(`${AGENT_API_BASE}status/${encodeURIComponent(workflowId)}`);
+
+// -- pick_files uploads (P4, A12) ----------------------------------------------------------------
+
+export interface PickedFile {
+  path: string;
+  name: string;
+  size: number;
+}
+
+/** POST /sessions/{sid}/callbacks/{tool_id}/files, one file, with upload progress (0..1).
+ *  XMLHttpRequest because fetch can't report upload progress. */
+export function uploadPickedFile(sessionId: string, toolId: string, file: File, onProgress?: (fraction: number) => void): Promise<PickedFile> {
+  const url = `${AGENT_API_BASE}sessions/${encodeURIComponent(sessionId)}/callbacks/${encodeURIComponent(toolId)}/files`;
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.withCredentials = true;
+    for (const [k, v] of Object.entries(CLIENT_HEADERS)) xhr.setRequestHeader(k, v);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) onProgress(e.total > 0 ? e.loaded / e.total : 0);
+    };
+    xhr.onerror = () => reject(new ApiError("Network error", 0));
+    xhr.onload = () => {
+      let body: Record<string, unknown> = {};
+      try {
+        body = xhr.responseText ? (JSON.parse(xhr.responseText) as Record<string, unknown>) : {};
+      } catch {
+        body = {};
+      }
+      if (xhr.status >= 200 && xhr.status < 300 && typeof body.path === "string") {
+        resolve({ path: body.path, name: typeof body.name === "string" ? body.name : file.name, size: typeof body.size === "number" ? body.size : file.size });
+        return;
+      }
+      const message = typeof body.message === "string" ? body.message : `${xhr.status} ${xhr.statusText}`;
+      reject(new ApiError(message, xhr.status, typeof body.error === "string" ? body.error : null));
+    };
+    const form = new FormData();
+    form.append("file", file, file.name);
+    xhr.send(form);
+  });
+}
+
+/** POST /callback-result: an answer (`result`) or a decline (`error`), with our request id so
+ *  an x_rejected for it can be matched. */
+export const sendCallbackResult = (body: { session_id: string; tool_id: string; request_id: string; result?: unknown; error?: string }) =>
+  request<{ tool_id: string; accepted: boolean; request_id: string }>(`${AGENT_API_BASE}callback-result`, { method: "POST", body: JSON.stringify(body) });
+
+// -- MCP servers (P4, A8; local only) ------------------------------------------------------------
+
+export type McpAuthMode = "none" | "bearer" | "oauth";
+export type McpStatus = "connected" | "needs_reauth" | "unreachable" | "blocked";
+
+export interface McpServer {
+  name: string;
+  url: string;
+  auth_mode: McpAuthMode;
+  has_credentials: boolean;
+  added_at: number | string | null;
+  tool_prefix: string;
+  status?: McpStatus;
+  code?: string | null;
+  message?: string | null;
+  tools?: { name: string; mcp_name: string }[];
+}
+
+export const listMcpServers = () =>
+  request<{ enabled: boolean; reason: string | null; servers: McpServer[] }>(`${AGENT_API_BASE}mcp/servers`);
+
+export const addMcpServer = (body: { name: string; url: string; auth_mode: "none" | "bearer"; bearer_token?: string }) =>
+  request<{ server: McpServer }>(`${AGENT_API_BASE}mcp/servers`, { method: "POST", body: JSON.stringify(body) });
+
+export const removeMcpServer = (name: string) =>
+  request<{ removed: boolean; name: string }>(`${AGENT_API_BASE}mcp/servers/${encodeURIComponent(name)}`, { method: "DELETE" });
+
+export const mcpServerStatus = (name: string) => request<McpServer>(`${AGENT_API_BASE}mcp/servers/${encodeURIComponent(name)}/status`);
+
+export const startMcpOAuth = (body: { name: string; url: string }) =>
+  request<{ authorization_url: string; flow_id: string }>(`${AGENT_API_BASE}mcp/oauth/start`, { method: "POST", body: JSON.stringify(body) });

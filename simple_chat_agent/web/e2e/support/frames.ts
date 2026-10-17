@@ -121,6 +121,21 @@ export const toolProgress = (t: TurnRef, toolId: string, toolName: string, delta
 export const toolEnd = (t: TurnRef, toolId: string, toolName: string, output: string) =>
   ev(t, "tool_end", { tool_id: toolId, tool_name: toolName, tool_output: output });
 
+export const toolError = (t: TurnRef, toolId: string, toolName: string, message: string) =>
+  ev(t, "tool_error", { tool_id: toolId, tool_name: toolName, message });
+
+/** A callback tool (ask_user, pick_files) waiting on the browser: requested, started, waiting. */
+export function callbackWaits(t: TurnRef, toolId: string, toolName: string, input: Record<string, unknown>): Frame[] {
+  return [
+    toolRequested(t, toolId, toolName, input),
+    toolStart(t, toolId, toolName, input),
+    ev(t, "callback_requested", { tool_id: toolId, tool_name: toolName, tool_input: input, output_schema: {} }),
+  ];
+}
+
+export const callbackResolved = (t: TurnRef, toolId: string, toolName: string, outcome: "ok" | "error" | "timeout") =>
+  ev(t, "callback_resolved", { tool_id: toolId, tool_name: toolName, outcome, error: null }, null);
+
 /** A read-only tool that runs without asking. */
 export function quickTool(t: TurnRef, toolId: string, toolName: string, input: Record<string, unknown>, output: string): Frame[] {
   return [toolRequested(t, toolId, toolName, input), toolStart(t, toolId, toolName, input), toolEnd(t, toolId, toolName, output)];
@@ -271,7 +286,7 @@ export function xWorker(
   };
 }
 
-export function xRejected(requestId: string, o: { kind: "approval" | "message"; toolId?: string; messageId?: string; code: string; reason: string }): Frame {
+export function xRejected(requestId: string, o: { kind: "approval" | "message" | "callback"; toolId?: string; messageId?: string; code: string; reason: string }): Frame {
   return {
     event: "x_rejected",
     data: {

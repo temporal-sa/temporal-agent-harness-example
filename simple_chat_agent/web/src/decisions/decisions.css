@@ -160,3 +160,32 @@
   .dc-judge .score { grid-column: 2; }
   .dc-judge .why { grid-column: 1 / 3; }
 }
+
+/* Callback cards (P4, A12): ask_user choices and the pick_files chooser. Same family as the
+   approval card; the status footer is a fixed two lines so the buttons above never move. */
+.dc-card .badge.agent { color: var(--purple); }
+.dc-card.cb .dc-foot { height: 2.4rem; align-items: flex-start; }
+.dc-card.cb .dc-foot .held { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.dc-card.cb .dc-foot .held.err { color: var(--red); }
+.dc-card .choices { list-style: none; margin: 0; padding: 0; display: grid; gap: .35rem; }
+.dc-card .choice {
+  width: 100%; display: grid; gap: .15rem; text-align: left; padding: .5rem .7rem; border: 1px solid var(--uv-light);
+  background: #111116; color: var(--off-white); font-family: var(--sans); font-size: .88rem; min-height: 2.6rem;
+}
+.dc-card .choice:hover:not(:disabled) { border-color: var(--green); background: rgba(31, 241, 165, .06); }
+.dc-card .choice:focus-visible { outline: none; box-shadow: var(--focus); }
+.dc-card .choice:disabled { opacity: .55; cursor: default; }
+.dc-card .choice .label { font-weight: 600; }
+.dc-card .drop {
+  display: flex; gap: .7rem; align-items: center; flex-wrap: wrap; padding: .7rem; border: 1px dashed var(--slate-500); background: #111116;
+}
+.dc-card .drop.over { border-color: var(--green); background: rgba(31, 241, 165, .06); }
+.dc-card .picked { list-style: none; margin: 0; padding: 0; display: grid; gap: .25rem; }
+.dc-card .picked li { display: flex; gap: .6rem; align-items: center; font-size: .82rem; min-height: 1.9rem; }
+.dc-card .picked .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.dc-card .picked progress { width: 7rem; accent-color: var(--green); }
+.dc-card .picked li.bad .name { color: var(--red); }
+@media (max-width: 600px) {
+  .dc-card .choice { min-height: 44px; }
+  .dc-card.cb .dc-foot { height: 2.6rem; }
+}

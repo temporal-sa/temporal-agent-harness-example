@@ -226,7 +226,7 @@ export function foldFrames(acc: TelemetryAcc, frames: readonly RawFrame[]): bool
         const requestId = d && (str(d.request_id) ?? str(d.message_id) ?? str(d.id));
         if (!d || !requestId) break;
         const code = str(d.code) ?? str(d.type);
-        const kind = d.kind === "approval" || d.kind === "message" ? d.kind : null;
+        const kind = d.kind === "approval" || d.kind === "message" || d.kind === "callback" ? d.kind : null;
         acc.rejections.set(requestId, {
           requestId,
           kind,

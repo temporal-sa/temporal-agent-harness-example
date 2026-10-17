@@ -124,12 +124,14 @@ export function subagentsOf(
 
 export function sessionStatus(input: {
   pendingApprovals: readonly PendingApproval[];
+  /** ask_user / pick_files calls waiting on the person. */
+  pendingCallbacks?: number;
   anyBusy: boolean;
   worker: WorkerHealth;
   waitingForWorker: boolean;
 }): SessionStatus {
   // Calls the judge is still deciding don't wait on you yet: the turn is running.
-  if (input.pendingApprovals.some((w) => !w.judging)) return "waiting_for_you";
+  if (input.pendingApprovals.some((w) => !w.judging) || (input.pendingCallbacks ?? 0) > 0) return "waiting_for_you";
   if (input.pendingApprovals.length > 0) return "running";
   if ((input.anyBusy && !input.worker.answering) || input.waitingForWorker) return "worker_unresponsive";
   if (input.anyBusy) return "running";

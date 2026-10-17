@@ -8,6 +8,7 @@ import { DiffView, JudgeCards } from "../app/slots";
 import { useTranscript } from "./context";
 import { ErrorNote } from "./ErrorNote";
 import { argPreview, commandSummary, decisionBadge, miniDiff, pathsOf, toolBadge, type MiniDiff } from "./toolInfo";
+import { reauthServer, scriptError, SCRIPT_TOOL, toolDisplayName } from "../session/extras";
 
 function useElapsed(running: boolean): number | null {
   const since = useRef<number | null>(null);
@@ -39,15 +40,19 @@ function StateBadge({ part, elapsed }: { part: ToolPart; elapsed: number | null 
     }
     case "denied":
       return <span className="badge leaving">{decisionBadge(part) ?? "Declined"}</span>;
+    case "awaiting_callback":
+      // The question or file request waits on the decision dock, durably in Temporal.
+      if (session.pendingCallbacks?.some((c) => c.part.toolId === part.toolId)) return <span className="badge idle">waiting · see card</span>;
+      return <span className="exit run">waiting</span>;
     case "requested":
     case "approved":
     case "running":
-    case "awaiting_callback":
       if (!workerAnswering) return <span className="exit wait">waiting for a Worker{elapsed !== null ? ` · ${clock(elapsed)}` : ""}</span>;
       return <span className="exit run">running{elapsed !== null ? ` ${clock(elapsed)}` : ""}</span>;
     case "failed":
       return <span className="badge error">Failed</span>;
     case "done":
+      if (scriptError(part)) return <span className="badge error">Failed</span>;
       if (cmd) {
         if (cmd.timedOut) return <span className="exit fail">timed out</span>;
         if (cmd.exitCode === 0) return <span className="exit ok">exit 0</span>;
@@ -121,8 +126,73 @@ function OutputPanel({ part }: { part: ToolPart }) {
   );
 }
 
-export function ToolRow({ part, nested = false }: { part: ToolPart; nested?: boolean }) {
-  const { openFile, session } = useTranscript();
+/** How many host calls show under a script before they fold into one line. */
+export const HOST_CALLS_SHOWN = 5;
+
+/** "62 host calls · 2 running · 1 failed". */
+export function hostCallsLabel(calls: readonly ToolPart[]): string {
+  const running = calls.filter((c) => c.state === "running" || c.state === "requested" || c.state === "approved").length;
+  const failed = calls.filter((c) => c.state === "failed").length;
+  const parts = [`${calls.length} host ${calls.length === 1 ? "call" : "calls"}`];
+  if (running) parts.push(`${running} running`);
+  if (failed) parts.push(`${failed} failed`);
+  return parts.join(" · ");
+}
+
+function HostCalls({ calls }: { calls: readonly ToolPart[] }) {
+  const [open, setOpen] = useState(false);
+  if (calls.length === 0) return null;
+  if (calls.length <= HOST_CALLS_SHOWN) {
+    return (
+      <div className="host-calls" role="group" aria-label={hostCallsLabel(calls)}>
+        {calls.map((c) => (
+          <ToolRow key={c.toolId} part={c} nested />
+        ))}
+      </div>
+    );
+  }
+  return (
+    <div className="host-calls">
+      <button type="button" className="attempt" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
+        <span className="chev" aria-hidden="true">
+          {open ? "▾" : "▸"}
+        </span>
+        {hostCallsLabel(calls)}
+      </button>
+      {open && (
+        <div className="group-items">
+          {calls.map((c) => (
+            <ToolRow key={c.toolId} part={c} nested />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScriptBlock({ script }: { script: string }) {
+  const [open, setOpen] = useState(false);
+  const lines = script ? script.split("\n").length : 0;
+  if (!script) return null;
+  return (
+    <div className="script">
+      <button type="button" className="attempt" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
+        <span className="chev" aria-hidden="true">
+          {open ? "▾" : "▸"}
+        </span>
+        {open ? "Hide the script" : `Show the script (${lines} ${lines === 1 ? "line" : "lines"})`}
+      </button>
+      {open && (
+        <pre className="script-src" tabIndex={0}>
+          {script}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+export function ToolRow({ part, nested = false, hostCalls }: { part: ToolPart; nested?: boolean; hostCalls?: readonly ToolPart[] }) {
+  const { openFile, session, openMcp } = useTranscript();
   const [open, setOpen] = useState(false);
   const badge = toolBadge(part.toolName);
   const running = part.state === "running" || part.state === "approved" || part.state === "requested" || part.state === "awaiting_callback";
@@ -132,6 +202,7 @@ export function ToolRow({ part, nested = false }: { part: ToolPart; nested?: boo
   // The parsed output (part.progress is the raw, tagged chunk).
   const live = session.toolProgress[part.toolId];
   const liveLine = running && live ? live.trimEnd().split("\n").pop() ?? "" : "";
+  const reauth = reauthServer(part);
 
   return (
     <>
@@ -140,7 +211,7 @@ export function ToolRow({ part, nested = false }: { part: ToolPart; nested?: boo
         <button type="button" className="tool-row" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
           <span className={`badge ${badge.kind}`}>{badge.label}</span>
           <span className="name">
-            {part.toolName} <span className="arg">{argPreview(part)}</span>
+            {toolDisplayName(part.toolName)} <span className="arg">{argPreview(part)}</span>
           </span>
           <span className="t">
             {diff && (diff.added > 0 || diff.removed > 0) && (
@@ -154,8 +225,21 @@ export function ToolRow({ part, nested = false }: { part: ToolPart; nested?: boo
         {liveLine && <div className="live">{liveLine}</div>}
         {diff && <DiffBlock diff={diff} path={paths[0] ?? ""} />}
         {part.state === "denied" && part.approval?.reason && <div className="live">Your reason: {part.approval.reason}</div>}
+        {part.toolName === SCRIPT_TOOL && <ScriptBlock script={typeof part.input?.script === "string" ? part.input.script : ""} />}
+        {hostCalls && <HostCalls calls={hostCalls} />}
         {part.state === "failed" && part.error && (
-          <ErrorNote text="The call failed. The agent sees the error and decides what to do next." detail={part.error} />
+          <ErrorNote
+            text={reauth ? `The MCP server ${reauth} needs you to reconnect. Reconnect it, then ask the agent to try again.` : "The call failed. The agent sees the error and decides what to do next."}
+            detail={part.error}
+          />
+        )}
+        {scriptError(part) && <ErrorNote text="The script failed. The agent sees the error and decides what to do next." detail={scriptError(part)!} />}
+        {reauth && openMcp && (
+          <div className="chips">
+            <button type="button" className="path reconnect" onClick={() => openMcp(reauth)}>
+              Reconnect {reauth}
+            </button>
+          </div>
         )}
         {paths.length > 0 && (
           <div className="chips">

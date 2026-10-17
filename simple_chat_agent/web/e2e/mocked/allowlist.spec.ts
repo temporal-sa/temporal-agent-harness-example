@@ -59,7 +59,7 @@ test("the demo script's requests are all on the allowlist", async ({ page, mockA
   // Reached only in other states: a session opened by URL that the list lacks, a stream that
   // ended (the mock keeps it open), and the browser's own favicon request.
   const conditional = new Set(["GET /favicon.ico", "GET /api/agent/sessions/{id}", "GET /api/agent/workflow-status/{id}"]);
-  const expected = ALLOWED.map((a) => a.route).filter((r) => !conditional.has(r));
+  const expected = ALLOWED.filter((a) => !a.feature).map((a) => a.route).filter((r) => !conditional.has(r));
   expect(expected.filter((r) => !hit.has(r)), "allowed routes this walk didn't reach").toEqual([]);
   test.info().annotations.push({ type: "routes", description: [...hit].join(", ") });
   void baseURL;
