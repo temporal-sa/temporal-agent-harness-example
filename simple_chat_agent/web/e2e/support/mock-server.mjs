@@ -1,4 +1,4 @@
-// The mocked project's server: the built app (web/dist) at /app/, and a scripted SSE stream at
+// The mocked project's server: the built app (web/dist) at /, and a scripted SSE stream at
 // /api/agent/attach. Every other /api route is mocked in the page with page.route (see
 // mock-api.ts); attach falls through to here because page.route can only fulfill a whole body,
 // and a real attach stays open while a turn runs.
@@ -81,14 +81,14 @@ function json(res, status, value) {
 }
 
 async function serveStatic(res, path) {
-  const rel = normalize(path.replace(/^\/app\/?/, "")).replace(/^(\.\.(\/|\\|$))+/, "");
+  const rel = normalize(path.replace(/^\/+/, "")).replace(/^(\.\.(\/|\\|$))+/, "");
   let file = join(DIST, rel || "index.html");
   if (!file.startsWith(DIST)) return json(res, 404, { error: "not_found" });
   try {
     const st = await stat(file);
     if (st.isDirectory()) file = join(file, "index.html");
   } catch {
-    // SPA fallback, like the API's /app/{path} route (assets/ 404s there).
+    // SPA fallback, like the API's /{path} route (assets/ 404s there).
     if (rel.startsWith("assets/")) return json(res, 404, { error: "not_found" });
     file = join(DIST, "index.html");
   }
@@ -141,18 +141,21 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    if (path === "/app") {
-      res.writeHead(307, { Location: `/app/${url.search}` });
+    // Old /app/ links redirect to the same path at the root, like the API.
+    if (path === "/app" || path.startsWith("/app/")) {
+      res.writeHead(307, { Location: `/${path.replace(/^\/app\/?/, "").replace(/^[/\\]+/, "")}${url.search}` });
       return res.end();
     }
-    if (path.startsWith("/app/")) return serveStatic(res, path);
-    // Everything else under /api is mocked in the page; reaching here is a gap in the mock.
-    return json(res, 404, { error: "not_mocked", message: `${req.method} ${path} is not mocked.` });
+    // Everything under /api is mocked in the page; reaching here is a gap in the mock.
+    if (path === "/api" || path.startsWith("/api/") || path.startsWith("/__mock/")) {
+      return json(res, 404, { error: "not_mocked", message: `${req.method} ${path} is not mocked.` });
+    }
+    return serveStatic(res, path);
   } catch (err) {
     return json(res, 500, { error: "mock_server", message: String(err) });
   }
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`mock server on http://127.0.0.1:${PORT}/app/ (dist: ${DIST})`);
+  console.log(`mock server on http://127.0.0.1:${PORT}/ (dist: ${DIST})`);
 });

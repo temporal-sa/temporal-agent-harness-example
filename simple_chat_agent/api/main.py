@@ -15,7 +15,6 @@ from fastapi.responses import (
     RedirectResponse,
     Response,
 )
-from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
 from temporalio.client import Client
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
@@ -138,17 +137,6 @@ app = FastAPI(lifespan=lifespan)
 # Starlette excludes text/event-stream from gzip, so live SSE latency is not
 # traded for buffering while large JSON state snapshots still compress.
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
-
-# Serve the built UI from the API in catalog deployments and local development.
-_STATIC_DIR = Path(__file__).resolve().parent.parent / "frontend" / "static"
-_FRONTEND_INDEX = _STATIC_DIR / "dist" / "index.html"
-app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
-
-
-@app.get("/")
-async def index() -> FileResponse:
-    return FileResponse(_FRONTEND_INDEX)
-
 
 @app.get("/api/me")
 async def me(request: Request) -> dict[str, Any]:
@@ -583,10 +571,15 @@ _agent_api = AgentApi(current_user=lambda request: _current_user(request))
 app.state.agent_api = _agent_api
 app.include_router(_agent_api.router(app_store=_store), prefix="/api/agent")
 
-# The product view (P3): the Vite build in simple_chat_agent/web/dist at /app/, behind the same
-# catalog / local auth as /api/agent. Unknown paths fall back to index.html (client routing);
-# a missing asset under assets/ is a 404. Without a build, /app/ explains how to make one.
-_APP_PATH = "/app"
+# The product view: the Vite build in simple_chat_agent/web/dist at /, behind the same catalog /
+# local auth as /api/agent. Unknown paths fall back to index.html (client routing); a missing
+# asset under assets/ is a 404, and so is anything under the API's own prefixes. Without a build,
+# / explains how to make one. The P3/P4 address /app/... redirects to the same path at /, so old
+# links and bookmarks still land. The catch-all route is registered last (after the console).
+_LEGACY_APP_PATH = "/app"
+# Paths the SPA fallback must never answer with index.html.
+_NOT_APP_PREFIXES = ("api/", "internal/", "console/", "static/")
+_NOT_APP_PATHS = {"api", "internal", "console", "healthz"}
 _APP_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
@@ -627,7 +620,8 @@ def _app_sign_in(request: Request) -> HTMLResponse:
             "<p>Your sign-in didn't reach the app. Reload the page; if it keeps happening, "
             "sign in again through the catalog.</p>"
             if catalog_auth_enabled()
-            else '<p>Sign in on the <a href="/">main page</a>, then come back.</p>'
+            else "<p>Local sign-in is off. Set <code>SIMPLE_CHAT_LOCAL_AUTH_ENABLED=1</code> "
+            "(with local credentials) and restart the API.</p>"
         )
         return _app_page(401, "Sign in to continue", hint)
     login = json.dumps(f"{request.scope.get('root_path', '')}/api/auth/local/login")
@@ -645,14 +639,28 @@ def _app_sign_in(request: Request) -> HTMLResponse:
     return _app_page(401, "Sign in to continue", form)
 
 
-@app.api_route(_APP_PATH, methods=["GET", "HEAD"], include_in_schema=False)
-async def app_redirect(request: Request) -> Response:
+# The harness console (P2 step 2.4): its unchanged static UI at /console/, talking to our own
+# owner-scoped routes at /console/api/. CONSOLE_ENABLED; on by default only for
+# AGENT_ENVIRONMENT=local. Mounted last so its static mount can't shadow other routes.
+app.state.console_enabled = mount_console(app, _agent_api, app_store=_store)
+
+
+@app.api_route(_LEGACY_APP_PATH, methods=["GET", "HEAD"], include_in_schema=False)
+@app.api_route(_LEGACY_APP_PATH + "/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
+async def legacy_app_redirect(request: Request, path: str = "") -> Response:
+    # Strip leading slashes and backslashes so /app//evil.example can't become a
+    # protocol-relative redirect off this origin.
+    rest = path.lstrip("/\\")
     query = f"?{request.url.query}" if request.url.query else ""
-    return RedirectResponse(f"{request.scope.get('root_path', '')}{_APP_PATH}/{query}")
+    return RedirectResponse(f"{request.scope.get('root_path', '')}/{rest}{query}")
 
 
-@app.api_route(_APP_PATH + "/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
-async def app_page(request: Request, path: str) -> Response:
+@app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+@app.api_route("/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
+async def app_page(request: Request, path: str = "") -> Response:
+    not_found = Response("Not found", status_code=404, media_type="text/plain", headers=_APP_HEADERS)
+    if path in _NOT_APP_PATHS or path.startswith(_NOT_APP_PREFIXES):
+        return not_found
     try:
         _current_user(request)
     except HTTPException as err:
@@ -668,7 +676,6 @@ async def app_page(request: Request, path: str) -> Response:
             "<p>Run <code>make web</code> in the repo root, then reload. "
             "For live reload while you work, run <code>make web-dev</code> instead.</p>",
         )
-    not_found = Response("Not found", status_code=404, media_type="text/plain", headers=_APP_HEADERS)
     if "\x00" in path:
         return not_found
     try:
@@ -683,12 +690,6 @@ async def app_page(request: Request, path: str) -> Response:
     if path.startswith("assets/") or not target.is_relative_to(dist):
         return not_found
     return FileResponse(index_html, headers={**_APP_FILE_HEADERS, "Cache-Control": "no-cache"})
-
-
-# The harness console (P2 step 2.4): its unchanged static UI at /console/, talking to our own
-# owner-scoped routes at /console/api/. CONSOLE_ENABLED; on by default only for
-# AGENT_ENVIRONMENT=local. Mounted last so its static mount can't shadow other routes.
-app.state.console_enabled = mount_console(app, _agent_api, app_store=_store)
 
 
 def main() -> None:

@@ -16,8 +16,8 @@ export interface AllowedRoute {
 const ID = "[^/]+";
 
 export const ALLOWED: readonly AllowedRoute[] = [
-  { method: "GET", path: /^\/app\/?$/, route: "GET /app/", backing: "static (web/dist/index.html)" },
-  { method: "GET", path: /^\/app\/assets\/[\w.-]+$/, route: "GET /app/assets/*", backing: "static (bundled JS, CSS, fonts)" },
+  { method: "GET", path: /^\/$/, route: "GET /", backing: "static (web/dist/index.html)" },
+  { method: "GET", path: /^\/assets\/[\w.-]+$/, route: "GET /assets/*", backing: "static (bundled JS, CSS, fonts)" },
   { method: "GET", path: /^\/favicon\.ico$/, route: "GET /favicon.ico", backing: "browser default request" },
   { method: "GET", path: /^\/api\/auth\/config$/, route: "GET /api/auth/config", backing: "process config" },
   { method: "GET", path: /^\/api\/me$/, route: "GET /api/me", backing: "session cookie / catalog headers" },

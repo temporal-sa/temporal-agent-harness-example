@@ -5,7 +5,7 @@ import { expect, type Page } from "@playwright/test";
 export const HAIKU = /^Claude Haiku 5\.5$/;
 
 export async function signIn(page: Page, base: string, user: string, password: string): Promise<void> {
-  await page.goto(`${base}/app/`);
+  await page.goto(`${base}/`);
   await page.getByLabel("Username").fill(user);
   await page.getByLabel("Password").fill(password);
   await page.getByRole("button", { name: "Sign in" }).click();

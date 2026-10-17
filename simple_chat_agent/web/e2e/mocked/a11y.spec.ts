@@ -170,7 +170,7 @@ test.describe("axe", () => {
 
   test("3k axe: sign-in page", async ({ page, mockApi }) => {
     await mockApi({ signedOut: true });
-    await page.goto("/app/");
+    await page.goto("/");
     await expect(page.getByRole("heading", { name: "Sign in to continue" })).toBeVisible();
     expect(unknown(await axe(page, "sign-in"))).toEqual([]);
   });

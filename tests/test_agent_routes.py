@@ -1923,7 +1923,7 @@ class ProductViewConfigTests(AgentRoutesTestBase):
 
 
 class ProductViewMountTests(unittest.TestCase):
-    """P3 step 3.0: the built app at /app/, behind the app's auth, with SPA fallback."""
+    """The built app at / (P5; /app/ before), behind the app's auth, with SPA fallback."""
 
     CATALOG = {"x-temporal-auth-subject": "sub-1", "x-temporal-auth-email": "a@example.com"}
 
@@ -1951,7 +1951,7 @@ class ProductViewMountTests(unittest.TestCase):
 
     def test_unauthenticated_catalog_is_401(self) -> None:
         self.build()
-        for path in ("/app/", "/app/sessions/x", "/app/assets/app-abc123.js"):
+        for path in ("/", "/sessions/x", "/assets/app-abc123.js"):
             r = self.client.get(path)
             self.assertEqual(r.status_code, 401, path)
             self.assertNotIn("Product view", r.text)
@@ -1960,7 +1960,7 @@ class ProductViewMountTests(unittest.TestCase):
     def test_local_login_page(self) -> None:
         self.build()
         with mock.patch.dict(os.environ, {"SIMPLE_CHAT_AUTH_MODE": "local", "SIMPLE_CHAT_LOCAL_AUTH_ENABLED": "1"}):
-            r = self.client.get("/app/")
+            r = self.client.get("/")
             self.assertEqual(r.status_code, 401)
             self.assertIn("/api/auth/local/login", r.text)
             self.assertIn("X-Requested-With", r.text)
@@ -1968,52 +1968,49 @@ class ProductViewMountTests(unittest.TestCase):
             from simple_chat_agent.api.auth import SESSION_COOKIE, create_session_token, user_from_local_username
 
             self.client.cookies.set(SESSION_COOKIE, create_session_token(user_from_local_username("demo")))
-            r = self.client.get("/app/")
+            r = self.client.get("/")
             self.assertEqual(r.status_code, 200)
             self.assertIn("Product view", r.text)
             self.client.cookies.clear()
 
     def test_local_without_local_login_points_to_main_page(self) -> None:
         with mock.patch.dict(os.environ, {"SIMPLE_CHAT_AUTH_MODE": "local", "SIMPLE_CHAT_LOCAL_AUTH_ENABLED": ""}):
-            r = self.client.get("/app/")
+            r = self.client.get("/")
         self.assertEqual(r.status_code, 401)
         self.assertNotIn("/api/auth/local/login", r.text)
 
     def test_not_built_is_a_503_page(self) -> None:
-        r = self.client.get("/app/", headers=self.CATALOG)
+        r = self.client.get("/", headers=self.CATALOG)
         self.assertEqual(r.status_code, 503)
         self.assertIn("text/html", r.headers["content-type"])
         self.assertIn("make web", r.text)
-        self.assertEqual(self.client.get("/app/sessions/x", headers=self.CATALOG).status_code, 503)
+        self.assertEqual(self.client.get("/sessions/x", headers=self.CATALOG).status_code, 503)
 
     def test_serving_and_spa_fallback(self) -> None:
         self.build()
-        r = self.client.get("/app?s=1", headers=self.CATALOG, follow_redirects=False)
-        self.assertIn(r.status_code, (307, 302))
-        self.assertEqual(r.headers["location"], "/app/?s=1")
-        for path in ("/app/", "/app/index.html", "/app/sessions/abc", "/app/deep/link/here?x=1"):
+        for path in ("/", "/index.html", "/sessions/abc", "/deep/link/here?x=1"):
             r = self.client.get(path, headers=self.CATALOG)
             self.assertEqual(r.status_code, 200, path)
             self.assertIn("Product view", r.text)
             self.assertEqual(r.headers["cache-control"], "no-cache")
             self.assertEqual(r.headers["x-frame-options"], "DENY")
-        r = self.client.get("/app/assets/app-abc123.js", headers=self.CATALOG)
+        r = self.client.get("/assets/app-abc123.js", headers=self.CATALOG)
         self.assertEqual(r.status_code, 200)
         self.assertIn("javascript", r.headers["content-type"])
         self.assertIn("immutable", r.headers["cache-control"])
-        self.assertEqual(self.client.get("/app/favicon.svg", headers=self.CATALOG).text, "<svg/>")
+        self.assertEqual(self.client.get("/favicon.svg", headers=self.CATALOG).text, "<svg/>")
         # A missing hashed asset is a 404, not index.html served as JavaScript.
-        self.assertEqual(self.client.get("/app/assets/gone-999.js", headers=self.CATALOG).status_code, 404)
+        self.assertEqual(self.client.get("/assets/gone-999.js", headers=self.CATALOG).status_code, 404)
 
     def test_nul_and_bad_paths_are_404_not_500(self) -> None:
         self.build()
-        for path in ("/app/a%00b", "/app/assets/x%00.js", "/app/%00"):
+        for path in ("/a%00b", "/assets/x%00.js", "/%00"):
             r = self.client.get(path, headers=self.CATALOG)
             self.assertEqual(r.status_code, 404, path)
 
     def test_app_pages_carry_the_csp(self) -> None:
         self.build()
-        for path in ("/app/", "/app/sessions/x", "/app/assets/app-abc123.js"):
+        for path in ("/", "/sessions/x", "/assets/app-abc123.js"):
             csp = self.client.get(path, headers=self.CATALOG).headers["content-security-policy"]
             for directive in ("default-src 'self'", "script-src 'self'", "object-src 'none'", "base-uri 'none'",
                               "frame-src 'self'", "img-src 'self' data:", "style-src 'self' 'unsafe-inline'",
@@ -2021,16 +2018,39 @@ class ProductViewMountTests(unittest.TestCase):
                 self.assertIn(directive, csp, path)
         # The sign-in page keeps its inline script working: no script-src there.
         with mock.patch.dict(os.environ, {"SIMPLE_CHAT_AUTH_MODE": "local", "SIMPLE_CHAT_LOCAL_AUTH_ENABLED": "1"}):
-            r = self.client.get("/app/")
+            r = self.client.get("/")
         self.assertEqual(r.status_code, 401)
         self.assertNotIn("script-src", r.headers["content-security-policy"])
 
     def test_no_escape_from_dist(self) -> None:
         self.build()
-        for path in ("/app/..%2fsecret.txt", "/app/%2e%2e/secret.txt", "/app/assets/..%2f..%2fsecret.txt"):
+        for path in ("/..%2fsecret.txt", "/%2e%2e/secret.txt", "/assets/..%2f..%2fsecret.txt"):
             r = self.client.get(path, headers=self.CATALOG)
             self.assertNotIn("outside dist", r.text, path)
 
+    def test_old_app_paths_redirect_to_the_root(self) -> None:
+        self.build()
+        cases = {
+            "/app": "/",
+            "/app?s=1": "/?s=1",
+            "/app/": "/",
+            "/app/?mcp=connected&mcp_server=x": "/?mcp=connected&mcp_server=x",
+            "/app/sessions/abc?s=2": "/sessions/abc?s=2",
+            # Never a protocol-relative redirect off this origin.
+            "/app//evil.example/x": "/evil.example/x",
+            "/app/%5C%5Cevil.example": "/evil.example",
+        }
+        for path, location in cases.items():
+            r = self.client.get(path, follow_redirects=False)
+            self.assertIn(r.status_code, (307, 302), path)
+            self.assertEqual(r.headers["location"], location, path)
+
+    def test_api_and_internal_paths_never_fall_back_to_the_app(self) -> None:
+        self.build()
+        for path in ("/api/nope", "/api", "/internal/nope", "/healthz", "/console/x"):
+            r = self.client.get(path, headers=self.CATALOG)
+            self.assertNotIn("Product view", r.text, path)
+            self.assertNotEqual(r.status_code, 200, path)
 
 
 class SecurityReviewTests(AgentRoutesTestBase):

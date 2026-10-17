@@ -1,7 +1,7 @@
 // The "MCP servers" dialog (PRD A8; local only): list, add, remove, status and Reconnect for
 // this user's MCP servers. A modal Dialog: focus moves in, Tab stays inside, Esc closes it, and
 // focus returns to the opener. OAuth (add or Reconnect) leaves for the provider and comes back
-// to /app/?mcp=connected (see `mcpReturnNotice`).
+// to /?mcp=connected (see `mcpReturnNotice`).
 
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from "react";
 

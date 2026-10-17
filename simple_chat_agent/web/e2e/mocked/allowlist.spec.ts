@@ -18,7 +18,7 @@ test("the demo script's requests are all on the allowlist", async ({ page, mockA
   await api.script(id, [...working(t1), ...workingEnds(t1), ...commitWaits(turn(2, "msg-2"))]);
 
   // Sign in (local login).
-  await page.goto("/app/");
+  await page.goto("/");
   await page.getByLabel("Username").fill("demo");
   await page.getByLabel("Password").fill("demo");
   await page.getByRole("button", { name: "Sign in" }).click();
@@ -69,7 +69,7 @@ test("the checker flags a Query-backed path", async ({ page, mockApi, requestLog
   requestLog.skipCheck();
   const api = await mockApi();
   void api;
-  await page.goto("/app/");
+  await page.goto("/");
   await page.evaluate(() => fetch("/api/chats").catch(() => undefined));
   const v = judge({ method: "GET", url: `${baseURL}/api/chats`, resourceType: "fetch" }, new URL(baseURL!).origin);
   expect(v.allowed).toBeNull();

@@ -32,7 +32,7 @@ test("3h isolation: user B can't see or open user A's session, and the other way
 
     // By URL: B opens A's session.
     const seenBefore = requestLog.seen.length;
-    await pageB.goto(`${env.baseB}/app/?s=${encodeURIComponent(a)}`);
+    await pageB.goto(`${env.baseB}/?s=${encodeURIComponent(a)}`);
     // The API answers 404; the app shows its not-found page and nothing of A's session.
     const notFound = pageB.getByRole("alert").filter({ has: pageB.getByRole("heading", { name: "No such session" }) });
     await expect(notFound).toBeVisible();

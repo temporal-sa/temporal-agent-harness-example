@@ -48,7 +48,7 @@ OAUTH_START_TIMEOUT = 30.0
 OAUTH_FINISH_TIMEOUT = 60.0
 REBUILD_BACKOFF_SECONDS = 60
 CALLBACK_PATH = "/api/agent/mcp/oauth/callback"
-APP_PATH = "/app/"
+APP_PATH = "/"
 LOCAL_ONLY = "MCP servers are available in local development only."
 
 

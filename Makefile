@@ -1,6 +1,6 @@
 # Local development for the coding agent and its product view (P3).
 #
-#   make web           build the product view into simple_chat_agent/web/dist (served at /app/)
+#   make web           build the product view into simple_chat_agent/web/dist (served at /)
 #   make web-dev       Vite dev server with live reload, proxying /api and /console to the API
 #   make gen           regenerate web/src/generated from the agents' JSON Schema
 #   make crash-worker  SIGKILL the local dev worker (demo crash trigger)
@@ -88,7 +88,7 @@ dev-stack:
 	@echo
 	@echo "4. Dev worker (task queue $(TASK_QUEUE)):   make dev-worker"
 	@echo "5. API on $(API_PORT), no provider keys:   make dev-api"
-	@echo "6. Product view:   make web, then open http://127.0.0.1:$(API_PORT)/app/"
-	@echo "   or live reload: make web-dev, sign in once at http://127.0.0.1:$(API_PORT)/app/, then use the Vite URL"
+	@echo "6. Product view:   make web, then open http://127.0.0.1:$(API_PORT)/"
+	@echo "   or live reload: make web-dev, sign in once at http://127.0.0.1:$(API_PORT)/, then use the Vite URL"
 	@echo
 	@echo "Crash the worker:  make crash-worker   (then make dev-worker to bring it back)"

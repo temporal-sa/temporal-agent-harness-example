@@ -17,6 +17,6 @@ export async function openScripted(page: Page, api: MockApi, frames: Frame[], ov
   const s = summary(over.session_id, over);
   if (!api.sessions.some((x) => x.session_id === s.session_id)) api.sessions.unshift(s);
   await api.script(s.session_id, frames);
-  await page.goto(`/app/?s=${encodeURIComponent(s.session_id)}`);
+  await page.goto(`/?s=${encodeURIComponent(s.session_id)}`);
   return s;
 }
