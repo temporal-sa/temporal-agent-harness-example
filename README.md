@@ -118,12 +118,11 @@ About 70% of the input is read from the provider's cache, which providers bill a
 
 ## More
 
-- [docs/catalog.md](docs/catalog.md): the always-on catalog deployment (environment, Task Queue and Worker Deployment, NetworkPolicy, S3 lifecycle).
+- [docs/catalog.md](docs/catalog.md): the always-on catalog deployment (environment, Task Queue and Worker Deployment, executor egress, S3 lifecycle).
 - [docs/CUTOVER.md](docs/CUTOVER.md): moving the catalog from the old chat app.
 - [docs/SECURITY-CHECKLIST.md](docs/SECURITY-CHECKLIST.md): each safety rule and the test that proves it.
 - [docs/local-development.md](docs/local-development.md): environment variables and troubleshooting.
 - [`basic_file_agent/`](basic_file_agent/README.md): a minimal agent on the same harness, about 150 lines.
-- [docs/PRD.md](docs/PRD.md): requirements and decisions.
 
 ## Notes
 
