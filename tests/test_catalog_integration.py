@@ -10,7 +10,6 @@ from starlette.requests import Request
 from simple_chat_agent.api.auth import SESSION_COOKIE, AuthenticatedUser, create_session_token
 from simple_chat_agent.api.main import _current_user
 from simple_chat_agent.api.auth import user_from_catalog_headers
-from simple_chat_agent.worker.main import _worker_deployment_config
 from simple_chat_agent.worker.user_chats_workflow import user_chats_workflow_id
 from simple_chat_agent.common.external_storage import simple_chat_data_converter
 from simple_chat_agent.api.temporal_ui import temporal_ui_url, temporal_ui_user_workflows_url
@@ -54,9 +53,13 @@ class CatalogIntegrationTests(unittest.TestCase):
         with patch.dict(os.environ, {
             "TEMPORAL_DEPLOYMENT_NAME": "advanced-ai-agent-workspace-123",
             "TEMPORAL_WORKER_BUILD_ID": "git-abc123",
-            "SIMPLE_CHAT_WORKER_VERSION": "old-local-version",
+            "CODING_AGENT_BUILD_ID": "old-local-version",
+            "ANTHROPIC_API_KEY": "unit-test-not-used",
         }, clear=True):
-            config = _worker_deployment_config("workspace-queue")
+            from simple_chat_agent.agent.worker import deployment_config
+
+            config = deployment_config("workspace-queue")
+            assert config is not None
             self.assertEqual(config.version.deployment_name, "advanced-ai-agent-workspace-123")
             self.assertEqual(config.version.build_id, "git-abc123")
 

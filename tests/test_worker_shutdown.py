@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import importlib
+import io
 import os
+import signal
 import unittest
 from unittest.mock import patch
 
-from simple_chat_agent.worker.main import (
-    _run_worker_and_codec_server,
-    _run_worker_until_stopped,
-)
 from simple_chat_agent.worker.shutdown import (
     DEFAULT_WORKER_GRACEFUL_SHUTDOWN_SECONDS,
     WORKER_GRACEFUL_SHUTDOWN_SECONDS_ENV,
@@ -81,45 +81,69 @@ class WorkerShutdownConfigurationTests(unittest.TestCase):
                 worker_graceful_shutdown_seconds()
 
 
-class WorkerServiceSupervisorTests(unittest.IsolatedAsyncioTestCase):
-    async def test_shutdown_signal_drains_worker_without_codec_server(self) -> None:
+class WorkerEntrypointTests(unittest.IsolatedAsyncioTestCase):
+    """python -m simple_chat_agent.worker.main runs the coding agent's worker (P5) and keeps the
+    old entrypoint's drain: SIGTERM drains the worker, and the codec server stops with it."""
+
+    def setUp(self) -> None:
+        os.environ.setdefault("ANTHROPIC_API_KEY", "unit-test-not-used")
+
+    @contextlib.contextmanager
+    def patched(self, worker: _FakeWorker, codec: _FakeCodecServer | None):
+        from simple_chat_agent.agent import worker as agent_worker
+
+        async def connect() -> object:
+            return type("Client", (), {"data_converter": None})()
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(agent_worker, "connect", connect))
+            stack.enter_context(patch.object(agent_worker, "build_worker", lambda _c, _q: worker))
+            stack.enter_context(patch.object(agent_worker, "deployment_config", lambda _q: None))
+            stack.enter_context(patch.object(agent_worker, "codec_server_enabled", lambda: codec is not None))
+            stack.enter_context(patch.object(agent_worker, "create_codec_app", lambda _dc: object()))
+            stack.enter_context(patch.object(agent_worker.uvicorn, "Server", lambda _cfg: codec))
+            stack.enter_context(patch.object(agent_worker.uvicorn, "Config", lambda *a, **k: None))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            yield
+
+    async def test_entrypoint_is_the_coding_agent_worker(self) -> None:
+        entry = importlib.import_module("simple_chat_agent.worker.main")
+
+        worker = _FakeWorker(return_immediately=True)
+        with self.patched(worker, None):
+            await entry.main()
+        self.assertTrue(worker.shutdown_called)
+
+    async def test_sigterm_drains_worker_and_stops_codec_server(self) -> None:
+        entry = importlib.import_module("simple_chat_agent.worker.main")
+
         worker = _FakeWorker()
-
-        def request_shutdown(
-            _loop: asyncio.AbstractEventLoop,
-            shutdown_requested: asyncio.Event,
-        ) -> list[object]:
-            shutdown_requested.set()
-            return []
-
-        with patch(
-            "simple_chat_agent.worker.main._register_shutdown_signal_handlers",
-            side_effect=request_shutdown,
-        ):
-            await _run_worker_until_stopped(worker)  # type: ignore[arg-type]
-
+        codec = _FakeCodecServer()
+        asyncio.get_running_loop().call_later(0.05, os.kill, os.getpid(), signal.SIGTERM)
+        with self.patched(worker, codec):
+            await asyncio.wait_for(entry.main(), timeout=10)
         self.assertTrue(worker.shutdown_called)
         self.assertFalse(worker.run_cancelled)
-
-    async def test_codec_exit_drains_worker_without_cancelling_it(self) -> None:
-        worker = _FakeWorker()
-        codec_server = _FakeCodecServer(return_immediately=True)
-        with patch(
-            "simple_chat_agent.worker.main._register_shutdown_signal_handlers",
-            return_value=[],
-        ):
-            await _run_worker_and_codec_server(worker, codec_server)  # type: ignore[arg-type]
-
-        self.assertTrue(worker.shutdown_called)
-        self.assertFalse(worker.run_cancelled)
+        self.assertTrue(codec.should_exit)
 
     async def test_worker_exit_stops_codec_server(self) -> None:
-        worker = _FakeWorker(return_immediately=True)
-        codec_server = _FakeCodecServer()
-        with patch(
-            "simple_chat_agent.worker.main._register_shutdown_signal_handlers",
-            return_value=[],
-        ):
-            await _run_worker_and_codec_server(worker, codec_server)  # type: ignore[arg-type]
+        entry = importlib.import_module("simple_chat_agent.worker.main")
 
-        self.assertTrue(codec_server.should_exit)
+        worker = _FakeWorker(return_immediately=True)
+        codec = _FakeCodecServer()
+        with self.patched(worker, codec):
+            await asyncio.wait_for(entry.main(), timeout=10)
+        self.assertTrue(codec.should_exit)
+
+    def test_help_needs_no_keys_or_server(self) -> None:
+        entry = importlib.import_module("simple_chat_agent.worker.main")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            entry.run(["--help"])
+        self.assertIn("TEMPORAL_WORKER_BUILD_ID", out.getvalue())
+        self.assertIn("CODING_AGENT_TASK_QUEUE", out.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

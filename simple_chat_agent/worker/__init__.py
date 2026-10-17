@@ -1,4 +1,5 @@
-"""Temporal worker, workflows, activities, and tool implementations."""
+"""The worker entrypoint (simple_chat_agent.worker.main), the codec server, the shutdown
+settings and the sandbox executor."""
 
 
 async def main() -> None:
