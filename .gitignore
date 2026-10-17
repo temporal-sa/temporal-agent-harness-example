@@ -67,3 +67,6 @@ crash.*.log
 .vscode/
 .idea/
 *.swp
+
+# Local output of the old Lambda sandbox deploy (IAM policy records); kept out of git.
+.lambda-build/
