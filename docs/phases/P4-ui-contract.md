@@ -55,4 +55,4 @@ All routes are under `/api/agent`. They are owner-scoped, require the CSRF heade
   - `tool_approval_requested` and `tool_start` wrap the args as `{"arguments": {...}}`, so unwrap them.
   - The risk class falls back to config `default_tool_risk_class` (`external_side_effect`), so there's no "Always approve" for MCP tools.
 - **Reauth:** a `tool_error` whose message starts `mcp_reauth_required:` shows a "Reconnect" chip that opens the dialog's Reconnect for that server.
-- **Sessions:** a session only gets MCP tools if it was created with `mcp: true`. Send it on create when the user has servers and config enables MCP.
+- **Sessions:** the server turns MCP on for new sessions when config enables it. The browser doesn't send `mcp` on create, and the create body refuses unknown fields.
