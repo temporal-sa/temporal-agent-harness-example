@@ -33,6 +33,7 @@ from simple_chat_agent.agent.sessions import CodingSessions
 from simple_chat_agent.agent.subagents import SUBAGENT_WORKFLOWS
 from simple_chat_agent.agent.tools.artifacts import ARTIFACT_TOOLS
 from simple_chat_agent.agent.tools.research import RESEARCH_TOOLS
+from simple_chat_agent.agent.tools.code_mode import CODE_MODE_ACTIVITIES
 from simple_chat_agent.agent.tools.workspace import TEST_TOOLS, WORKSPACE_ACTIVITIES, WORKSPACE_TOOLS
 from simple_chat_agent.agent.workflow import CodingAgent
 from simple_chat_agent.common.env import load_dotenv
@@ -110,7 +111,7 @@ def build_worker(client: Client, queue: str) -> Worker:
         client,
         task_queue=queue,
         workflows=[CodingAgent, CodingSessions, *SUBAGENT_WORKFLOWS],
-        activities=[*WORKSPACE_ACTIVITIES, *APPROVAL_ACTIVITIES, *MCP_ACTIVITIES],
+        activities=[*WORKSPACE_ACTIVITIES, *CODE_MODE_ACTIVITIES, *APPROVAL_ACTIVITIES, *MCP_ACTIVITIES],
         plugins=[AgentPlugin(CODING_AGENT)],
         deployment_config=deployment_config(queue),
         graceful_shutdown_timeout=worker_graceful_shutdown_timeout(),

@@ -186,6 +186,7 @@ class SecurityReviewTests(unittest.TestCase):
         fields.update(data)
         agent = agent_with(fields["posture"])
         agent._data = SimpleNamespace(**fields, model_copy=lambda update: SimpleNamespace(**{**fields, **update}))
+        agent._code_mode = object()  # run_script (P4 A11)
         return agent
 
     def test_test_tools_only_in_local(self) -> None:

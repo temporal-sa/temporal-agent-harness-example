@@ -27,6 +27,7 @@ from simple_chat_agent.agent.runtime import CODING_AGENT
 from simple_chat_agent.agent.approvals import APPROVAL_ACTIVITIES
 from simple_chat_agent.agent.tools.artifacts import ARTIFACT_TOOLS
 from simple_chat_agent.agent.tools.research import RESEARCH_TOOLS
+from simple_chat_agent.agent.tools.code_mode import CODE_MODE_ACTIVITIES
 from simple_chat_agent.agent.tools.workspace import TEST_TOOLS, WORKSPACE_ACTIVITIES, WORKSPACE_TOOLS
 from simple_chat_agent.agent.sessions import CodingSessions
 from simple_chat_agent.agent.subagents import SUBAGENT_WORKFLOWS
@@ -49,7 +50,7 @@ async def main() -> None:
         client,
         task_queue=args.task_queue,
         workflows=[CodingAgent, CodingSessions, *SUBAGENT_WORKFLOWS],
-        activities=[*WORKSPACE_ACTIVITIES, *APPROVAL_ACTIVITIES, *MCP_ACTIVITIES],
+        activities=[*WORKSPACE_ACTIVITIES, *CODE_MODE_ACTIVITIES, *APPROVAL_ACTIVITIES, *MCP_ACTIVITIES],
         plugins=[AgentPlugin(CODING_AGENT)],
         identity=args.identity,
         max_heartbeat_throttle_interval=timedelta(seconds=1),

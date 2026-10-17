@@ -79,6 +79,7 @@ with workflow.unsafe.imports_passed_through():
         subagent_tools,
     )
     from simple_chat_agent.agent.tools.artifacts import ARTIFACT_TOOLS
+    from simple_chat_agent.agent.tools.code_mode import build_code_mode_tool
     from simple_chat_agent.agent.tools.workspace import TEST_TOOLS, WORKSPACE_TOOLS
 
 # Wake an idle session this often so a deploy can move it to the new version (PRD A18).
@@ -230,6 +231,10 @@ class CodingAgent:
         self._seen_requests: deque[str] = deque(carried.recent_request_ids, maxlen=RECENT_REQUEST_IDS)
         self._deferred: list[FrontDoorMessage] = list(carried.pending_messages)
         self._workspace_id = data.workspace_id or workflow.info().workflow_id
+        # Code Mode (PRD A11): built once per run; an approved script's host calls skip their
+        # own gate ("Approve script" approves them once).
+        self._code_mode = build_code_mode_tool(self._workspace_id)
+        harness_ext.allow_approved_script_calls(self._runner)
         self._turns_this_run = 0
         self._continuing = False
         # Interrupt bookkeeping for the turn in flight.
@@ -540,7 +545,7 @@ class CodingAgent:
 
     def _tools(self) -> list[Any]:
         research = [t for t in RESEARCH_TOOLS if t.__name__ in set(self._data.research_tools)]
-        tools: list[Any] = [*WORKSPACE_TOOLS, *research, *ARTIFACT_TOOLS, *STATE_TOOLS]
+        tools: list[Any] = [*WORKSPACE_TOOLS, *research, *ARTIFACT_TOOLS, *STATE_TOOLS, self._code_mode]
         if self._data.depth == 0:
             tools += subagent_tools(
                 task_queue=workflow.info().task_queue,

@@ -76,13 +76,14 @@ async def running_worker(client: Any, task_queue: str) -> AsyncIterator[Any]:
     from simple_chat_agent.agent.workflow import CodingAgent
 
     from simple_chat_agent.agent.approvals import APPROVAL_ACTIVITIES
+    from simple_chat_agent.agent.tools.code_mode import CODE_MODE_ACTIVITIES
     from simple_chat_agent.agent.tools.workspace import WORKSPACE_ACTIVITIES
 
     worker = Worker(
         client,
         task_queue=task_queue,
         workflows=[CodingAgent, CodingSessions, *SUBAGENT_WORKFLOWS],
-        activities=[*WORKSPACE_ACTIVITIES, *APPROVAL_ACTIVITIES],
+        activities=[*WORKSPACE_ACTIVITIES, *CODE_MODE_ACTIVITIES, *APPROVAL_ACTIVITIES],
         plugins=[AgentPlugin(CODING_AGENT)],
         max_heartbeat_throttle_interval=timedelta(seconds=1),
         default_heartbeat_throttle_interval=timedelta(seconds=1),

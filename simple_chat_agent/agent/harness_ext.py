@@ -9,10 +9,14 @@ tests/test_harness_ext.py pin the shapes these helpers rely on.
 from __future__ import annotations
 
 import asyncio
+import contextvars as _contextvars
+import inspect as _inspect
 import os
 import typing
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass as _dataclass
+from dataclasses import replace as _replace
 from datetime import timedelta
 from typing import Any
 
@@ -53,7 +57,18 @@ from temporal_agent_harness.harness.agent_protocol import (
     ModelInteractionStarted,
     ToolApprovalDecision,
 )
-from temporal_agent_harness.harness.agent_workflow import AgentWorkflowRunner
+from temporal_agent_harness.harness.agent_workflow import (
+    AgentWorkflowRunner,
+    _current_runner,
+    _current_tool_id,
+    tool_defn,
+)
+# Code Mode internals (limited_code_mode_tool). Imported here, at module scope: this module is
+# passed through the workflow sandbox, so these are the same classes the harness checks against.
+from temporal_agent_harness.harness.code_mode import tool as cm
+from temporal_agent_harness.harness.code_mode.driver import CodeModeDriver, load_stepper
+from temporal_agent_harness.harness.code_mode.stubs import render_host_interface, render_type_check_stubs
+from temporal_agent_harness.harness.code_mode.vfs import FileOp, validate_mounts
 
 # Model deltas are flushed to the workflow as one Signal per batch. The harness default is
 # 50 ms; 500 ms keeps a long coding turn inside Temporal's per-run limits (PRD A20, CTO-5).
@@ -879,3 +894,185 @@ def guard_send_agent_message(
         return await runner._handle_send_agent_message(message)
 
     workflow.set_update_handler(SEND_AGENT_MESSAGE_UPDATE, handler, validator=validator)
+
+
+# ---------------------------------------------------------------------------
+# Code Mode with per-script limits, nested host-call ids and one script approval (PRD A11)
+# ---------------------------------------------------------------------------
+
+# The tool names a running, already-approved script may call without its own gate. Set by
+# _ScriptRunner.run_tool around each host call; read by the policy check that
+# allow_approved_script_calls installs on the runner.
+_APPROVED_SCRIPT_TOOLS: _contextvars.ContextVar[frozenset[str] | None] = _contextvars.ContextVar(
+    "coding_agent_approved_script_tools", default=None
+)
+
+
+@_dataclass(frozen=True)
+class ScriptLimits:
+    """Per-script limits. ``max_host_calls`` counts host-function calls (the exposed tools);
+    ``max_file_ops`` counts script file operations on a mount (one ``open``/``read_text``/
+    ``iterdir`` is one, whatever ``fs_*`` calls it takes); ``concurrency`` bounds both together."""
+
+    max_host_calls: int = 16
+    max_file_ops: int = 64
+    concurrency: int = 4
+
+
+def host_call_id(script_tool_id: str, seq: int) -> str:
+    """The tool id of a script's ``seq``-th host call (1-based): ``<script tool id>/<seq>``.
+    The UI nests every tool event whose id starts with ``<script tool id>/`` under the script."""
+    return f"{script_tool_id}/{seq}"
+
+
+def allow_approved_script_calls(runner: AgentWorkflowRunner) -> None:
+    """Let host calls made by an approved script skip their own approval gate.
+
+    The script tool (``limited_code_mode_tool``) is gated like any tool; once it runs, it was
+    approved, and "Approve script" covers its host calls once (PRD A11). The harness gates each
+    host call again (``_apply_approval_policy`` asks ``runner._policy_auto_approves`` first), so
+    this wraps that instance method: inside a script's host call (``_APPROVED_SCRIPT_TOOLS``
+    set, by ``_ScriptRunner``) a tool the script exposes is approved without a gate or events;
+    everywhere else (model tool calls, the policy-update cascade) the original answers.
+    Idempotent."""
+    if getattr(runner, "_coding_agent_script_tools", None) is not None:
+        return
+    original = runner._policy_auto_approves
+    # Kept on the runner: the workflow sandbox can hold a second copy of this module, and the
+    # script's _ScriptRunner must set the very ContextVar this check reads.
+    approved = _APPROVED_SCRIPT_TOOLS
+
+    def policy_auto_approves(tool_name: str, *, inherently_safe: bool) -> bool:
+        allowed = approved.get()
+        if allowed is not None and tool_name in allowed:
+            return True
+        return original(tool_name, inherently_safe=inherently_safe)
+
+    runner._policy_auto_approves = policy_auto_approves  # type: ignore[method-assign]
+    runner._coding_agent_script_tools = approved  # type: ignore[attr-defined]
+
+
+class _ScriptRunner:
+    """The runner as one script's driver sees it: every ``run_tool`` gets the next nested id
+    (``host_call_id``) instead of the driver's random one, and runs with the script's tools
+    marked approved. Everything else is the real runner."""
+
+    def __init__(self, runner: AgentWorkflowRunner, script_tool_id: str, allowed: frozenset[str]) -> None:
+        self._runner = runner
+        self._script_tool_id = script_tool_id
+        self._allowed = allowed
+        self._seq = 0
+
+    async def run_tool(self, call_id: str, tool: Callable[..., Awaitable[Any]], /, *args: Any, **kwargs: Any) -> Any:
+        self._seq += 1
+        approved = getattr(self._runner, "_coding_agent_script_tools", None)
+        if approved is None:
+            raise RuntimeError("allow_approved_script_calls was not installed on this runner")
+        token = approved.set(self._allowed)
+        try:
+            return await self._runner.run_tool(host_call_id(self._script_tool_id, self._seq), tool, *args, **kwargs)
+        finally:
+            approved.reset(token)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._runner, name)
+
+
+def _limited_driver_class() -> type:
+    class LimitedDriver(CodeModeDriver):  # type: ignore[misc, valid-type]
+        """``CodeModeDriver`` (code_mode/driver.py, 0.7.0) with ``ScriptLimits`` applied in
+        ``_run_call``, the one place every host call and file operation of a step starts."""
+
+        def __init__(self, *args: Any, limits: ScriptLimits, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._limits = limits
+            self._host_calls = 0
+            self._file_ops = 0
+            self._gate = asyncio.Semaphore(limits.concurrency)
+
+        async def _run_call(self, call: Any, stepper: Any) -> Any:
+            if isinstance(call, stepper.Sleep):
+                return await super()._run_call(call, stepper)
+            # Counted in start order, which the stepper fixes, so replay counts the same.
+            if isinstance(call, FileOp):
+                self._file_ops += 1
+                if self._file_ops > self._limits.max_file_ops:
+                    raise RuntimeError(
+                        f"file operation limit reached: a script may make at most "
+                        f"{self._limits.max_file_ops} file operations"
+                    )
+            else:
+                self._host_calls += 1
+                if self._host_calls > self._limits.max_host_calls:
+                    raise RuntimeError(
+                        f"host call limit reached: a script may make at most "
+                        f"{self._limits.max_host_calls} host-function calls"
+                    )
+            async with self._gate:
+                return await super()._run_call(call, stepper)
+
+    return LimitedDriver
+
+
+def limited_code_mode_tool(
+    tools: Sequence[Callable[..., Awaitable[Any]]],
+    *,
+    name: str,
+    injections: dict[str, Any] | None = None,
+    mounts: Sequence[Any] = (),
+    limits: ScriptLimits = ScriptLimits(),
+    guide: str = "",
+) -> Callable[..., Awaitable[str]]:
+    """The harness ``code_mode_tool`` (code_mode/tool.py ``_code_mode_tool``, 0.7.0), rebuilt
+    so its script runs on our driver:
+
+    * ``limits`` (``ScriptLimits``): over-limit calls fail inside the script as RuntimeError;
+    * host calls get nested ids (``host_call_id``), so the UI can put them under the script;
+    * the script tool is gated (``inherently_safe=False``) and, once approved, its host calls
+      are not gated again (``allow_approved_script_calls`` must be installed on the runner).
+
+    Same model-facing contract, stubs and type check (a type error comes back to the model as
+    "Script error (...)" before any host call runs); ``code_mode_type_check`` works on it."""
+    tools = list(tools)
+    mount_list = validate_mounts(mounts)
+    tools_by_name = cm._validate_tools(tools, has_mounts=bool(mount_list))
+    load_stepper()
+    stubs = render_type_check_stubs(tools)
+    if mount_list:
+        stubs = _replace(stubs, source=stubs.source + cm._FILESYSTEM_STUB)
+    coercers = cm._build_coercers(tools)
+    docstring = cm._CONTRACT.format(
+        sandbox=cm._WITH_FILESYSTEM if mount_list else cm._NO_FILESYSTEM,
+        interface=render_host_interface(tools) if tools else "(none)",
+        filesystem=cm._render_filesystem(mount_list),
+        guide=guide,
+    )
+    injection_values = dict(injections or {})
+    fs_tools = frozenset({"fs_seed", "fs_stat", "fs_read", "fs_list", "fs_write", "fs_mkdir", "fs_delete", "fs_rename"})
+    allowed = frozenset(tools_by_name) | (fs_tools if mount_list else frozenset())
+    driver_class = _limited_driver_class()
+
+    async def _run_code(script: str) -> str:
+        runner = _ScriptRunner(_current_runner(), _current_tool_id(), allowed)
+        driver = driver_class(
+            runner,
+            tools_by_name,
+            coercers,
+            injections=injection_values,
+            stubs=stubs,
+            mounts=mount_list,
+            limits=limits,
+        )
+        return await driver.run_script(script)
+
+    _run_code.__name__ = name
+    _run_code.__qualname__ = name
+    _run_code.__doc__ = docstring
+    _run_code.__signature__ = _inspect.Signature(  # type: ignore[attr-defined]
+        [_inspect.Parameter("script", _inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str)],
+        return_annotation=str,
+    )
+    _run_code.__annotations__ = {"script": str, "return": str}
+    tool = tool_defn(inherently_safe=False)(_run_code)
+    tool.__code_mode_stubs__ = stubs  # type: ignore[attr-defined]
+    return tool
