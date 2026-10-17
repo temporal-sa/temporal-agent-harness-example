@@ -43,3 +43,12 @@ Dockerfile
 **/Dockerfile
 *.md
 !README.md
+
+# Local-only output that must never reach an image (P5 review).
+.lambda-build/
+dev.db*
+simple_chat_agent/web/e2e/.demo-runs/
+simple_chat_agent/web/e2e/__screenshots__/
+simple_chat_agent/web/e2e/.results*/
+.pytest_cache/
+.ruff_cache/

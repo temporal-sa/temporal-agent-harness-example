@@ -59,7 +59,7 @@ make dev-stack                # prints the commands below with this repo's paths
 
 Then start each piece in its own terminal:
 
-1. Redis: `redis-server --port 6390 --appendonly yes --dir .simple_chat_agent`
+1. Redis: `mkdir -p .simple_chat_agent && redis-server --port 6390 --appendonly yes --dir .simple_chat_agent`
 2. Temporal: `temporal server start-dev --port 7244 --ui-port 8244 --db-filename dev.db --search-attribute CodingAgentOwner=Keyword --search-attribute UserEmail=Keyword`
 3. The executor: `make executor-image`, then the `docker run` line that `make dev-stack` prints. Check it with `curl -s 127.0.0.1:8083/healthz`. Add `WORKSPACE_EXECUTOR_TOKEN=<any random value>` to `.env.local` first; the worker, API and executor share it.
 4. The worker: `make dev-worker`

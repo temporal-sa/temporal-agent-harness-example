@@ -83,7 +83,7 @@ dev-stack:
 	@echo "Local stack: run each in its own terminal from $(ROOT). Skip what is already running."
 	@echo
 	@echo "1. Redis (AOF) on $(REDIS_PORT):"
-	@echo "   redis-server --port $(REDIS_PORT) --appendonly yes --dir $(ROOT)/.simple_chat_agent"
+	@echo "   mkdir -p $(ROOT)/.simple_chat_agent && redis-server --port $(REDIS_PORT) --appendonly yes --dir $(ROOT)/.simple_chat_agent"
 	@echo
 	@echo "2. Temporal dev server on $(TEMPORAL_PORT) (UI on $(TEMPORAL_UI_PORT)). Never the server on 7233:"
 	@echo "   temporal server start-dev --port $(TEMPORAL_PORT) --ui-port $(TEMPORAL_UI_PORT) --db-filename dev.db \\"

@@ -99,7 +99,7 @@ Status as of P5 (2026-10-16):
 | Read tools: 5 attempts | `tests/test_tools_research.py::ToolDefinitionTests::test_retry_policies_are_read_class`; `tests/test_tools_artifacts.py::ToolDefinitionTests::test_retry_policies_are_explicit` |
 | `run_command` runs at most once after it started; reattaches on retry | `tests/test_tools_workspace.py::RunCommandActivityTests::test_retry_after_worker_crash_reattaches_and_runs_once`, `::test_unreachable_executor_is_retryable`; `tests/test_tools_workspace.py::ExecutorJobTests::test_lost_job_after_executor_restart_is_not_rerun`, `::test_cached_result_with_a_different_command_is_rejected` |
 | Write and commit are idempotent per tool-call id | `tests/test_tools_workspace.py::FileToolsTests::test_edit_retry_after_lost_response_reports_already_applied`; `tests/test_tools_workspace.py::ExecToolsTests::test_git_status_diff_commit`; `tests/test_tools_artifacts.py::CreateArtifactTests::test_same_idempotency_key_returns_the_same_artifact` |
-| Judge: 2 attempts, 20 s schedule-to-close | `tests/test_approvals.py::EvaluatorWiring::test_judge_model_config` |
+| Judge: 2 attempts, 20 s schedule-to-close | `tests/test_approvals.py::EvaluatorWiring::test_activities_exported` |
 | A file tool's failure reaches the model as its reason (P5) | `tests/test_harness_ext.py::ToolFailureText::test_activity_failure_reaches_the_model_as_its_reason` |
 
 ## Cross-user isolation (S1, S5)

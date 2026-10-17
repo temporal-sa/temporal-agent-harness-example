@@ -11,7 +11,7 @@ This runbook moves the catalog from the old chat app (`SimpleChatWorkflow`, `Use
 | Workflow types | `SimpleChatWorkflow`, `UserChatsWorkflow` | `CodingSessions`, `CodingAgent`, `Explorer`, `Reviewer` |
 | Task Queue | `SIMPLE_CHAT_TASK_QUEUE` (default `simple-chat-agent`) | `CODING_AGENT_TASK_QUEUE` (default `coding-agent`) |
 | Worker Deployment | `TEMPORAL_DEPLOYMENT_NAME` (old name) | a **new** `TEMPORAL_DEPLOYMENT_NAME` |
-| Build ID | `TEMPORAL_WORKER_BUILD_ID` | `TEMPORAL_WORKER_BUILD_ID`, now **required** (no fallback) |
+| Build ID | `TEMPORAL_WORKER_BUILD_ID` | `TEMPORAL_WORKER_BUILD_ID`, now **required** (`CODING_AGENT_BUILD_ID` is still read as an alias; the old `1.0.0` default is gone) |
 | Workflow ID prefixes | the old app's chat and user ids | `coding-agent-…`, `coding-sessions-…` |
 | Versioning flag | the old app's flag | `CODING_AGENT_WORKER_VERSIONING_ENABLED` (default on, PINNED) |
 | UI | port 8080 (old frontend) | served by the API on 8000 at `/`; `/app/…` redirects to `/` |
@@ -23,9 +23,10 @@ This runbook moves the catalog from the old chat app (`SimpleChatWorkflow`, `Use
 
 1. The owner has given `/go release`.
 2. The new image is built (`make image`) and the executor image (`make executor-image`, or the catalog's build).
-3. The `CodingAgentOwner` Keyword search attribute exists in the namespace. Session list rebuilds and the owner check depend on it.
-4. Pick the new Worker Deployment name. It must not be the old one. The Build ID comes from the source plus `uv.lock` and is never reused for different code (PRD §6).
-5. Count what will be terminated, and tell users that old chats end:
+3. The catalog project yaml is updated (see [catalog.md](catalog.md)): the brokered `OPENAI_API_KEY` is requested, `CODING_AGENT_TASK_QUEUE` and the new Deployment name are set, codec auth is on (`SIMPLE_CHAT_CODEC_AUTH_ENABLED=1`), the executor NetworkPolicy and the S3 lifecycle rule are in place, and `SIMPLE_CHAT_STREAM_TOKEN` is removed.
+4. The `CodingAgentOwner` Keyword search attribute exists in the namespace. Session list rebuilds and the owner check depend on it.
+5. Pick the new Worker Deployment name. It must not be the old one. The Build ID comes from the source plus `uv.lock` and is never reused for different code (PRD §6).
+6. Count what will be terminated, and tell users that old chats end:
 
    ```sh
    temporal workflow count --namespace "$NS" \
@@ -60,7 +61,7 @@ temporal batch list --namespace "$NS"     # wait for the job to show Completed
 
 Then run the count from "Before you start" again; it must be 0.
 
-Purge the old app's S3 claim-check payloads only after their histories have passed namespace retention, so no retained history points at a deleted payload. The new app's archive and claim-check prefixes are separate (see [catalog.md](catalog.md#s3-lifecycle)); don't touch them.
+Purge the old app's S3 claim-check payloads with `simple_chat_agent.common.external_storage.purge_workflow_payloads(namespace=..., workflow_id=...)` for each terminated workflow id (or an S3 prefix delete on the old app's claim-check prefix), only after their histories have passed namespace retention, so no retained history points at a deleted payload. The new app's archive and claim-check prefixes are separate (see [catalog.md](catalog.md#s3-lifecycle)); don't touch them.
 
 ### 4. Decommission the old deployment
 

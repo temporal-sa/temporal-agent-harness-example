@@ -1864,7 +1864,7 @@ def _authorize(authorization: str | None) -> None:
             status_code=503, detail="Executor authentication is not configured."
         )
     scheme, _, supplied = (authorization or "").partition(" ")
-    if scheme.lower() != "bearer" or not hmac.compare_digest(supplied, expected):
+    if scheme.lower() != "bearer" or not hmac.compare_digest(supplied.encode("utf-8", "surrogateescape"), expected.encode("utf-8", "surrogateescape")):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 

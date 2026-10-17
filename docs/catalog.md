@@ -82,6 +82,7 @@ One demo run uses about 130k tokens (see the README), so a user can do roughly 3
 | `AGENT_SESSION_TTL_SECONDS` | API, worker | Default 1,296,000 (15 days) |
 | `AGENT_ARCHIVE_PREFIX` | API | Default `agent-frames/<redis prefix>` |
 | `WORKSPACE_EXECUTOR_URL` | API, worker | The executor Service |
+| `SIMPLE_CHAT_CODEC_AUTH_ENABLED=1`, `SIMPLE_CHAT_CODEC_JWKS_URL`, `SIMPLE_CHAT_CODEC_ALLOWED_ORIGINS` | worker | **Required in the catalog.** The codec server's `/decode` can fetch S3 payloads, so it must check the Temporal Cloud token (JWKS) and only allow the Temporal UI origin (e.g. `https://cloud.temporal.io`). The code defaults to auth off and CORS `*` for local use. |
 | `SIMPLE_CHAT_API_HOST`, `SIMPLE_CHAT_CODEC_SERVER_HOST` | API, worker | `0.0.0.0` so Services and probes can reach them |
 | `SIMPLE_CHAT_PUBLIC_URL` | API | Public base URL (OAuth callbacks) |
 
@@ -127,7 +128,7 @@ Add one lifecycle rule to the app bucket for the frame archive:
 - **Prefix:** the archive prefix (`agent-frames/` by default).
 - **Expire after:** at least 15 days, the session TTL (`AGENT_SESSION_TTL_SECONDS`). The archive holds the only full transcript once Temporal has truncated the stream at continue-as-new and Redis has expired, so a shorter rule loses transcripts of live sessions.
 
-Don't expire claim-check payloads sooner than the namespace's retention plus the session TTL: a retained history may still point at them.
+Don't expire claim-check payloads sooner than the namespace's retention plus one day. A closed run's retained history may still point at them, and an open session continues-as-new at least daily (`MAX_RUN_AGE` in `agent/workflow.py`), so no open run points at payloads older than that.
 
 ## Validation
 

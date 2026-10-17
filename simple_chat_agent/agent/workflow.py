@@ -90,6 +90,9 @@ with workflow.unsafe.imports_passed_through():
 
 # Wake an idle session this often so a deploy can move it to the new version (PRD A18).
 IDLE_WAKE = timedelta(hours=1)
+# An idle session still continues-as-new this often (P5 review M1), so no open run points
+# at claim-check payloads or history older than about a day.
+MAX_RUN_AGE = timedelta(days=1)
 # How many front-door request ids to remember for dedup, across continue-as-new.
 RECENT_REQUEST_IDS = 500
 # Stream events carried across continue-as-new (see _continue_as_new): a small tail past what
@@ -305,6 +308,7 @@ class CodingAgent:
             or info.is_continue_as_new_suggested()
             or info.is_target_worker_deployment_version_changed()
             or (forced is not None and self._turns_this_run >= forced)
+            or workflow.now() - info.start_time >= MAX_RUN_AGE
         )
 
     def _ready_to_continue_as_new(self) -> bool:

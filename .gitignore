@@ -70,3 +70,6 @@ crash.*.log
 
 # Local output of the old Lambda sandbox deploy (IAM policy records); kept out of git.
 .lambda-build/
+
+# The local Temporal dev server database (holds session histories).
+dev.db*
