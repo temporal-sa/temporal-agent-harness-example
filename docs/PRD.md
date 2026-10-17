@@ -13,6 +13,7 @@
 
 | Date | Version | Change | By |
 |---|---|---|---|
+| 2026-10-16 | 1.2 | **P5 complete** (`docs/phases/P5-report.md`). UI at `/`, new worker behind the unchanged entrypoint, old app deleted (121 files). Hardening and docs (security checklist, README, catalog, cutover runbook); cutover dry run passed on a dev namespace. Deep review: no blockers, two majors fixed (daily continue-as-new for idle sessions; codec auth in catalog doc). Image builds at HEAD. Awaiting owner `/go release`. | PM |
 | 2026-10-16 | 1.2 | **Owner approved P5 (hardening)** by `/yes`, with "remember streamlined process"; covers deleting the old code on the branch. Lean plan in `docs/phases/P5-handoff.md`. Release, push and termination of old chats still need `/go release`. | Owner |
 | 2026-10-16 | 1.2 | **P4 complete** (`docs/phases/P4-report.md`). MCP (local only), Code Mode, `ask_user`, `pick_files`, provider web search with sources, and the `basic_file_agent` rewrite each passed one live check; one combined review (no blockers; one major fixed). Minor items deferred to P5. Awaiting owner go for P5. | PM |
 | 2026-10-16 | 1.2 | **Owner approved P4 (demo extras)** by `/yes`, with the instruction to reduce testing (time and tokens). P4 handoff (`docs/phases/P4-handoff.md`) sets a lean test plan: one live check per feature on Haiku, one regression and one demo pass at the end, one combined review. PM calls: MCP local only (D7); provider web search off by default behind a per-session toggle, local only until the owner says otherwise. | Owner |
@@ -285,7 +286,7 @@ Turn flow:
 | **P2 API and streaming** | S1–S8 | Contract test against client 0.1.0. Three tabs use one subscriber. Workers-down: transcript renders; sends land as Signals, then apply exactly once. Cross-user 404 on every route. | Done |
 | **P3 UI** | U0 (owner review first), U1–U8, demo seed | The §2.5 demo script passes end to end twice in a row. Playwright: 100 ms accepted state; no Query from the browser. Copy review against guide 09. | Done |
 | **P4 Demo extras** | A8 MCP, A11 Code Mode, A12 callbacks, provider web search as a sources list, `basic_file_agent` | Each feature's AC. A cost per demo run is measured and written to the README. | Done (README note in P5) |
-| **P5 Hardening** | Security checklist (each item linked to a test), docs, Docker, cutover runbook dry run on a dev namespace, deletion of old code | Independent deep review passes. Image builds. Recorded local demo. | In progress |
+| **P5 Hardening** | Security checklist (each item linked to a test), docs, Docker, cutover runbook dry run on a dev namespace, deletion of old code | Independent deep review passes. Image builds. Recorded local demo. | Done (demo recording is the owner's) |
 | Release | Catalog deploy | Owner `/go release` | Not started |
 
 ---
