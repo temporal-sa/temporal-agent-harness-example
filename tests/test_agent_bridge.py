@@ -26,6 +26,8 @@ from temporalio.client import WorkflowExecutionStatus
 
 from temporal_agent_harness.harness.agent_protocol import AgentEvent
 from temporal_agent_harness.harness.agent_protocol.events import (
+    CallbackRequested,
+    CallbackResolved,
     MessageAccepted,
     MessageHandlerStart,
     ModelInteractionEnded,
@@ -371,6 +373,32 @@ class ForwarderTests(_RedisCase):
                 await fwd._settle()
         self.assertEqual(calls, ["stream_acked"])
         self.assertEqual((await self.store.meta("s")).acked, 7)
+
+    async def test_open_pick_files_calls_are_mirrored(self) -> None:
+        """P5: the upload route accepts files only for a pick_files call that waits. The bridge
+        opens it on callback_requested (before the frame is stored), closes it on
+        callback_resolved, and clears all at the root turn end. Other callbacks aren't opened."""
+        t0 = 1000.0
+        head = [
+            (item(MessageAccepted(handler="chat", payload={}, disposition="opened"), ts=t0), 1),
+            (item(TurnStarted(), msg=None, ts=t0 + 1), 2),
+            (item(MessageHandlerStart(), ts=t0 + 2), 3),
+            (item(CallbackRequested(tool_id="pick-1", tool_name="pick_files"), ts=t0 + 3), 4),
+            (item(CallbackRequested(tool_id="ask-1", tool_name="ask_user"), ts=t0 + 4), 5),
+            (item(CallbackRequested(tool_id="pick-2", tool_name="pick_files"), ts=t0 + 5), 6),
+        ]
+        await self.forward(Script(head))
+        self.assertTrue(await self.store.pick_open("s", "pick-1"))
+        self.assertTrue(await self.store.pick_open("s", "pick-2"))
+        self.assertFalse(await self.store.pick_open("s", "ask-1"))
+        await self.r.delete(self.store._k("s", "lease"))
+        resolved = head + [(item(CallbackResolved(tool_id="pick-1", tool_name="pick_files", outcome="ok"), ts=t0 + 6), 7)]
+        await self.forward(Script(resolved))
+        self.assertFalse(await self.store.pick_open("s", "pick-1"))
+        self.assertTrue(await self.store.pick_open("s", "pick-2"))
+        await self.r.delete(self.store._k("s", "lease"))
+        await self.forward(Script(resolved + [(item(TurnEnded(), msg=None, ts=t0 + 7), 8)]))
+        self.assertFalse(await self.store.pick_open("s", "pick-2"))
 
     async def test_lease_loss_stops_writes(self) -> None:
         b = self.bridge()
@@ -833,11 +861,14 @@ class SettingsResultTests(_RedisCase):
         applied = {"ok": True, "detail": "Approvals: auto.", "setting": "posture", "model": None, "posture": "auto"}
         refused = {"ok": False, "detail": "no key", "setting": "model",
                    "model": {"provider": "anthropic", "model": "claude-sonnet-5-5", "effort": None}, "posture": None}
+        # P5: set_web_search results too, so the toggle reads right after a reload.
+        web = {"ok": True, "detail": "Web search on.", "setting": "web_search", "web_search": True}
         entries = turn_script(False)[:-1] + [
             (item(MessageHandlerEnd(output=applied), msg="p1"), 7),
             (item(MessageHandlerEnd(output=refused), msg="p2"), 8),
             (item(MessageHandlerEnd(output={"text": "chat reply"}), msg="m1"), 9),
-            (item(TurnEnded(), msg=None, ts=2000.0), 10),
+            (item(MessageHandlerEnd(output=web), msg="w1"), 10),
+            (item(TurnEnded(), msg=None, ts=2000.0), 11),
         ]
         calls: list[tuple[str, dict]] = []
 
@@ -849,7 +880,7 @@ class SettingsResultTests(_RedisCase):
         self.assertTrue(await self.store.acquire_lease("s", b.holder))
         with mock.patch.object(agent_bridge, "AgentClient", Script(entries).client):
             await _Forwarder(b, "s")._forward_once()
-        self.assertEqual(calls, [("s", applied), ("s", refused)])
+        self.assertEqual(calls, [("s", applied), ("s", refused), ("s", web)])
 
     async def test_a_failing_update_never_stops_the_transcript(self) -> None:
         from temporal_agent_harness.harness.agent_protocol.events import MessageHandlerEnd

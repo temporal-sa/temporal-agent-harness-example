@@ -8,6 +8,7 @@ import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from 
 import { api, ApiError, type McpFeature } from "../session";
 import type { McpAuthMode, McpServer, McpStatus } from "../session/api";
 import { Dialog } from "../shell/Dialog";
+import { safeAuthUrl } from "./authUrl";
 
 const STATUS_TEXT: Record<McpStatus, string> = {
   connected: "Connected",
@@ -36,6 +37,8 @@ export function mcpErrorText(err: unknown): string {
       return "The server asks you to sign in. Choose OAuth, or a bearer token.";
     case "mcp_unreachable":
       return "Couldn't reach the server. Check the URL and that it's running.";
+    case "too_many_oauth_flows":
+      return "Too many MCP sign-ins are open. Finish or close one, or wait a few minutes.";
     default:
       return err instanceof Error && err.message ? err.message : "Something went wrong. Try again.";
   }
@@ -116,7 +119,9 @@ export function McpDialog({ feature, reconnect, onClose, onChanged }: { feature:
 
   async function oauth(name: string, url: string) {
     const r = await api.startMcpOAuth({ name, url });
-    window.location.assign(r.authorization_url);
+    const target = safeAuthUrl(r.authorization_url);
+    if (!target) throw new Error("The server's sign-in page isn't an https address, so it wasn't opened.");
+    window.location.assign(target);
   }
 
   async function submit(e: FormEvent) {
@@ -221,16 +226,19 @@ export function McpDialog({ feature, reconnect, onClose, onChanged }: { feature:
                   {s.status && <span className={`status ${s.status}`}>{STATUS_TEXT[s.status] ?? s.status}</span>}
                   {s.tools && <span className="hint">{s.tools.length === 1 ? "1 tool" : `${s.tools.length} tools`}</span>}
                   <span className="spacer" />
-                  <button
-                    type="button"
-                    id={`mcp-reconnect-${s.name}`}
-                    className="btn secondary small"
-                    disabled={busy === s.name}
-                    aria-label={`Reconnect ${s.name}`}
-                    onClick={() => void reconnectServer(s)}
-                  >
-                    Reconnect
-                  </button>
+                  {s.auth_mode !== "none" && (
+                    // No sign-in, nothing to reconnect (P5).
+                    <button
+                      type="button"
+                      id={`mcp-reconnect-${s.name}`}
+                      className="btn secondary small"
+                      disabled={busy === s.name}
+                      aria-label={`Reconnect ${s.name}`}
+                      onClick={() => void reconnectServer(s)}
+                    >
+                      Reconnect
+                    </button>
+                  )}
                   <button type="button" className="btn ghost small" disabled={busy === s.name} aria-label={`Remove ${s.name}`} onClick={() => void remove(s.name)}>
                     Remove
                   </button>

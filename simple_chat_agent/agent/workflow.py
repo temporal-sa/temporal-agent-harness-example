@@ -239,6 +239,7 @@ class CodingAgent:
         self._pending_model: ModelChoice | None = carried.pending_model
         self._seen_requests: deque[str] = deque(carried.recent_request_ids, maxlen=RECENT_REQUEST_IDS)
         self._deferred: list[FrontDoorMessage] = list(carried.pending_messages)
+        mcp.restore_cache(self, carried.mcp_tools)
         self._workspace_id = data.workspace_id or workflow.info().workflow_id
         # Code Mode (PRD A11): built once per run; an approved script's host calls skip their
         # own gate ("Approve script" approves them once).
@@ -368,6 +369,7 @@ class CodingAgent:
                 "workspace": self.workspace.current.model_dump(mode="json"),
             },
             steer_queue=self._steer,
+            mcp_tools=mcp.carry_cache(self),
         )
         next_config = AgentConfig(
             approval_policy=self._runner.approval_policy,

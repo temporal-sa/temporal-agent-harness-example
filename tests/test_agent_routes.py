@@ -747,6 +747,20 @@ class DirectorySyncTests(AgentRoutesTestBase):
             ],
         )
 
+    def test_web_search_is_in_the_summary_and_follows_the_agent(self) -> None:
+        # P5: the toggle reads the session's value after a reload, from the summary.
+        sid = self.create()["workflow_id"]
+        self.assertIs(self.listed(sid)["web_search"], False)
+        signals = len(self.manager_signals())
+        update = agent_routes.session_settings_updater(self.directory, self.store)
+        self.run_async(update(sid, {"ok": True, "setting": "web_search", "web_search": True}))
+        self.assertIs(self.listed(sid)["web_search"], True)
+        self.assertIs(self.client.get(f"/api/agent/sessions/{sid}", headers=A).json()["web_search"], True)
+        # Redis only: CodingSessions isn't signalled for it.
+        self.assertEqual(len(self.manager_signals()), signals)
+        self.run_async(update(sid, {"ok": True, "setting": "web_search", "web_search": None}))
+        self.assertIs(self.listed(sid)["web_search"], True)
+
     def test_a_change_the_worker_refused_puts_the_old_value_back(self) -> None:
         sid = self.create()["workflow_id"]
         before = self.listed(sid)

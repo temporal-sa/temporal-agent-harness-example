@@ -195,8 +195,9 @@ def process_environment() -> str:
 
 def mcp_net_policy(environment: str) -> net_guard.NetPolicy:
     """The guard's policy for MCP traffic. Production: :func:`net_guard.default_policy`.
-    Local development may also reach loopback on the ports in ``AGENT_MCP_LOOPBACK_PORTS``,
-    and only when both the session and this process are local."""
+    Local development may also reach loopback on the ports in ``AGENT_MCP_LOOPBACK_PORTS``
+    (and on no other port), and only when both the session and this process are local.
+    Public hosts stay on the base port list."""
     base = net_guard.default_policy()
     raw = os.environ.get(LOOPBACK_PORTS_ENV, "").strip()
     if not raw or environment != "local" or process_environment() != "local":
@@ -204,9 +205,10 @@ def mcp_net_policy(environment: str) -> net_guard.NetPolicy:
     ports = frozenset(int(p) for p in raw.replace(" ", "").split(",") if p.isdigit())
     return net_guard.NetPolicy(
         allowed_schemes=base.allowed_schemes,
-        allowed_ports=base.allowed_ports | ports,
+        allowed_ports=base.allowed_ports,
         max_redirects=0,
         allow_networks=_LOOPBACK,
+        exception_ports=ports,
     )
 
 

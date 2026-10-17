@@ -337,6 +337,22 @@ _self_test_error: str | None = None
 _live_health_lock = asyncio.Lock()
 _last_live_health_check_at = 0.0
 _last_live_health_error: str | None = None
+# Paths served without the bearer token.
+_PUBLIC_PATHS = frozenset({"/healthz"})
+
+
+@app.middleware("http")
+async def _authorize_before_body(request: Request, call_next: Any) -> Any:
+    """Check the bearer token before FastAPI reads or validates the request body (P5), so an
+    unauthenticated caller gets 401 (or 503 when no token is configured) and never a 422
+    that describes the body schema. The handlers' own ``_authorize`` calls stay as a second
+    check."""
+    if request.url.path not in _PUBLIC_PATHS:
+        try:
+            _authorize(request.headers.get("authorization"))
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return await call_next(request)
 
 
 @app.get("/healthz")
@@ -1814,6 +1830,8 @@ def _sandbox_env() -> dict[str, str]:
         "LC_ALL": "C.UTF-8",
         "PIP_CACHE_DIR": "/workspace/.cache/pip",
         "PYTHONUNBUFFERED": "1",
+        # No __pycache__ in the workspace: it would show up as changes (P5).
+        "PYTHONDONTWRITEBYTECODE": "1",
         "GIT_AUTHOR_NAME": name,
         "GIT_AUTHOR_EMAIL": email,
         "GIT_COMMITTER_NAME": name,

@@ -98,6 +98,27 @@ class ExecutorFilesAuthTests(_ExecutorFilesTestBase):
                     self.assertEqual(response.status_code, 401)
         self.assertFalse((self.workspace / "a").exists())
 
+    def test_auth_is_checked_before_the_body_is_parsed(self) -> None:
+        # P5: an unauthenticated caller gets 401, never a 422 that describes the schema.
+        for path in ("/files/read", "/files/write", "/execute", "/execute/log", "/execute/cancel"):
+            for body in (b"not json", b'{"unexpected": 1}'):
+                with self.subTest(path=path, body=body):
+                    response = self.client.post(
+                        path, content=body, headers={"Content-Type": "application/json"}
+                    )
+                    self.assertEqual(response.status_code, 401, response.text)
+                    self.assertNotIn("workspace_id", response.text)
+        # Authorized, the same bad body is a validation error as before.
+        response = self.client.post(
+            "/files/read", content=b"not json",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}"},
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.client.get("/healthz").status_code in (200, 503), True)
+
+    def test_sandbox_env_skips_bytecode(self) -> None:
+        self.assertEqual(sandbox_executor._sandbox_env()["PYTHONDONTWRITEBYTECODE"], "1")
+
     def test_unconfigured_token_refuses_requests(self) -> None:
         with patch.dict("os.environ", {"WORKSPACE_EXECUTOR_TOKEN": ""}):
             response = self.call("list", path=".")

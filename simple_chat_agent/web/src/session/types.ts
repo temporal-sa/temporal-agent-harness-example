@@ -489,6 +489,8 @@ export interface SessionSeed {
   /** From the session summary: the model and posture it started with. */
   model?: ModelChoice | null;
   posture?: Posture | null;
+  /** From the session summary: whether web search is on (P5; absent on older summaries). */
+  webSearch?: boolean | null;
   /** Config `tool_risk_classes`, `default_tool_risk_class` and `remember_allowed_classes`. */
   toolRiskClasses?: Readonly<Record<string, string>> | null;
   defaultToolRiskClass?: string | null;

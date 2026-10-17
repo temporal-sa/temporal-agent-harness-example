@@ -327,7 +327,8 @@ export function useCodingSession(sessionId: string, seed: SessionSeed = {}): Cod
     answerCallback: (toolId, result) => callbackRun(toolId, "answer", { result }),
     declineCallback: (toolId, reason) => callbackRun(toolId, "decline", { error: reason?.trim() || "The user declined." }),
     uploadPicked: (toolId, file, onProgress) => uploadPickedFile(sessionId, toolId, file, onProgress),
-    webSearch: webSearchOn(h.messages, false),
+    // The summary's value (kept current by the bridge), then any toggles in the transcript.
+    webSearch: webSearchOn(h.messages, seed.webSearch ?? false),
     setWebSearch: (enabled: boolean) => runMessage("set_web_search", "set_web_search", { enabled }),
     toolProgress: progress.text,
     toolProgressChunks: progress.chunks,

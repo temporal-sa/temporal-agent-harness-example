@@ -138,6 +138,8 @@ export function sessionStatus(input: {
   return "idle";
 }
 
+const MCP_TOOL_PREFIX = "mcp__";
+
 /** Tag each waiting call with its approval class from config, and whether "Always approve"
  *  can apply to it. Neither is hard-coded: both come from /api/agent/config. */
 export function withRiskClass<T extends { part: { toolName: string } }>(
@@ -148,7 +150,9 @@ export function withRiskClass<T extends { part: { toolName: string } }>(
 ): (T & { riskClass: string | null; rememberAllowed: boolean })[] {
   return approvals.map((w) => {
     const riskClass = classes?.[w.part.toolName] ?? fallback ?? null;
-    return { ...w, riskClass, rememberAllowed: riskClass !== null && (rememberAllowed ?? []).includes(riskClass) };
+    // MCP tools are never remembered (P5), whatever class config gives them.
+    const mcp = w.part.toolName.startsWith(MCP_TOOL_PREFIX);
+    return { ...w, riskClass, rememberAllowed: !mcp && riskClass !== null && (rememberAllowed ?? []).includes(riskClass) };
   });
 }
 

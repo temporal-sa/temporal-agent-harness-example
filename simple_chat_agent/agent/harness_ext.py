@@ -415,7 +415,7 @@ def _invoker(
         except Exception as exc:  # noqa: BLE001 - mirror the harness adapter, except on interrupt
             if is_interrupted():
                 raise asyncio.CancelledError(f"{name} stopped by the user") from exc
-            return f"Tool {name!r} failed: {exc}"
+            return f"Tool {name!r} failed: {tool_failure_text(exc)}"
         finally:
             if after_call is not None:
                 after_call(name)
@@ -428,6 +428,22 @@ def _invoker(
         return result
 
     return invoke
+
+
+def tool_failure_text(exc: BaseException) -> str:
+    """The reason a tool failed, as the model should read it (P5). An activity tool's
+    failure arrives as ``ActivityError`` ("Activity task failed"); its reason is the
+    ``ApplicationError`` underneath (e.g. "notes/c.txt does not exist.")."""
+    from temporalio.exceptions import ActivityError, ApplicationError
+
+    current: BaseException | None = exc
+    for _ in range(5):
+        if isinstance(current, ApplicationError):
+            return current.message or str(current)
+        if not isinstance(current, ActivityError):
+            break
+        current = current.cause or current.__cause__
+    return str(exc) or type(exc).__name__
 
 
 class TurnInterrupted(Exception):

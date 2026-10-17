@@ -28,6 +28,7 @@ import logging
 import os
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -46,6 +47,10 @@ MAX_TOKEN_CHARS = 8192
 MAX_URL_CHARS = 2000
 OAUTH_START_TIMEOUT = 30.0
 OAUTH_FINISH_TIMEOUT = 60.0
+# Concurrent OAuth flows one user may have pending (each also times out; see
+# ``common.mcp_oauth.MCP_OAUTH_FLOW_TIMEOUT_SECONDS``). Starting again for the same server
+# replaces that server's pending flow instead of counting twice.
+MAX_OAUTH_FLOWS_PER_USER = 3
 REBUILD_BACKOFF_SECONDS = 60
 CALLBACK_PATH = "/api/agent/mcp/oauth/callback"
 APP_PATH = "/"
@@ -76,6 +81,21 @@ class AddServer(BaseModel):
 class OAuthStart(BaseModel):
     name: str = Field(min_length=1, max_length=24)
     url: str = Field(min_length=1, max_length=MAX_URL_CHARS)
+
+
+class _CandidateToken:
+    """Stands in for the app store while a new bearer token is tried: answers the one
+    lookup ``mcp_client.resolve_auth`` makes, for this user only, without storing anything."""
+
+    REF = "candidate"
+
+    def __init__(self, user_id: str, token: str) -> None:
+        self._connection = SimpleNamespace(
+            user_id=user_id, access_token=token, token_type="Bearer", metadata={"auth_mode": "bearer"}
+        )
+
+    def get_oauth_connection_by_id(self, ref: str) -> Any:
+        return self._connection if ref == self.REF else None
 
 
 def create_mcp_router(
@@ -182,11 +202,14 @@ def create_mcp_router(
             raise error(422, "unreachable", f"That URL can't be reached: {exc}") from None
         return url
 
-    async def discover(uid: str, record: McpServerRecord, env: str) -> list[dict[str, str]]:
+    async def discover(
+        uid: str, record: McpServerRecord, env: str, *, credentials: Any = None
+    ) -> list[dict[str, str]]:
+        """List the server's tools as ``uid``. ``credentials`` stands in for the app store
+        (a token not yet stored, see :class:`_CandidateToken`)."""
+        creds = credentials or (app_store() if record.auth_ref and app_store else None)
         try:
-            tools = await mcp_client.list_tools(
-                record, owner_id=uid, store=app_store() if record.auth_ref and app_store else None, environment=env
-            )
+            tools = await mcp_client.list_tools(record, owner_id=uid, store=creds, environment=env)
         except mcp_client.McpAuthForbidden as exc:
             raise error(403, "auth_ref_forbidden", str(exc)) from None
         except Exception as exc:  # noqa: BLE001 - classified for the dialog
@@ -219,34 +242,37 @@ def create_mcp_router(
         existing = {r.name for r in await records(uid)}
         if body.name not in existing and len(existing) >= mcp_client.MAX_SERVERS:
             raise error(422, "too_many_servers", f"At most {mcp_client.MAX_SERVERS} MCP servers.")
-        auth_ref = None
+        token = (body.bearer_token or "").strip()
         if body.auth_mode == "bearer":
-            token = (body.bearer_token or "").strip()
             if not token:
                 raise error(422, "token_required", "A bearer token is required.")
-            auth_ref = store().upsert_oauth_connection(
-                user_id=uid,
-                provider=provider(body.name),
-                access_token=token,
-                token_type="Bearer",
-                scope="",
-                provider_user_id=None,
-                provider_user_login=None,
-                metadata={"auth_mode": "bearer"},
-            )
+            store()  # credential storage must exist before we try the token
         record = McpServerRecord(
             name=body.name,
             url=url,
             auth_mode=body.auth_mode,
-            auth_ref=auth_ref,
+            auth_ref=_CandidateToken.REF if body.auth_mode == "bearer" else None,
             added_at=datetime.now(timezone.utc).isoformat(),
         )
-        try:
-            tools = await discover(uid, record, env)
-        except Exception:
-            if auth_ref is not None and body.name not in existing:
-                store().delete_oauth_connection(user_id=uid, provider=provider(body.name))
-            raise
+        # Discover with the new token first; store it only on success, so a failed re-add
+        # never overwrites a working token (P5).
+        candidate = _CandidateToken(uid, token) if body.auth_mode == "bearer" else None
+        tools = await discover(uid, record, env, credentials=candidate)
+        if body.auth_mode == "bearer":
+            record = record.model_copy(
+                update={
+                    "auth_ref": store().upsert_oauth_connection(
+                        user_id=uid,
+                        provider=provider(body.name),
+                        access_token=token,
+                        token_type="Bearer",
+                        scope="",
+                        provider_user_id=None,
+                        provider_user_login=None,
+                        metadata={"auth_mode": "bearer"},
+                    )
+                }
+            )
         await save(uid, record)
         return JSONResponse({"server": view(uid, record, status="connected", tools=tools)})
 
@@ -301,6 +327,18 @@ def create_mcp_router(
         if body.name not in existing and len(existing) >= mcp_client.MAX_SERVERS:
             raise error(422, "too_many_servers", f"At most {mcp_client.MAX_SERVERS} MCP servers.")
         app = store()
+        # A new start for the same server replaces its pending flow; otherwise cap per user.
+        for old in [f for f in flows.values() if f.user_id == uid and f.server_id == body.name]:
+            flows.pop(old.flow_id, None)
+            if old.task is not None:
+                old.task.cancel()
+        if sum(1 for f in flows.values() if f.user_id == uid) >= MAX_OAUTH_FLOWS_PER_USER:
+            raise error(
+                429,
+                "too_many_oauth_flows",
+                f"At most {MAX_OAUTH_FLOWS_PER_USER} MCP sign-ins can be open at once. "
+                "Finish or close one, or wait a few minutes.",
+            )
         flow = PendingMcpOAuthFlow(user_id=uid, server_id=body.name, server_url=url, tool_prefix=body.name, label=body.name)
         flows[flow.flow_id] = flow
         flow.task = asyncio.create_task(finish(flow, app, env, callback_url(request, flow.flow_id)))

@@ -104,6 +104,8 @@ WORKER_CHECK_EVERY_SECONDS = float(os.environ.get("AGENT_BRIDGE_WORKER_CHECK_SEC
 WORKER_CHECK_MAX_SECONDS = float(os.environ.get("AGENT_BRIDGE_WORKER_CHECK_MAX_SECONDS", "60"))
 # Idle, nothing pending, last root frame outside a turn: end the attach after this much silence.
 OUT_OF_TURN_QUIET_SECONDS = float(os.environ.get("AGENT_BRIDGE_OUT_OF_TURN_QUIET_SECONDS", "3"))
+# The callback tool whose uploads the API accepts only while a call waits (P5).
+PICK_FILES_TOOL = "pick_files"
 
 
 def sse_data(item: AgentEvent) -> tuple[str, dict[str, Any]]:
@@ -626,6 +628,11 @@ class _Forwarder:
                     confirm_token = await self.store.begin_confirming(
                         self.session, time.time() + CONFIRM_TIMEOUT_SECONDS
                     )
+                if is_root:
+                    # Mirror open pick_files calls before the frame is stored, so the browser
+                    # never sees a card the upload route would refuse (also for a dup:
+                    # idempotent, and a takeover replays the open turn in order).
+                    await self._mirror_pick(event, data)
                 if not dup:
                     # (A dup was stored by the previous holder. It is still folded below: that
                     # holder may have died between storing a frame and saving its meta.)
@@ -681,6 +688,18 @@ class _Forwarder:
             with contextlib.suppress(Exception):
                 await frames.aclose()
         return count
+
+    async def _mirror_pick(self, event: str, data: dict[str, Any]) -> None:
+        """Keep the session's set of waiting ``pick_files`` tool ids (P5): the upload route
+        accepts files only for one of these, with no Query."""
+        tool_id = data.get("tool_id")
+        if event == "callback_requested" and data.get("tool_name") == PICK_FILES_TOOL and tool_id:
+            await self.store.open_pick(self.session, tool_id)
+        elif event in ("callback_resolved", "tool_end", "tool_error") and tool_id:
+            await self.store.close_pick(self.session, tool_id)
+        elif event == "turn_end":
+            # A callback belongs to its turn; nothing waits after the turn ends.
+            await self.store.clear_picks(self.session)
 
     # -- writing -----------------------------------------------------------------------
 
@@ -865,12 +884,12 @@ class _Forwarder:
     # -- session settings ----------------------------------------------------------------
 
     async def _apply_settings(self, output: Any) -> None:
-        """A root ``set_model`` / ``set_posture`` result: copy the value the agent now holds
-        (new when ok, unchanged when refused) into the session list."""
+        """A root ``set_model`` / ``set_posture`` / ``set_web_search`` result: copy the value
+        the agent now holds (new when ok, unchanged when refused) into the session list."""
         callback = self.b._on_settings
         if callback is None or not isinstance(output, dict):
             return
-        if output.get("setting") not in ("model", "posture"):
+        if output.get("setting") not in ("model", "posture", "web_search"):
             return
         try:
             await callback(self.session, output)

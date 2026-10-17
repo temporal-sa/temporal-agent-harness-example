@@ -149,6 +149,8 @@ export interface SessionSummary {
   posture: Posture | null;
   environment: string | null;
   demo: string | null;
+  /** Whether provider web search is on, as the agent last acknowledged (P5). */
+  web_search?: boolean | null;
 }
 
 export const listSessions = () => request<SessionSummary[]>(`${AGENT_API_BASE}sessions`);

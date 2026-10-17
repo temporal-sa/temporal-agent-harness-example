@@ -166,5 +166,25 @@ class CloseWithNote(unittest.TestCase):
         self.assertEqual([p.content for p in out[0].parts], ["do it", "I stopped"])
 
 
+
+class ToolFailureText(unittest.TestCase):
+    def test_activity_failure_reaches_the_model_as_its_reason(self) -> None:
+        # P5 (P3 deferred): "notes/c.txt does not exist.", not "Activity task failed".
+        from temporalio.api.enums.v1 import RetryState
+        from temporalio.exceptions import ActivityError, ApplicationError
+
+        from simple_chat_agent.agent.harness_ext import tool_failure_text
+
+        cause = ApplicationError("notes/c.txt does not exist.", type="Workspace_not_found", non_retryable=True)
+        err = ActivityError(
+            "Activity task failed", scheduled_event_id=1, started_event_id=2, identity="w",
+            activity_type="read_file", activity_id="1", retry_state=RetryState.RETRY_STATE_NON_RETRYABLE_FAILURE,
+        )
+        err.__cause__ = cause
+        self.assertEqual(tool_failure_text(err), "notes/c.txt does not exist.")
+        self.assertEqual(tool_failure_text(cause), "notes/c.txt does not exist.")
+        self.assertEqual(tool_failure_text(ValueError("bad args")), "bad args")
+
+
 if __name__ == "__main__":
     unittest.main()

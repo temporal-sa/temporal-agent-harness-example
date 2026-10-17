@@ -301,6 +301,18 @@ def build_toolset(
     return FunctionToolset(tools, id="mcp") if tools else None
 
 
+def restore_cache(instance: Any, carried: list[dict[str, Any]]) -> None:
+    """Put the MCP tool list carried across continue-as-new back on the new run's instance."""
+    if carried:
+        setattr(instance, CACHE_ATTR, [McpServerTools.model_validate(c) for c in carried])
+
+
+def carry_cache(instance: Any) -> list[dict[str, Any]]:
+    """The MCP tool list to carry into the next run (empty if never listed)."""
+    cached: list[McpServerTools] = getattr(instance, CACHE_ATTR, None) or []
+    return [c.model_dump(mode="json") for c in cached]
+
+
 async def toolsets_for_run(data: Any, *, is_interrupted: Callable[[], bool] = lambda: False) -> list[Any]:
     """The MCP toolsets for this model run (empty unless the session has MCP on).
 

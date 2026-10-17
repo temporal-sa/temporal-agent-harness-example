@@ -137,8 +137,8 @@ TITLE_MAX = 200
 # Browser callbacks (PRD A12): tool ids we accept, the answer's size, and an error note's length.
 _TOOL_ID = re.compile(r"^[A-Za-z0-9_.:/-]{1,200}$")
 CALLBACK_RESULT_MAX_BYTES = 16 * 1024
-# Per-session caps on pick_files uploads, across all tool ids (P4 review: the route can't
-# prove a pick is waiting without a Query, so these bound what one session can write).
+# Per-session caps on pick_files uploads, across all tool ids (P4 review). Uploads are also
+# accepted only while that pick waits (P5, mirrored by the bridge); the caps bound the total.
 PICK_SESSION_MAX_FILES = 50
 PICK_SESSION_MAX_BYTES = 50 * 1024 * 1024
 CALLBACK_ERROR_MAX = 500
@@ -781,11 +781,21 @@ class SessionDirectory:
         return record
 
     async def update_settings(
-        self, user_id: str, session_id: str, *, model: ModelChoice | None = None, posture: str | None = None
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        model: ModelChoice | None = None,
+        posture: str | None = None,
+        web_search: bool | None = None,
     ) -> dict[str, Any] | None:
-        """The session's current model or posture, after the API accepted a change: Redis at
-        once, then ``update_session_signal`` (signal-with-start, so workers can be down)."""
+        """The session's current model, posture or web search, after the agent accepted a
+        change: Redis at once, then (model and posture) ``update_session_signal``
+        (signal-with-start, so workers can be down). Web search lives in Redis only; a rebuilt
+        list has the start value from the memo, and the client folds later toggles on top."""
         fields: dict[str, Any] = {}
+        if web_search is not None:
+            fields["web_search"] = web_search
         if model is not None:
             fields["model"] = model.registry_key
             fields["model_choice"] = model.model_dump(mode="json", exclude_none=True)
@@ -796,11 +806,12 @@ class SessionDirectory:
         record = await self._update_record(user_id, session_id, **fields)
         if record is None:
             return None
-        await self._send(
-            user_id,
-            "update_session_signal",
-            {"session_id": session_id, "model": fields.get("model"), "posture": posture},
-        )
+        if model is not None or posture is not None:
+            await self._send(
+                user_id,
+                "update_session_signal",
+                {"session_id": session_id, "model": fields.get("model"), "posture": posture},
+            )
         return record
 
     async def mark_closed(self, user_id: str, session_id: str) -> None:
@@ -921,7 +932,7 @@ class SessionDirectory:
             log.warning("session directory %s for %s not recorded in CodingSessions: %s", signal, digest, exc)
 
 
-SESSION_MEMO_FIELDS = ("title", "created_at", "model", "model_choice", "posture", "environment", "demo")
+SESSION_MEMO_FIELDS = ("title", "created_at", "model", "model_choice", "posture", "environment", "demo", "web_search")
 
 
 def session_memo(record: dict[str, Any]) -> dict[str, Any]:
@@ -953,6 +964,8 @@ async def _rebuilt_record(execution: Any) -> dict[str, Any]:
         "posture": memo.get("posture") or None,
         "environment": memo.get("environment"),
         "demo": memo.get("demo"),
+        # The start value (the memo isn't updated); the client folds later toggles on top.
+        "web_search": memo.get("web_search") if isinstance(memo.get("web_search"), bool) else None,
         "rebuilt": True,
     }
 
@@ -1145,6 +1158,7 @@ def _summary(record: dict[str, Any], *, closed: bool = False) -> dict[str, Any]:
         "posture": record.get("posture"),
         "environment": record.get("environment"),
         "demo": record.get("demo"),
+        "web_search": record.get("web_search"),
     }
 
 
@@ -1332,6 +1346,9 @@ def create_agent_router(
             "posture": body.posture,
             "environment": environment,
             "demo": body.demo,
+            # Whether provider web search is on (P5: the toggle reads it after a reload). The
+            # bridge keeps it current from each set_web_search result.
+            "web_search": bool(body.web_search),
         }
         client = await temporal()
         try:
@@ -1743,10 +1760,13 @@ def create_agent_router(
             raise HarnessError(413, "too_large", f"Each file is limited to {PICK_MAX_FILE_BYTES} bytes.")
         if (await store.meta(root)).closed:
             raise HarnessError(409, "session_closed", "This session is closed. Start a new one.")
+        # Only while that pick_files call waits: the bridge mirrors open calls from
+        # callback_requested / callback_resolved into Redis (P5), so this needs no Query.
+        if not await store.pick_open(root, tool_id):
+            raise HarnessError(409, "not_waiting", "That file request isn't waiting for files any more.")
         key = upload_key(root, tool_id)
         # Reserve before writing, atomically (INCR), so parallel uploads can't pass the caps
-        # together. The browser can't prove a pick_files call is waiting (that would take a
-        # Query), so the per-session caps bound what any number of tool ids can write.
+        # together. The per-session caps also bound what one session can write in total.
         ttl = session_ttl_seconds()
         counters = (
             (f"{key}:n", 1, PICK_MAX_FILES, "too_many_files", f"At most {PICK_MAX_FILES} files can be picked at once."),
@@ -1863,7 +1883,8 @@ def create_agent_router(
 def session_settings_updater(
     directory: SessionDirectory, store: AgentStore
 ) -> Callable[[str, dict[str, Any]], Awaitable[None]]:
-    """The bridge's ``on_settings``: copy a set_model / set_posture result (``SettingsAck``)
+    """The bridge's ``on_settings``: copy a set_model / set_posture / set_web_search result
+    (``SettingsAck``)
     into the owner's session list. The ack carries the value the agent holds, so a refused
     change puts the previous value back."""
 
@@ -1875,6 +1896,8 @@ def session_settings_updater(
             await directory.update_settings(owner, session_id, model=ModelChoice.model_validate(ack["model"]))
         elif ack.get("setting") == "posture" and ack.get("posture"):
             await directory.update_settings(owner, session_id, posture=str(ack["posture"]))
+        elif ack.get("setting") == "web_search" and isinstance(ack.get("web_search"), bool):
+            await directory.update_settings(owner, session_id, web_search=ack["web_search"])
 
     return update
 

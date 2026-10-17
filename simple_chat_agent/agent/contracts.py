@@ -72,6 +72,10 @@ class CarriedState(BaseModel):
     steer_queue: list[str] = Field(default_factory=list)
     # Front-door messages that arrived during the handoff; the next run admits them first.
     pending_messages: list[FrontDoorMessage] = Field(default_factory=list)
+    # The MCP tool list as last listed (``mcp_client.McpServerTools`` as JSON; P5), so the
+    # next run reuses fresh entries instead of listing every server again. Empty for runs
+    # that predate it: the next run then lists as before.
+    mcp_tools: list[dict[str, Any]] = Field(default_factory=list)
     # The remembered allow-list ("always allow") survives through AgentConfig.approval_policy,
     # which the workflow rebuilds from the live runner policy before continuing as new.
 

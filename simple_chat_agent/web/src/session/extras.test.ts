@@ -150,6 +150,9 @@ describe("web search", () => {
     const m = (enabled: boolean, over: Partial<Message> = {}) =>
       ({ id: `w${enabled}`, handler: "set_web_search", input: { enabled }, output: null, status: "done", acceptedAt: 1, ...over }) as Message;
     expect(webSearchOn([], false)).toBe(false);
+    // P5: after a reload the seed is the session summary's value.
+    expect(webSearchOn([], true)).toBe(true);
+    expect(webSearchOn([m(false)], true)).toBe(false);
     expect(webSearchOn([m(true, { status: "accepted" })], false)).toBe(true);
     expect(webSearchOn([m(true, { output: { ok: false, web_search: false, setting: "web_search", detail: "Not here." } })], false)).toBe(false);
     expect(webSearchOn([m(true), m(false, { acceptedAt: null })], false)).toBe(true);

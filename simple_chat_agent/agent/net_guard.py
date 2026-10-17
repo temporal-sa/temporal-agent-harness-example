@@ -103,6 +103,11 @@ class NetPolicy:
     # Exceptions to the address rules. Empty in production. Tests use it to reach a
     # loopback test server; an operator could use it for one named internal service.
     allow_networks: tuple[IPNetwork, ...] = field(default_factory=tuple)
+    # When set, ``allow_networks`` applies only on these ports, and these ports (if not in
+    # ``allowed_ports``) are open only to ``allow_networks`` addresses. Local MCP uses it so
+    # loopback is reachable on its named ports only, and public hosts keep the base ports.
+    # None: the exception applies on every allowed port (tests).
+    exception_ports: frozenset[int] | None = None
 
 
 def default_policy() -> NetPolicy:
@@ -238,7 +243,7 @@ def _parse(url: str, policy: NetPolicy) -> tuple[httpx.URL, str, str, int]:
             f"Refused {url!r}: no host.", url=url, reason="invalid_url"
         )
     port = parsed.port or (443 if scheme == "https" else 80)
-    if port not in policy.allowed_ports:
+    if port not in policy.allowed_ports and port not in (policy.exception_ports or ()):
         allowed = ", ".join(str(p) for p in sorted(policy.allowed_ports))
         raise BlockedDestination(
             f"Refused {url!r}: port {port} is not allowed (only {allowed}).",
@@ -265,9 +270,19 @@ def _vet_addresses(
     policy: NetPolicy,
 ) -> VettedDestination:
     checked: list[str] = []
+    exception_port = policy.exception_ports is None or port in policy.exception_ports
     for addr in addresses:
         ip = ipaddress.ip_address(addr)
-        why = None if _allowed_by_exception(ip, policy) else classify_address(ip)
+        exempt = exception_port and _allowed_by_exception(ip, policy)
+        if not exempt and port not in policy.allowed_ports:
+            raise BlockedDestination(
+                f"Refused {url!r}: port {port} is open only to the configured local addresses.",
+                url=url,
+                host=host,
+                address=addr,
+                reason="port",
+            )
+        why = None if exempt else classify_address(ip)
         if why is not None:
             via = "" if _literal_ip(host) else f" ({host} resolves to {addr})"
             raise BlockedDestination(

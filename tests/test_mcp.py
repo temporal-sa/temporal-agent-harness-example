@@ -89,6 +89,18 @@ class SsrfTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(net_guard.BlockedDestination):
                 await mcp_client.check_server_url("http://127.0.0.1:8765/mcp", "local")
 
+    async def test_loopback_exception_is_only_on_the_named_ports(self) -> None:
+        # P5: loopback is reachable on the named ports only; public hosts keep the base ports.
+        env = {"AGENT_ENVIRONMENT": "local", mcp_client.LOOPBACK_PORTS_ENV: "8765"}
+        with mock.patch.dict(os.environ, env):
+            for url in ("http://127.0.0.1/mcp", "https://127.0.0.1/mcp", "http://127.0.0.1:8766/mcp"):
+                with self.assertRaises(net_guard.BlockedDestination, msg=url):
+                    await mcp_client.check_server_url(url, "local")
+            with self.assertRaises(net_guard.BlockedDestination) as cm:
+                await mcp_client.check_server_url("https://93.184.216.34:8765/mcp", "local")
+            self.assertEqual(cm.exception.reason, "port")
+            await mcp_client.check_server_url("https://93.184.216.34/mcp", "local")
+
     async def test_guarded_transport_checks_every_request(self) -> None:
         # E.g. an OAuth refresh to a second host goes through the guard too.
         transport = mcp_client.GuardedTransport(net_guard.default_policy())
@@ -336,6 +348,112 @@ class McpRouteTests(AgentRoutesTestBase):
             with mock.patch.object(mcp_client, "list_tools", mock.AsyncMock(side_effect=unauthorized)):
                 status = self.client.get("/api/agent/mcp/servers/srv/status", headers=A).json()
         self.assertEqual((status["status"], status["code"]), ("needs_reauth", mcp_client.RECONNECT_CODE))
+
+    def test_failed_bearer_readd_keeps_the_working_token(self) -> None:
+        # P5: the new token is tried first and stored only when discovery succeeds.
+        async def list_tools(record: McpServerRecord, *, owner_id: str, store: Any, environment: str) -> Any:
+            headers, _ = mcp_client.resolve_auth(store, owner_id=owner_id, record=record)
+            if headers.get("Authorization") == "Bearer bad-token":
+                response = httpx.Response(401, request=httpx.Request("POST", record.url))
+                raise httpx.HTTPStatusError("401 Unauthorized", request=response.request, response=response)
+            return self.tools()
+
+        def add(token: str) -> Any:
+            return self.client.post(
+                "/api/agent/mcp/servers",
+                json={"name": "srv", "url": "https://mcp.example.com/mcp", "auth_mode": "bearer", "bearer_token": token},
+                headers=A,
+            )
+
+        def stored_token() -> str | None:
+            connection = self.app_store.get_oauth_connection(user_id="alice", provider="mcp:srv")
+            return connection.access_token if connection else None
+
+        with (
+            mock.patch.dict(os.environ, {"AGENT_ENVIRONMENT": "local"}),
+            mock.patch.object(mcp_client, "check_server_url", mock.AsyncMock()),
+            mock.patch.object(mcp_client, "list_tools", list_tools),
+        ):
+            self.assertEqual(add("good-token").status_code, 200)
+            self.assertEqual(stored_token(), "good-token")
+            r = add("bad-token")
+            self.assertEqual((r.status_code, r.json()["error"]), (401, "mcp_auth_required"))
+            self.assertEqual(stored_token(), "good-token")
+            listed = self.client.get("/api/agent/mcp/servers", headers=A).json()["servers"]
+            self.assertTrue(listed[0]["has_credentials"])
+            # A failed first add stores nothing.
+            r = self.client.post(
+                "/api/agent/mcp/servers",
+                json={"name": "other", "url": "https://mcp.example.com/mcp", "auth_mode": "bearer", "bearer_token": "bad-token"},
+                headers=A,
+            )
+            self.assertEqual(r.status_code, 401)
+            self.assertIsNone(self.app_store.get_oauth_connection(user_id="alice", provider="mcp:other"))
+            self.assertEqual(add("new-token").status_code, 200)
+            self.assertEqual(stored_token(), "new-token")
+
+    def test_oauth_flows_are_capped_per_user(self) -> None:
+        # P5: at most MAX_OAUTH_FLOWS_PER_USER pending; restarting one server replaces its flow.
+        from simple_chat_agent.api import agent_mcp
+        from simple_chat_agent.common import mcp_oauth
+
+        async def authorize(*, flow: Any, **_k: Any) -> None:
+            await flow.redirect(f"https://auth.example.com/authorize?f={flow.flow_id}")
+            await flow.wait_for_callback()
+
+        def start(name: str, headers: dict[str, str] = A) -> Any:
+            return self.client.post(
+                "/api/agent/mcp/oauth/start", json={"name": name, "url": "https://mcp.example.com/mcp"}, headers=headers
+            )
+
+        with (
+            mock.patch.dict(os.environ, {"AGENT_ENVIRONMENT": "local"}),
+            mock.patch.object(mcp_client, "check_server_url", mock.AsyncMock()),
+            mock.patch.object(mcp_oauth, "authorize_mcp_oauth_flow", authorize),
+            mock.patch.object(agent_mcp, "MAX_OAUTH_FLOWS_PER_USER", 2),
+        ):
+            self.assertEqual(start("one").status_code, 200)
+            self.assertEqual(start("two").status_code, 200)
+            r = start("three")
+            self.assertEqual((r.status_code, r.json()["error"]), (429, "too_many_oauth_flows"))
+            self.assertEqual(start("one").status_code, 200)  # replaces one's pending flow
+            self.assertEqual(start("three", headers=B).status_code, 200)  # per user
+
+
+class CarriedToolListTests(unittest.TestCase):
+    def test_tool_list_round_trips_through_carried_state(self) -> None:
+        # P5: carried across continue-as-new; a run that predates the field carries nothing.
+        from simple_chat_agent.agent.contracts import CarriedState
+
+        record = McpServerRecord(name="srv", url="https://mcp.example.com/mcp")
+        entry = McpServerTools(
+            server=record, fingerprint=record.fingerprint(), listed_at=12.0,
+            tools=[McpToolInfo(name="mcp__srv__echo", mcp_name="echo")],
+        )
+        before = SimpleNamespace(**{mcp.CACHE_ATTR: [entry]})
+        carried = CarriedState.model_validate_json(CarriedState(mcp_tools=mcp.carry_cache(before)).model_dump_json())
+        after = SimpleNamespace()
+        mcp.restore_cache(after, carried.mcp_tools)
+        self.assertEqual(getattr(after, mcp.CACHE_ATTR), [entry])
+        self.assertEqual(CarriedState.model_validate({}).mcp_tools, [])
+        self.assertEqual(mcp.carry_cache(SimpleNamespace()), [])
+        empty = SimpleNamespace()
+        mcp.restore_cache(empty, [])
+        self.assertFalse(hasattr(empty, mcp.CACHE_ATTR))
+
+
+class OAuthFlowTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    async def test_abandoned_flow_times_out(self) -> None:
+        from simple_chat_agent.common.mcp_oauth import PendingMcpOAuthFlow
+
+        flow = PendingMcpOAuthFlow(user_id="u", server_id="s", server_url="https://x", tool_prefix="s", label="s")
+        self.assertEqual(flow.timeout_seconds, 600)
+        flow.timeout_seconds = 0.05
+        with self.assertRaises(TimeoutError):
+            await flow.wait_for_callback()
+        done = PendingMcpOAuthFlow(user_id="u", server_id="s", server_url="https://x", tool_prefix="s", label="s")
+        done.complete("code", "state")
+        self.assertEqual(await done.wait_for_callback(), ("code", "state"))
 
 
 if __name__ == "__main__":

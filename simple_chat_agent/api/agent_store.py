@@ -603,6 +603,26 @@ class AgentStore:
         """The session ended: nothing it held will ever start."""
         await self.r.delete(self._k(session, "p"))
 
+    # -- open pick_files calls (P5): the upload route accepts files only while one waits --
+
+    async def open_pick(self, session: str, tool_id: str) -> None:
+        """A ``pick_files`` call published ``callback_requested``: uploads for it are allowed."""
+        pipe = self.r.pipeline(transaction=True)
+        pipe.sadd(self._k(session, "picks"), tool_id)
+        pipe.expire(self._k(session, "picks"), session_ttl_seconds())
+        await pipe.execute()
+
+    async def close_pick(self, session: str, tool_id: str) -> None:
+        """That call was resolved (answered, declined, timed out or stopped)."""
+        await self.r.srem(self._k(session, "picks"), tool_id)
+
+    async def clear_picks(self, session: str) -> None:
+        """The turn ended or the session closed: no pick is waiting."""
+        await self.r.delete(self._k(session, "picks"))
+
+    async def pick_open(self, session: str, tool_id: str) -> bool:
+        return bool(await self.r.sismember(self._k(session, "picks"), tool_id))
+
     async def mark_emitted(self, session: str, frame_id: str) -> bool:
         """Record that a telemetry frame was stored. False if it already was. Bounded."""
         return bool(

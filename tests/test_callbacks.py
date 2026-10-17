@@ -147,7 +147,13 @@ class CallbackRouteTests(AgentRoutesTestBase):
         self.addCleanup(patcher.stop)
         super().setUp()
 
-    def upload(self, sid: str, name: str, data: bytes = b"a,b\n", tool_id: str = "toolu_1", headers: dict[str, str] = A) -> Any:
+    def upload(
+        self, sid: str, name: str, data: bytes = b"a,b\n", tool_id: str = "toolu_1", headers: dict[str, str] = A,
+        *, waiting: bool = True,
+    ) -> Any:
+        if waiting:
+            # As the bridge does on callback_requested for pick_files.
+            self.client.portal.call(self.store.open_pick, sid, tool_id)  # type: ignore[union-attr]
         return self.client.post(
             f"/api/agent/sessions/{sid}/callbacks/{tool_id}/files", files={"file": (name, data, "text/csv")}, headers=headers
         )
@@ -180,6 +186,16 @@ class CallbackRouteTests(AgentRoutesTestBase):
         wid, name, payload = self.temporal.signals[-1]
         self.assertEqual((wid, name, payload.tool_id), (sid, ENQUEUE_CALLBACK_SIGNAL, "toolu_1"))
         self.assertEqual(payload.result, {"paths": ["uploads/data.csv", "uploads/data-1.csv"]})
+
+    def test_upload_only_while_that_pick_waits(self) -> None:
+        # P5: a tool id with no open pick_files call (never asked, answered, or its turn ended).
+        sid = self.create()["session_id"]
+        r = self.upload(sid, "a.csv", tool_id="toolu_7", waiting=False)
+        self.assertEqual((r.status_code, r.json()["error"]), (409, "not_waiting"))
+        self.assertEqual(self.written, {})
+        self.assertEqual(self.upload(sid, "a.csv", tool_id="toolu_7").status_code, 200)
+        self.client.portal.call(self.store.close_pick, sid, "toolu_7")  # type: ignore[union-attr]
+        self.assertEqual(self.upload(sid, "b.csv", tool_id="toolu_7", waiting=False).status_code, 409)
 
     def test_upload_limits_and_owner(self) -> None:
         sid = self.create()["session_id"]

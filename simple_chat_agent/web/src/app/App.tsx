@@ -253,6 +253,7 @@ function SessionScreen({
     () => ({
       model: summaryModel(summary),
       posture: summary?.posture ?? null,
+      webSearch: summary?.web_search ?? null,
       toolRiskClasses: config?.tool_risk_classes ?? null,
       defaultToolRiskClass: config?.default_tool_risk_class ?? null,
       rememberAllowedClasses: config?.remember_allowed_classes ?? null,

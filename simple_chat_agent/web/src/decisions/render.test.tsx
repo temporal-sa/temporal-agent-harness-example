@@ -67,17 +67,20 @@ describe("DecisionDock", () => {
     expect(html).toContain("Approve 3");
     expect(html).toContain("Decline 2");
     expect(html).toContain("Always approve file edits");
-    expect(html).toContain("Shell commands need a yes each time");
+    // P5: no greyed "Always approve" on the shell group; it isn't offered at all.
+    expect(html.match(/Always approve/g)).toHaveLength(2); // the edit group's label and its accessible name
+    expect(html).not.toContain('aria-disabled="true"');
     expect(html).toContain("The agent is paused in Temporal and nothing is running.");
     expect(html.match(/class="dc-card/g)).toHaveLength(1);
   });
 
-  it("renders one commit as the plain card with Always approve greyed and a reason", () => {
+  it("renders one commit as the plain card with no Always approve, and a reason", () => {
     const html = renderToStaticMarkup(<DecisionDock session={session([tool("g1", "git_commit", { message: "Use the remaining balance" })])} />);
     expect(html).toContain("Needs approval");
     expect(html).toContain("Commit 1 file");
     expect(html).toContain('message: &quot;Use the remaining balance&quot;');
-    expect(html).toMatch(/aria-disabled="true"[^>]*title="Commits need a yes each time"/);
+    expect(html).not.toContain("Always approve");
+    expect(html).toContain("Commits need a yes each time.");
     expect(html).toContain("This request survives reloads and Worker restarts.");
   });
 

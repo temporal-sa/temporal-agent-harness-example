@@ -273,7 +273,7 @@ export function ApprovalCard({ session }: { session: CodingSession }) {
                 {offersAlways(it.toolName) ? "Approve" : "Approve script"}
               </button>
               {offersAlways(it.toolName) && (
-                <AlwaysButton risk={it.risk} toolName={it.toolName} allowed={it.rememberAllowed} onClick={() => approve("one", [it.toolId], true)} />
+                <AlwaysButton risk={it.risk} allowed={it.rememberAllowed} onClick={() => approve("one", [it.toolId], true)} />
               )}
               <button
                 type="button"
@@ -402,25 +402,14 @@ function alwaysWhy(risk: Risk): string {
     : `Always approve lasts for this session. You can undo it from the posture menu.`;
 }
 
-function AlwaysButton({ risk, toolName, allowed, onClick, name }: { risk: Risk; toolName: string; allowed: boolean; onClick(): void; name?: string }) {
-  const id = useId();
-  if (allowed) {
-    return (
-      <button type="button" className="btn secondary small" aria-label={name} onClick={onClick}>
-        {alwaysApproveLabel(risk)}
-      </button>
-    );
-  }
-  const reason = alwaysApproveReason(risk, toolName);
+/** Shown only where "Always approve" applies (P5): never for MCP tools or for a class outside
+ *  `remember_allowed_classes`. Where it doesn't apply, the card's "why" line says so. */
+function AlwaysButton({ risk, allowed, onClick, name }: { risk: Risk; allowed: boolean; onClick(): void; name?: string }) {
+  if (!allowed) return null;
   return (
-    <>
-      <button type="button" className="btn ghost small off" aria-disabled="true" aria-describedby={id} title={reason} onClick={(e) => e.preventDefault()}>
-        Always approve
-      </button>
-      <span id={id} className="sr-only">
-        Not available: {reason}.
-      </span>
-    </>
+    <button type="button" className="btn secondary small" aria-label={name} onClick={onClick}>
+      {alwaysApproveLabel(risk)}
+    </button>
   );
 }
 
@@ -522,7 +511,6 @@ function GroupRows(p: GroupRowsProps) {
             {offersAlways(g.toolName) && (
               <AlwaysButton
                 risk={g.risk}
-                toolName={g.toolName}
                 allowed={g.rememberAllowed}
                 name={`${alwaysApproveLabel(g.risk)}, approving these ${n}`}
                 onClick={() => p.onApprove(key, groupTargets(g), true)}

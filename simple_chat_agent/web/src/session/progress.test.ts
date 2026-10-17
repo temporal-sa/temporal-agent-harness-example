@@ -155,5 +155,7 @@ describe("risk classes", () => {
       ["external_side_effect", false],
     ]);
     expect(withRiskClass([pending("edit_file")], null, null, null)[0]).toMatchObject({ riskClass: null, rememberAllowed: false });
+    // P5: never for MCP tools, even if config maps one into a remembered class.
+    expect(withRiskClass([pending("mcp__git__commit")], { mcp__git__commit: "workspace_edit" }, null, ["workspace_edit"])[0]).toMatchObject({ rememberAllowed: false });
   });
 });

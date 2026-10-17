@@ -36,6 +36,9 @@ from simple_chat_agent.common.store import AppStore, OAuthConnectionRecord
 
 
 _TOKEN_REFRESH_SKEW = timedelta(seconds=60)
+# An authorization the user never finishes (tab closed, provider page abandoned) gives up
+# after this long, so a pending flow never waits forever (P5).
+MCP_OAUTH_FLOW_TIMEOUT_SECONDS = float(os.environ.get("AGENT_MCP_OAUTH_FLOW_TIMEOUT_SECONDS", "600"))
 
 
 @dataclass
@@ -51,15 +54,20 @@ class PendingMcpOAuthFlow:
     auth_url_ready: asyncio.Event = field(default_factory=asyncio.Event)
     callback: asyncio.Future[tuple[str, str | None]] | None = None
     task: asyncio.Task[Any] | None = None
+    timeout_seconds: float = field(default_factory=lambda: MCP_OAUTH_FLOW_TIMEOUT_SECONDS)
 
     async def redirect(self, url: str) -> None:
         self.auth_url = url
         self.auth_url_ready.set()
 
     async def wait_for_callback(self) -> tuple[str, str | None]:
+        """The provider's redirect back, or ``TimeoutError`` after ``timeout_seconds``."""
         if self.callback is None:
             self.callback = asyncio.get_running_loop().create_future()
-        return await self.callback
+        try:
+            return await asyncio.wait_for(asyncio.shield(self.callback), timeout=self.timeout_seconds)
+        except asyncio.TimeoutError:
+            raise TimeoutError("The MCP authorization wasn't finished in time. Start it again.") from None
 
     def complete(self, code: str, state: str | None) -> None:
         if self.callback is None:
@@ -74,6 +82,8 @@ class PendingMcpOAuthFlow:
             self.callback = asyncio.get_running_loop().create_future()
         if not self.callback.done():
             self.callback.set_exception(error)
+            # A cancelled or timed-out flow has no waiter left; don't log it as unretrieved.
+            self.callback.exception()
 
 
 class AppMcpTokenStorage(TokenStorage):
