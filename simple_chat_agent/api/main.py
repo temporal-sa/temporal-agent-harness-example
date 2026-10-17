@@ -29,6 +29,7 @@ from simple_chat_agent.api.auth import (
     AuthError,
     catalog_auth_enabled,
     create_session_token,
+    session_secret_problem,
     user_from_catalog_headers,
     user_from_local_username,
     user_from_session_token,
@@ -46,6 +47,9 @@ load_dotenv()
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     load_dotenv()
+    if local_auth_requested() and not catalog_auth_enabled() and (problem := session_secret_problem()):
+        # PRD §5.6: local sign-in refuses to start without a real signing secret.
+        raise RuntimeError(f"Local sign-in is on but {problem} Set a random value of 32+ characters.")
     client_config: dict[str, Any] = {
         "namespace": os.environ.get("TEMPORAL_NAMESPACE", "default"),
         "data_converter": simple_chat_data_converter(),

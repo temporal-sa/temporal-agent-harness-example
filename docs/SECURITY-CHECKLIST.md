@@ -4,7 +4,7 @@ Each rule from PRD §5, each cross-user rule, and each security fix from the P2�
 
 Status as of P5 (2026-10-16):
 - **59 rules and sub-rules** (§5 plus cross-user isolation) have at least one automated test, and so do the **15 security fixes** from the P2–P4 reviews.
-- **3 have no automated test** (listed at the end with the reason). One of them, the local JWT-secret refusal, is **not implemented** and is open for the Lead.
+- **2 have no automated test** (listed at the end with the reason). The local JWT-secret refusal was implemented by the Lead in P5 and is now tested.
 
 ## §5.1 The approval gate fails closed
 
@@ -78,7 +78,7 @@ Status as of P5 (2026-10-16):
 | Abandoned MCP OAuth flows time out and are capped per user (P5) | `tests/test_mcp.py::OAuthFlowTimeoutTests::test_abandoned_flow_times_out`; `tests/test_mcp.py::McpRouteTests::test_oauth_flows_are_capped_per_user` |
 | Judge status reads the worker env without returning keys | `tests/test_p3_operations.py::SecurityReviewTests::test_judge_status_reads_worker_env_without_returning_keys` |
 | `**/.env*` is in `.gitignore` and `.dockerignore` | `tests/test_security_rules.py::EnvFilesIgnoredTests::test_gitignore_covers_env_files`, `::test_dockerignore_covers_env_files` (P5) |
-| Local auth refuses to start without a JWT secret unless bound to 127.0.0.1 | **Not implemented**; see the end |
+| Local auth refuses to start without a JWT secret (stricter than the PRD: no built-in fallback anywhere, 32+ characters) | `tests/test_session_secret.py` (`test_no_built_in_fallback`, `test_short_secret_refused_and_long_one_works`, `test_api_refuses_to_start_with_local_auth_and_no_secret`) |
 
 ## §5.7 Budgets
 
@@ -150,6 +150,5 @@ The P2 reliability fixes (B1, M1–M5, minors 1, 4, 8–10, 13, 15, N1–N7) are
 
 | Rule | Why | Where it stands |
 |---|---|---|
-| §5.6 Local auth refuses to start without a JWT secret unless bound to 127.0.0.1 | **Not implemented.** `simple_chat_agent/api/auth.py:_session_secret` falls back to a fixed dev secret when `SIMPLE_CHAT_JWT_SECRET` is unset. Mitigations: the API binds to 127.0.0.1 by default (`api/main.py`), `make dev-api` always sets a random secret, and the catalog never accepts the local session cookie (tested above). | Open for the Lead. `auth.py` and `main.py` are outside Eng H's files. The fix is a startup check that refuses when local auth is on, the secret is unset and the host isn't 127.0.0.1, plus a unit test. |
 | §5.5 Each workspace activity resolves its owning `CodingAgent` by walking `parent_id` (at most 3 levels, cached) | Built differently. Activities never take a workspace from the model: `workspace_id` is injected from init data (`agent/workflow.py`, `agent/subagents.py`), so there is no walk to test in the worker. The API's walk from a subagent id to its owner allows up to 4 hops (`agent_routes.py:_owner_from_temporal`, `MAX_PARENT_HOPS`) and is tested above. | The PRD wording should be updated to match. |
 | §5.3 Criteria edits are `model_callable=False` | There is no criteria-edit handler. Criteria come from init and the catalog sanitizes caller policies (`test_catalog_refuses_preallowing_risky_tools`). | Nothing to test until a handler exists. |

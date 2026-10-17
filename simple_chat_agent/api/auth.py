@@ -82,11 +82,25 @@ def _short_digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
 
 
+MIN_SESSION_SECRET_CHARS = 32
+
+
+def session_secret_problem() -> str | None:
+    """Why local sign-in can't sign session tokens, or None. PRD §5.6: local auth never runs
+    on a built-in or short secret."""
+    secret = os.environ.get("SIMPLE_CHAT_JWT_SECRET", "")
+    if not secret:
+        return "SIMPLE_CHAT_JWT_SECRET is not set."
+    if len(secret) < MIN_SESSION_SECRET_CHARS:
+        return f"SIMPLE_CHAT_JWT_SECRET must be at least {MIN_SESSION_SECRET_CHARS} characters."
+    return None
+
+
 def _session_secret() -> bytes:
-    secret = os.environ.get("SIMPLE_CHAT_JWT_SECRET")
-    if secret is None:
-        secret = "dev-only-simple-chat-secret"
-    return secret.encode("utf-8")
+    problem = session_secret_problem()
+    if problem:
+        raise AuthError(problem)
+    return os.environ["SIMPLE_CHAT_JWT_SECRET"].encode("utf-8")
 
 
 def _encode_jwt(payload: dict[str, Any], secret: bytes) -> str:
