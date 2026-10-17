@@ -1,746 +1,132 @@
 # Advanced AI Agent
 
-The catalog owns deployment, login, shared LLM keys, and crashable environments.
-See [Catalog deployment](docs/catalog.md). This branch tracks the catalog
-integration while preserving the durable agent harness.
+A coding agent built on the official Temporal Agent Harness. It fixes a bug in a real repo, survives a worker crash in the middle of the test run, and waits for a human to approve the commit.
 
-This repo is not trying to be a generic agent SDK.
+What's in it:
 
-It is an example of how a team might build a small, opinionated agent harness around its own operating model: durable execution, readable Temporal history, explicit tool categories, runtime guard enforcement, controlled model access, resumable context, provider-specific model adapters, and optional non-durable streaming.
+- **[`temporal-agent-harness`](https://pypi.org/project/temporal-agent-harness/) 0.7.0** for the agent loop: turns, tools, approvals, events, subagents, Code Mode and browser callbacks. The few gaps it has (interrupt, continue-as-new, heartbeats) are filled in one module, [`agent/harness_ext.py`](simple_chat_agent/agent/harness_ext.py).
+- **[Pydantic AI's Temporal integration](https://ai.pydantic.dev/durable_execution/temporal/)** with Anthropic, OpenAI and Gemini. You can switch provider between turns and keep the history.
+- **A sandboxed workspace.** The agent reads, searches and edits code, runs commands and tests, and commits locally, inside a Bubblewrap sandbox with no credentials.
+- **Approvals** with four postures, including an auto mode where a judge approves routine calls and sends the rest to you. The gate fails closed.
+- **Durability you can see.** A worker crash shows what Temporal kept and what it repeated. Messages and approvals sent while no worker is running land in Temporal as [Signals](https://docs.temporal.io/sending-messages#sending-signals) and apply when a worker returns.
+- **[Worker Versioning](https://docs.temporal.io/production-deployment/worker-deployments/worker-versioning)** with PINNED workflows, and [continue-as-new](https://docs.temporal.io/workflow-execution/continue-as-new) for long sessions.
+- A product view in the buildkit design language, the harness console one click away, and Temporal UI links on every session.
+- Extras: MCP servers (local only), Code Mode scripts, `ask_user` and `pick_files` cards, and provider web search with a sources list.
 
-The interesting part is not "how to call an LLM." It is how the agent loop, tool registry, guard policy, context manager, and Temporal execution model fit together.
-
-Want to run this locally? Start here:
-[Running Locally](docs/local-development.md).
-
-Want to build your own project on the harness? Start here:
-[Building With `agent_harness`](docs/building-with-agent-harness.md).
-
-Design note on app-owned tool categories:
-[Extensible Tool Categories And Guard Policy](docs/extensible-tool-categories-and-guard-policy.md).
-
-## Demo Recording
-
-[![Temporal Agent Harness demo recording](docs/demo-video-thumbnail.png)](https://drive.google.com/file/d/1HEwsBnabhiszNh0ULDwCcnAavfNzDcLK/view?usp=sharing)
-
-## Opinionated Architecture
-
-![Agent harness architecture](docs/agent-harness-simplified.png)
-
-The main design choice is to separate reusable harness behavior from application ownership. The harness should encode the agent platform rules a company wants every agent to follow, while provider-specific modules handle details such as Claude request formats and streaming. The application still owns the workflow shape, product UX, authentication, tool availability, and business-specific policies.
-
-| Layer | Owns | Does Not Own |
-| --- | --- | --- |
-| `agent_harness` | The provider-neutral agent loop, provider interfaces and adapters, context management, tool and guard registration, guard enforcement, generic activity routing, activity summary conventions, continuation snapshots, interrupt/steering semantics, and a streaming protocol. | Product auth, OAuth flows, UI state, user/session persistence, business workflows, concrete streaming transports, or provider-specific app state. |
-| Application workflow | Durable conversation orchestration, signal/query/update surface, agent construction, tool availability, approval state, continue-as-new policy, and how returned harness state is carried forward. | Direct network I/O, UI rendering, or provider login flows. |
-| Tools and guards | Business capabilities and policy. They run in workflow context, can call child workflows, wait on signals/timers, and use `ctx.activity(...)` for side effects. | Hidden side effects from workflow code. Durable side effects should go through activities or child workflows. |
-| Activities | Non-deterministic work: provider API calls, API calls, database writes, emails, OAuth-token-backed provider calls, and long-running side effects. | Agent policy decisions that need to replay deterministically. |
-| Worker process | Registration of workflows, activities, generic routers, data converter/codecs, and optional sideband stream sinks. | Per-user product state beyond what the application explicitly loads. |
-| UI / API server | Login, OAuth, chat selection, signals, queries, event-stream display, and approval controls. | Durable agent memory or hidden changes to workflow state. |
-
-This boundary is intentionally strict. For example, GitHub OAuth belongs to the simple chat application, not the harness. The workflow can receive a stable connection id or session id and let activities resolve the actual token. Passing a JWT or OAuth token through workflow history would make the wrong thing durable.
-
-Sideband streaming follows the same rule. The harness defines a protocol and emits best-effort events when a sink is configured. The UI chooses how to transport and render those events. Partial streamed text is not durable conversation state until the provider API activity completes and the workflow commits the assistant message.
-
-## Turn Flow
+## How it works
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    actor User
-    participant UI as UI / API Server
-    participant Registry as User Chats Workflow
-    participant WF as Application Agent Workflow
-    participant Harness as Agent Harness
-    participant AgentApiAct as call_agent_api Activity
-    participant Claude as Claude API
-    participant Tool as Tool / Guard Workflow Code
-    participant Router as Generic Tool/Guard Activity
-    participant External as External API / DB / Email
-    participant Stream as Optional Sideband Stream
-
-    User->>UI: Send message, steering, interrupt, or approval
-    UI->>Registry: Create/list/delete chat workflows
-    UI->>WF: Signal chat input or control event
-    UI->>WF: Query durable state
-    WF->>Harness: agent.run(user_message)
-    Harness->>AgentApiAct: Execute provider API activity
-    AgentApiAct->>Claude: Create or stream message
-    opt Stream sink configured
-        AgentApiAct-->>Stream: Token deltas and provider lifecycle events
-    end
-    AgentApiAct-->>Harness: Provider response
-    alt Provider requests tools
-        Harness->>Tool: Execute requested tools in workflow context
-        Tool->>Tool: Run pre-guards sequentially
-        Tool->>Router: ctx.activity(..., summary="tool:step")
-        Router->>External: Perform side effect
-        opt Stream sink configured
-            Router-->>Stream: Tool or guard progress
-        end
-        Router-->>Tool: Activity result
-        Tool->>Tool: Run post-guards sequentially
-        Tool-->>Harness: ToolResult or guarded failure payload
-        Harness->>AgentApiAct: Next provider API call with tool_result blocks
-    else Final assistant response
-        Harness-->>WF: AgentResult and continuation state
-        WF-->>UI: Committed transcript via query/SSE
-        UI-->>User: Render durable chat plus non-durable stream visibility
-    end
+flowchart LR
+  UI[Product view] -->|messages, approvals| API
+  API -->|Signals| T[(Temporal)]
+  T --> W[Worker: CodingAgent]
+  W -->|model calls| P[Anthropic / OpenAI / Gemini]
+  W -->|files, commands| X[Executor sandbox]
+  W -->|events| T
+  API -->|bridge: attach once| T
+  API <-->|frames, status| R[(Redis)]
+  UI -->|SSE| API
 ```
 
-## What This Shows
+| Component | What it does | When it's down |
+|---|---|---|
+| Worker (`CodingSessions`, `CodingAgent`, `Explorer`, `Reviewer`) | Runs each session as a workflow. Model calls and workspace tools are activities. | The UI keeps working from Redis. New messages and approvals wait in Temporal. A banner says the worker isn't answering. |
+| API | Auth, the harness transport routes, the Signal front door, the bridge that copies agent events into Redis, uploads and the console | The UI is unavailable; workflows carry on. |
+| Redis (AOF) | The session's event log, status, leases and spend counters | Attach falls back to Temporal. New turns stop (spend checks fail closed). |
+| Executor | Runs commands and file operations in a per-session workspace | Tools retry; the Terminal says the sandbox isn't answering. |
+| Temporal | Durable state, the event stream, versioning | Everything waits. |
 
-- Agent loops can be ordinary Temporal workflow code.
-- Provider API calls can be isolated in one activity.
-- Tool and guard code can run in workflow context while side effects route through generic activities.
-- Tool categories can require pre-guards or post-guards at runtime.
-- Event history can stay readable even when all tools share generic activity names.
-- Context can be owned by the agent, snapshotted, restored, and reduced before each model call.
-- Tool calls can run concurrently when the provider requests multiple tools in one turn.
-- Users can steer or interrupt an in-progress agent without treating partial streamed text as durable state.
-- Sideband streaming can provide best-effort product UX without coupling that stream to Temporal history.
+A turn: the browser posts a message; the API sends it as a Signal; the workflow opens a turn and calls the model in a heartbeating activity. Each tool call passes the approval gate (deterministic rules, then the judge or you), then runs as an activity. The bridge attaches to the workflow once per session and writes each event to Redis, and every open tab reads from there. Nothing on a browser path issues a Query.
 
-## Core Shape
+When a worker dies mid-turn, the model call's heartbeat stops, Temporal retries it on another worker, and a running test command reattaches to the job that is still running in the sandbox. The transcript then shows what was kept and what was repeated.
 
-The provider API call is an activity. Tool execution happens from workflow code. If a tool needs side effects, it calls through `ctx.activity(...)`, which routes through a generic activity while setting a useful Temporal summary.
+## Prerequisites
 
-```python
-from datetime import timedelta
+- Python 3.12 and [uv](https://docs.astral.sh/uv/)
+- Node 22 (for the web app)
+- Docker Desktop (for the sandbox executor)
+- The [Temporal CLI](https://docs.temporal.io/cli)
+- `redis-server`
+- The AWS CLI with access to the demo account's Secrets Manager (for the shared LLM keys), or your own keys
 
-from agent_harness.activity_router import RoutedActivityContext
-from agent_harness.tool_types import ToolType
-from agent_harness.tools import (
-    ToolContext,
-    ToolResult,
-    ToolSet,
-    tool,
-)
+## Run it locally
 
-
-@tool(
-    name="lookup_customer",
-    description="Look up a customer by id.",
-    tool_type=ToolType.READ,
-)
-async def lookup_customer(ctx: ToolContext, customer_id: str) -> ToolResult:
-    payload = await ctx.activity(
-        _lookup_customer_activity,
-        args={"customer_id": customer_id},
-    )
-    return ToolResult(payload=payload, error=False)
-
-
-tools = ToolSet(tools=[lookup_customer])
+```sh
+uv sync
+scripts/dev-secrets.sh        # pulls the Anthropic, OpenAI and Gemini keys into .env.local (mode 600, never printed)
+make dev-stack                # prints the commands below with this repo's paths
 ```
 
-If no `step` is provided, the activity summary is the tool name:
-
-```python
-await ctx.activity(_lookup_customer_activity)
-# summary: "lookup_customer"
-```
-
-If a tool has multiple activity steps, the tool author names them:
-
-```python
-await ctx.activity(_load_customer, step="load")
-await ctx.activity(_update_customer, step="update")
-# summaries: "lookup_customer:load", "lookup_customer:update"
-```
-
-This keeps the activity type generic while making Temporal history useful to humans.
-
-Long-running routed activity functions can opt into Temporal heartbeats by setting
-`heartbeat_timeout` on `ctx.activity(...)`. The generic routed activity router
-sends conservative liveness heartbeats while the function runs. Tool authors can
-also request an activity-side `RoutedActivityContext` when they have meaningful
-progress details:
-
-```python
-async def export_report(ctx: ToolContext, report_id: str) -> ToolResult:
-    result = await ctx.activity(
-        _export_report_activity,
-        args={"report_id": report_id},
-        start_to_close_timeout=timedelta(minutes=10),
-        heartbeat_timeout=timedelta(seconds=30),
-    )
-    return ToolResult(payload=result, error=False)
-
-
-async def _export_report_activity(
-    report_id: str,
-    *,
-    activity_ctx: RoutedActivityContext,
-) -> dict:
-    activity_ctx.heartbeat({"phase": "loading"})
-    # do work
-    activity_ctx.heartbeat({"phase": "writing"})
-    # do work
-    return {"report_id": report_id, "status": "exported"}
-```
-
-The author heartbeat API is coalesced, and the automatic router heartbeat skips
-sends when a manual heartbeat happened recently. Use the sideband stream for
-high-frequency user-visible progress; use heartbeats for liveness, cancellation,
-and coarse retry progress.
-
-## Tool Idempotency
-
-Temporal Activities may be retried when a worker crashes, a network write fails,
-or a completion is lost. The harness can give a tool a stable
-`ctx.idempotency_key(...)` derived from the provider's durable tool-call id, but
-the tool author owns how that key is enforced. Mutating tools should pass the key
-to the system they mutate, use it as an upsert key in application storage, or
-disable retries when the side effect cannot be made safe.
-
-```python
-@tool(
-    name="export_report",
-    description="Export a customer report.",
-    tool_type=ToolType.MUTATING,
-    pre_guards=["mutating_tool_approval"],
-)
-async def export_report(ctx: ToolContext, report_id: str) -> ToolResult:
-    idempotency_key = ctx.idempotency_key(report_id)
-    result = await ctx.activity(
-        _export_report_activity,
-        args={
-            "report_id": report_id,
-            "idempotency_key": idempotency_key,
-        },
-    )
-    return ToolResult(payload=result, error=False)
-```
-
-Read-only tools usually do not need this. Tools that call arbitrary user code or
-third-party APIs without an idempotency primitive should say so in their tool
-description or use a conservative retry policy.
-
-## Tool Failure Semantics
-
-Expected tool failures should be returned as data with
-`ToolResult(payload={...}, error=True)`. During agent execution, unexpected tool
-exceptions are converted into LLM-visible tool errors so the workflow can keep
-running and the model can recover. Cancellations still propagate.
-
-## Registration
-
-Tools and guards are defined with decorators and then added to a `ToolSet`. Standalone functions can be registered directly:
-
-```python
-tools.add_tool(lookup_customer, export_report)
-tools.add_guard(require_ops_approval)
-```
-
-Provider classes can expose multiple related tools and guards while keeping shared API state in one object:
-
-```python
-class GitHubProvider:
-    def __init__(self, connection_id: str) -> None:
-        self._connection_id = connection_id
-
-    @tool(
-        name="github_list_issues",
-        description="List issues in a GitHub repository.",
-        tool_type=ToolType.READ,
-    )
-    async def list_issues(
-        self, ctx: ToolContext, owner: str, repo: str
-    ) -> ToolResult:
-        payload = await ctx.activity(
-            _list_issues_activity,
-            args={
-                "connection_id": self._connection_id,
-                "owner": owner,
-                "repo": repo,
-            },
-        )
-        return ToolResult(payload=payload, error=False)
-
-
-tools.add_provider(GitHubProvider(connection_id))
-```
-
-The model sees individual tools. The application can still group implementation state by provider.
-
-## Activity Defaults
-
-Agent construction is where the application sets normal activity behavior for tools and guards: task queues, timeouts, retry policy, cancellation behavior, and related Temporal options.
-
-```python
-from datetime import timedelta
-
-from temporalio.common import RetryPolicy
-
-from agent_harness.activity_options import ActivityOptions
-from agent_harness.providers.claude import ClaudeAgent
-
-agent = ClaudeAgent(
-    "You are an internal operations agent.",
-    tools,
-    model="claude-sonnet-4-5",
-    activity_options=ActivityOptions(
-        schedule_to_start_timeout=timedelta(seconds=30),
-        start_to_close_timeout=timedelta(minutes=5),
-        retry_policy=RetryPolicy(maximum_attempts=3),
-    ),
-)
-```
-
-Tool and guard authors can override those defaults for a specific activity step:
-
-```python
-async def export_report(ctx: ToolContext, report_id: str) -> ToolResult:
-    result = await ctx.activity(
-        _export_report_activity,
-        step="export",
-        args={"report_id": report_id},
-        start_to_close_timeout=timedelta(hours=1),
-        retry_policy=RetryPolicy(maximum_attempts=1),
-    )
-    return ToolResult(payload=result, error=False)
-```
-
-The harness keeps the summary convention while allowing each step to use the Temporal execution policy it actually needs.
-
-## Context And Continuation
-
-The agent owns its context manager across `.run(...)` calls. A workflow can create the agent once, call it for each new user message, and preserve conversation context between turns.
-
-```python
-agent = ClaudeAgent(
-    system_prompt,
-    tools,
-    model="claude-sonnet-4-5",
-    max_tokens=64_000,
-    max_context_tokens=200_000,
-)
-
-result = await agent.run(user_message)
-```
-
-The default `SlidingWindowContextManager` keeps recent context, preserves the initial user message, removes stale tool-result blocks from older rounds, and fits the model input into a conservative token budget before each provider call. The latest tool result is preserved in full for the next model call.
-The agent loop has no turn cap; it continues until the model produces a final
-response, a guard halts it, the user interrupts it, or the workflow reaches a
-safe continue-as-new boundary.
-Applications can pass a durable ISO-8601 UTC `reference_time` to `run(...)`.
-The harness adds it to the system context for that turn, carries it through
-continue-as-new, and reminds the model to verify time-sensitive facts rather
-than treating the timestamp itself as evidence.
-
-Applications can replace the context manager by passing `context_manager_factory=...`.
-
-When Temporal suggests continue-as-new, the harness returns continuation state instead of continuing blindly:
-
-```python
-result = await agent.run(user_message)
-if result.needs_continue_as_new:
-    workflow.continue_as_new(
-        AgentInput(agent_state=result.continuation_state)
-    )
-```
-
-That state is a normal workflow payload. For large histories, use Temporal payload external storage, a codec, or an application database as the claim-check layer. The harness only defines the snapshot/restore contract.
-
-## Steering And Interrupts
-
-The workflow can add out-of-band user context without turning it into a brand-new task:
-
-```python
-agent.steer(
-    "Prefer the safer remediation plan.",
-    mode="after_next_tool_result",
-)
-```
-
-`mode="immediate"` inserts steering before the next provider call. `mode="after_next_tool_result"` inserts it after the next tool result is recorded.
-
-Hard interrupts cancel the in-flight provider API activity and add replacement context:
-
-```python
-agent.interrupt("Stop that path. Check the customer's latest order first.")
-```
-
-The current policy discards partial assistant output. This matters when the UI streams tokens: streamed text is product UX, not durable conversation state, until the provider API activity completes.
-
-## Sideband Streaming
-
-The harness defines a small streaming protocol but does not own a transport. Applications install a sink in the worker process:
-
-```python
-from agent_harness.streaming import StreamEvent, configure_stream_sink
-
-
-class JsonlSink:
-    async def emit(self, event: StreamEvent) -> None:
-        ...
-
-
-configure_stream_sink(JsonlSink())
-```
-
-When a `stream_id` is supplied, Claude token deltas and routed activity progress
-can be emitted to that sink. Activity functions receive an injectable
-`StreamContext` only when they ask for it:
-
-```python
-from agent_harness.streaming import StreamContext
-
-
-async def _export_report_activity(
-    report_id: str,
-    stream: StreamContext,
-) -> dict[str, str]:
-    await stream.emit({"report_id": report_id}, kind="export_started")
-    ...
-```
-
-If no sink is configured, streaming is a no-op.
-
-## Guards
-
-Tools are categorized with string-compatible categories. The harness provides a
-built-in `ToolType` enum for common categories, and apps can define their own.
-The harness can require guards for specific categories. By default, `MUTATING`,
-`MCP`, and `ADMIN` require a pre-guard.
-
-```python
-from agent_harness.guards import GuardContext, GuardResult, guard
-from agent_harness.tool_types import ToolType
-from agent_harness.tools import tool
-
-
-@guard(name="require_ops_approval", fulfills=ToolType.ADMIN)
-async def require_ops_approval(ctx: GuardContext) -> GuardResult:
-    approval = await ctx.activity(
-        _request_ops_approval,
-        step="approval",
-        args={"tool_name": ctx.tool_name, "tool_args": ctx.tool_args},
-    )
-
-    if not approval["approved"]:
-        return GuardResult(
-            passed=False,
-            reason="ops_approval_denied",
-            llm_payload={
-                "error": "Ops approval denied",
-                "reason": "ops_approval_denied",
-            },
-        )
-
-    return GuardResult(passed=True, internal_payload=approval)
-```
-
-The protected tool declares the guard explicitly:
-
-```python
-@tool(
-    name="restart_service",
-    description="Restart a production service.",
-    tool_type=ToolType.ADMIN,
-    pre_guards=[require_ops_approval],
-)
-async def restart_service(ctx: ToolContext, service_name: str) -> ToolResult:
-    result = await ctx.activity(
-        _restart_service,
-        args={"service_name": service_name},
-    )
-    return ToolResult(payload=result, error=False)
-
-
-tools.add_tool(restart_service)
-```
-
-Guards run sequentially in the order declared. Pre-guard failure prevents the tool from running. Post-guard failure prevents the model from receiving the raw tool result and returns the guard's `llm_payload` instead.
-
-This does not make it impossible for a developer to write a bad guard. It does make missing guard coverage explicit and runtime-enforced.
-
-## Reusable Guard Workflow Example
-
-This example shows a reusable customer confirmation guard. `CUSTOMER_CHANGE` is
-an example company-specific tool category: the point is that a class of tools
-can require the same guard, while the guard chooses the right confirmation path
-from the tool context.
-
-The customer confirmation workflow is reusable infrastructure:
-
-```python
-# workflows/customer_confirmation_workflow.py
-import asyncio
-from dataclasses import dataclass
-from datetime import timedelta
-from typing import Any, Literal
-
-from temporalio import activity, workflow
-
-
-ConfirmationStatus = Literal["accepted", "rejected", "timed_out"]
-
-
-@dataclass
-class CustomerConfirmationRequest:
-    customer_email: str
-    template: str
-    payload: dict[str, Any]
-
-
-@dataclass
-class CustomerConfirmationEmail:
-    message_id: str
-    confirmation_workflow_id: str
-
-
-@dataclass
-class CustomerConfirmationResult:
-    status: ConfirmationStatus
-    accepted: bool
-    email: CustomerConfirmationEmail
-
-
-@activity.defn
-async def send_customer_confirmation_email(
-    request: CustomerConfirmationRequest,
-    confirmation_workflow_id: str,
-) -> CustomerConfirmationEmail:
-    # The email should link to an app endpoint that signals
-    # CustomerConfirmationWorkflow.confirm on this workflow id.
-    # request.template selects the email template; request.payload fills it.
-    return CustomerConfirmationEmail(
-        message_id="email-message-id",
-        confirmation_workflow_id=confirmation_workflow_id,
-    )
-
-
-@workflow.defn
-class CustomerConfirmationWorkflow:
-    def __init__(self) -> None:
-        self._accepted: bool | None = None
-
-    @workflow.signal
-    async def confirm(self, accepted: bool) -> None:
-        self._accepted = accepted
-
-    @workflow.run
-    async def run(
-        self, request: CustomerConfirmationRequest
-    ) -> CustomerConfirmationResult:
-        confirmation_workflow_id = workflow.info().workflow_id
-        email = await workflow.execute_activity(
-            send_customer_confirmation_email,
-            args=[request, confirmation_workflow_id],
-            start_to_close_timeout=timedelta(minutes=1),
-            summary=f"customer_confirmation:{request.template}",
-        )
-
-        try:
-            await workflow.wait_condition(
-                lambda: self._accepted is not None,
-                timeout=timedelta(days=5),
-                timeout_summary="customer_confirmation_timeout",
-            )
-        except asyncio.TimeoutError:
-            return CustomerConfirmationResult(
-                status="timed_out",
-                accepted=False,
-                email=email,
-            )
-
-        if not self._accepted:
-            return CustomerConfirmationResult(
-                status="rejected",
-                accepted=False,
-                email=email,
-            )
-
-        return CustomerConfirmationResult(
-            status="accepted",
-            accepted=True,
-            email=email,
-        )
-```
-
-Define the app-owned category once:
-
-```python
-# tool_categories.py
-CUSTOMER_CHANGE = "customer_change"
-```
-
-The guard is reusable policy. It maps the current tool call to a confirmation template and starts the child workflow:
-
-```python
-# guards/customer_confirmation_guard.py
-from dataclasses import asdict
-
-from temporalio import workflow
-
-with workflow.unsafe.imports_passed_through():
-    from agent_harness.guards import GuardContext, GuardResult, guard
-    from my_agent.tool_categories import CUSTOMER_CHANGE
-    from my_agent.workflows.customer_confirmation_workflow import (
-        CustomerConfirmationRequest,
-        CustomerConfirmationWorkflow,
-    )
-
-
-def _customer_confirmation_request(ctx: GuardContext) -> CustomerConfirmationRequest:
-    if ctx.tool_name == "substitute_item":
-        return CustomerConfirmationRequest(
-            customer_email=ctx.tool_args["customer_email"],
-            template="substitute_item",
-            payload={
-                "order_id": ctx.tool_args["order_id"],
-                "unavailable_sku": ctx.tool_args["unavailable_sku"],
-                "substitute_sku": ctx.tool_args["substitute_sku"],
-            },
-        )
-
-    if ctx.tool_name == "change_shipping_address":
-        return CustomerConfirmationRequest(
-            customer_email=ctx.tool_args["customer_email"],
-            template="change_shipping_address",
-            payload={
-                "order_id": ctx.tool_args["order_id"],
-                "new_address": ctx.tool_args["new_address"],
-            },
-        )
-
-    raise ValueError(f"No customer confirmation configured for {ctx.tool_name}")
-
-
-@guard(name="confirm_customer_change", fulfills=CUSTOMER_CHANGE)
-async def confirm_customer_change(ctx: GuardContext) -> GuardResult:
-    request = _customer_confirmation_request(ctx)
-    result = await workflow.execute_child_workflow(
-        CustomerConfirmationWorkflow.run,
-        request,
-        id=f"{workflow.info().workflow_id}-{ctx.tool_name}-confirmation-{workflow.uuid4()}",
-        static_summary=f"{ctx.guard_name}:{ctx.tool_name}",
-    )
-
-    if not result.accepted:
-        return GuardResult(
-            passed=False,
-            reason=result.status,
-            llm_payload={
-                "error": "Customer did not approve the requested change.",
-                "confirmation": asdict(result),
-            },
-        )
-
-    return GuardResult(
-        passed=True,
-        internal_payload={"confirmation": asdict(result)},
-    )
-```
-
-The tool stays focused on the actual mutation:
-
-```python
-# tools/substitute_item_tool.py
-from datetime import timedelta
-
-from agent_harness.tools import ToolContext, ToolResult, tool
-from my_agent.guards.customer_confirmation_guard import confirm_customer_change
-from my_agent.tool_categories import CUSTOMER_CHANGE
-
-
-async def _apply_substitution(
-    order_id: str,
-    unavailable_sku: str,
-    substitute_sku: str,
-) -> dict[str, str]:
-    return {
-        "order_id": order_id,
-        "removed": unavailable_sku,
-        "added": substitute_sku,
-    }
-
-
-@tool(
-    name="substitute_item",
-    description="Substitute an unavailable order item after customer confirmation.",
-    tool_type=CUSTOMER_CHANGE,
-    pre_guards=[confirm_customer_change],
-)
-async def substitute_item(
-    ctx: ToolContext,
-    order_id: str,
-    unavailable_sku: str,
-    substitute_sku: str,
-    customer_email: str,
-) -> ToolResult:
-    applied = await ctx.activity(
-        _apply_substitution,
-        step="apply_substitution",
-        args={
-            "order_id": order_id,
-            "unavailable_sku": unavailable_sku,
-            "substitute_sku": substitute_sku,
-        },
-        start_to_close_timeout=timedelta(minutes=2),
-    )
-    return ToolResult(
-        payload={
-            "substitution_applied": True,
-            "applied": applied,
-        },
-        error=False,
-    )
-```
-
-From Claude's point of view, `substitute_item` is one tool call. From the application's point of view, the reusable guard performs durable policy orchestration: a child workflow sends an email and waits for a customer signal or a five-day timer. The tool only runs after that guard passes, and its code is limited to the order mutation.
-
-## Worker Registration
-
-Applications using this harness should register the provider API activity plus the generic tool and guard routers:
-
-```python
-from agent_harness.guards import run_guard_activity
-from agent_harness.providers.claude import call_agent_api
-from agent_harness.tools import run_tool_activity
-from my_agent.workflows.customer_confirmation_workflow import (
-    CustomerConfirmationWorkflow,
-    send_customer_confirmation_email,
-)
-
-activities = [
-    call_agent_api,
-    run_tool_activity,
-    run_guard_activity,
-    send_customer_confirmation_email,
-]
-
-workflows = [
-    AgentWorkflow,
-    CustomerConfirmationWorkflow,
-]
-```
-
-The Anthropic SDK reads credentials from `ANTHROPIC_API_KEY`. Set
-`ANTHROPIC_BASE_URL` to point Anthropic SDK calls at a compatible gateway such
-as LiteLLM.
-
-## What This Unlocks
-
-Because tools and guards are workflow code, they can do more than call one function:
-
-- Start child workflows for delegated work.
-- Wait for durable approval flows, signals, updates, timers, or external state.
-- Fan out to multiple activities and summarize each step clearly.
-- Apply organization-specific guard policy before and after execution.
-- Stream best-effort progress to a sideband sink when one is configured.
-- Return continuation state when workflow history pressure requires continue-as-new.
-
-That means examples in this repo should be read less as "agent demos" and more as "harness capability demos." The agent is the vehicle; the point is showing what the harness makes easy, observable, and harder to misuse.
-
-## Non-Goals
-
-- A provider-neutral agent framework.
-- A complete authorization system.
-- A replacement for application-specific workflows.
-- A polished library API.
-- A durable streaming system.
-
-The goal is to make the architectural tradeoffs concrete enough that another team could adapt the pattern to its own internal agent platform.
+Then start each piece in its own terminal:
+
+1. Redis: `redis-server --port 6390 --appendonly yes --dir .simple_chat_agent`
+2. Temporal: `temporal server start-dev --port 7244 --ui-port 8244 --db-filename dev.db --search-attribute CodingAgentOwner=Keyword --search-attribute UserEmail=Keyword`
+3. The executor: `make executor-image`, then the `docker run` line that `make dev-stack` prints. Check it with `curl -s 127.0.0.1:8083/healthz`. Add `WORKSPACE_EXECUTOR_TOKEN=<any random value>` to `.env.local` first; the worker, API and executor share it.
+4. The worker: `make dev-worker`
+5. The API: `make dev-api` (it runs without provider keys)
+6. The web app: `make web`, then open http://127.0.0.1:8000/ and sign in as `demo` / `demo`.
+
+| Command | What it does |
+|---|---|
+| `make web` | Builds the product view; the API serves it at `/` |
+| `make web-dev` | Vite with live reload, proxying `/api` and `/console` to the API |
+| `make dev-worker` | Runs the worker on Task Queue `coding-agent-dev` |
+| `make dev-api` | Runs the API on 8000 with local login |
+| `make crash-worker` | SIGKILLs the dev worker (the demo's crash) |
+| `make image`, `make executor-image` | Build the app image and the executor image |
+| `make gen` | Regenerates the web app's types from the agents' schemas |
+
+Tests: `.venv/bin/python -m unittest discover -s tests` for Python (Redis on 6390; some suites also want the dev server on 7244), and `npm test` and `npm run typecheck` in `simple_chat_agent/web`.
+
+## Demo script (7 minutes)
+
+One session, from **New demo session**. The seed is a small Python service with one real bug and a test suite that takes about 20 seconds.
+
+| Time | Do | What you'll see |
+|---|---|---|
+| 0:00 | Open the product view. Posture **Auto mode**, model Claude. | |
+| 0:40 | Send: "test_refund fails. Find the cause, fix it, run the tests, commit." | The plan fills in. Two explorers run in parallel, nested in the transcript. |
+| 1:50 | | The fix appears as an inline diff. The judge approves `pytest`, and the Terminal streams. |
+| 2:40 | `make crash-worker` during the test run, then `make dev-worker`. | A yellow banner. In Temporal UI, the pending activity. Then a recovery divider ("Worker lost at …. Kept: … Repeated: …") and the tests go green. |
+| 4:10 | | `git_commit` goes to you, not the judge. Reload the page: the card is still there. Approve. |
+| 4:50 | Switch the model to GPT. Send: "Review the diff." | The Reviewer subagent returns a structured review. |
+| 5:40 | Click **Harness console**. | The same session as the harness records it: the raw loop. |
+| 6:30 | | Close on the meters: tokens in and out, the share read from the provider cache, recoveries, and the work kept after the worker loss. |
+
+### Extras (local)
+
+Run these on a fresh session after the core script. Each one takes a minute or two.
+
+| Feature | Setup | Do | What you'll see |
+|---|---|---|---|
+| MCP | `.venv/bin/python -m tests.fixtures.mcp.echo_server --port 8765`, and add `AGENT_MCP_LOOPBACK_PORTS=8765` to `.env.local` before starting the worker and API. | Open **MCP servers**, add `local-echo` at `http://127.0.0.1:8765/mcp`, start a new session, and ask the agent to echo something. | "Connected · 2 tools". An approval card for `local-echo · echo`, then its result in the transcript and the console. |
+| Code Mode | | "Read every file under src/ in one script and summarize them." | One **Approve script** card; the script's host calls nest under it. |
+| `ask_user` | | "Ask me which file to start with before you change anything." | A choice card in the decision dock. It survives a reload. |
+| `pick_files` | | "Ask me for a CSV and add up its numbers." | A file picker; the upload lands in `uploads/` and the agent reads it. |
+| Web search | Turn on **Web search** in the composer. | Ask a question about something recent. | A sources list under the reply. Off by default. |
+
+## Cost per demo run
+
+Measured on the local stack, one run each:
+
+| Run | Input tokens | Output tokens |
+|---|---|---|
+| Core script | about 125k | about 5k |
+| Extras walkthrough | about 155k | about 1.5k |
+
+About 70% of the input is read from the provider's cache, which providers bill at a discount. The meters strip shows the live numbers for each session. In the catalog, per-session, per-user-per-day and global spend caps stop a turn before it goes over (see [docs/catalog.md](docs/catalog.md#spend-caps)).
+
+## More
+
+- [docs/catalog.md](docs/catalog.md): the always-on catalog deployment (environment, Task Queue and Worker Deployment, NetworkPolicy, S3 lifecycle).
+- [docs/CUTOVER.md](docs/CUTOVER.md): moving the catalog from the old chat app.
+- [docs/SECURITY-CHECKLIST.md](docs/SECURITY-CHECKLIST.md): each safety rule and the test that proves it.
+- [docs/local-development.md](docs/local-development.md): environment variables and troubleshooting.
+- [`basic_file_agent/`](basic_file_agent/README.md): a minimal agent on the same harness, about 150 lines.
+- [docs/PRD.md](docs/PRD.md): requirements and decisions.
+
+## Notes
+
+- The harness is pre-1.0 and pinned at 0.7.0. `harness_ext.py` uses a few of its private internals; `tests/test_harness_ext.py` fails if they move.
+- MCP servers and the "Never ask" posture are local only. In the catalog, MCP is off and the judge can approve only reads and file edits.
+- There is no patching. Workers are versioned and workflows are PINNED; a code change ships as a new Worker Deployment Version.

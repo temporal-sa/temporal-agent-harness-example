@@ -1,189 +1,45 @@
-# Running Locally
+# Local development
 
-This guide runs the demo on your machine with a single external dependency: the LLM provider. 
+The README's [Run it locally](../README.md#run-it-locally) starts the stack. This page lists the settings you may want to change and the problems people run into.
 
-## Required Tools
+## `.env.local`
 
-- `uv`
-  - Package: https://github.com/astral-sh/uv
-  - Homebrew install: `brew install uv`
-- Node.js 22 and `npm`
-  - Package: https://nodejs.org/
-  - Homebrew install: `brew install node@22`
-  - `npm` is bundled with Node.js.
-- Temporal CLI
-  - Package: https://github.com/temporalio/cli
-  - Homebrew install: `brew install temporal`
+`scripts/dev-secrets.sh` writes the three provider keys here (mode 600) and keeps any other lines you add. The Make targets source it without printing it. It is git- and docker-ignored; the script refuses to run if that ever stops being true.
 
-Optional tools:
+| Variable | Used by | Purpose |
+|---|---|---|
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` | worker | Provider keys. The worker refuses to start with none. `make dev-api` unsets them: the API never holds them. |
+| `WORKSPACE_EXECUTOR_TOKEN` | worker, API, executor | Any random value, shared by all three |
+| `TYPESAFE_API_KEY` | worker | Optional: auto mode uses Jev as its judge |
+| `AGENT_MCP_LOOPBACK_PORTS` | worker, API | Ports on 127.0.0.1 that MCP servers may use locally (e.g. `8765`). Loopback is refused on every other port. |
+| `AGENT_RESEARCH_TOOLS` | API | `fetch_url` (default) or `fetch_url,search_web` |
+| `GOOGLE_SEARCH_GROUNDING_API_KEY` or `SIMPLE_CHAT_SEARXNG_BASE_URL` | worker | A backend for `search_web` |
+| `AGENT_WEB_SEARCH` | API | `off` hides the provider web search toggle |
+| `CONSOLE_ENABLED` | API | The harness console is on locally by default |
+| `SIMPLE_CHAT_LOCAL_AUTH_USERNAME`, `SIMPLE_CHAT_LOCAL_AUTH_PASSWORD` | API | Local login (default `demo` / `demo`) |
+| `SIMPLE_CHAT_JWT_SECRET` | API | Signs the local session cookie. `make dev-api` makes a fresh one per run if unset, so a restart signs you out. |
+| `AGENT_SPEND_CAP_SESSION_TOKENS`, `AGENT_SPEND_CAP_USER_DAY_TOKENS`, `AGENT_SPEND_CAP_GLOBAL_DAY_TOKENS` | worker | Spend caps ([catalog.md](catalog.md#spend-caps) has the defaults) |
+| `AGENT_MODELS_ANTHROPIC`, `AGENT_MODELS_OPENAI`, `AGENT_MODELS_GOOGLE` | worker, API | Override the model allowlists (comma-separated; the first is the default) |
 
-- Docker, if you prefer running dependencies in containers.
-- Docker buildx, if you want to validate the catalog image locally.
+The Make targets set the rest: `AGENT_ENVIRONMENT=local`, Temporal on `127.0.0.1:7244`, Redis on 6390, the executor on 8083 and Task Queue `coding-agent-dev`. Override any of them on the command line, e.g. `make dev-worker TASK_QUEUE=mine`.
 
-## Environment
+## Ports
 
-Create a repo-root `.env` file:
+| Port | What |
+|---|---|
+| 7244 / 8244 | Temporal dev server and its UI. Never use the server on 7233. |
+| 6390 | Redis |
+| 8083 | Executor (container port 8082) |
+| 8000 | API and the product view at `/` |
+| 5173 | `make web-dev` (Vite) |
 
-```bash
-ANTHROPIC_API_KEY=sk-ant-...
-SIMPLE_CHAT_JWT_SECRET=replace-me-with-any-local-secret
+Storage is local by default: payloads, artifacts and the frame archive go to disk under the system temp directory. Set `SIMPLE_CHAT_S3_BUCKET` and the DynamoDB tables to use AWS instead.
 
-SIMPLE_CHAT_AUTH_MODE=local
-SIMPLE_CHAT_LOCAL_AUTH_ENABLED=1
-SIMPLE_CHAT_LOCAL_AUTH_USERNAME=demo
-SIMPLE_CHAT_LOCAL_AUTH_PASSWORD=demo
+## Troubleshooting
 
-TEMPORAL_NAMESPACE=default
-TEMPORAL_ENDPOINT=127.0.0.1:7233
-TEMPORAL_TLS=0
-SIMPLE_CHAT_TASK_QUEUE=simple-chat-agent
-SIMPLE_CHAT_WORKER_VERSION=1.0.0
-SIMPLE_CHAT_WORKER_VERSIONING_ENABLED=0
-```
-
-Deployed authentication is handled by the catalog. Local login is explicitly
-selected by the settings above.
-
-Optional local values:
-
-```bash
-# Enables GitHub tools after you connect GitHub from the Tools window.
-GITHUB_OAUTH_CLIENT_ID=...
-GITHUB_OAUTH_CLIENT_SECRET=...
-GITHUB_OAUTH_REDIRECT_URI=http://127.0.0.1:8000/oauth/github/callback
-GITHUB_OAUTH_SCOPES=read:user,user:email,public_repo
-
-# Enables optional research tools.
-SIMPLE_CHAT_SEARXNG_BASE_URL=http://127.0.0.1:8080
-GOOGLE_API_KEY=...
-```
-
-## Optional Local SearXNG
-
-The `search_web` tool is enabled when both the API and worker processes see
-`SIMPLE_CHAT_SEARXNG_BASE_URL`. For local development, you can run SearXNG in
-Docker and point the app at it:
-
-Create a `settings.yml` file, for example at
-`.local/searxng/config/settings.yml`:
-
-```bash
-mkdir -p .local/searxng/config .local/searxng/cache
-```
-
-```yaml
-use_default_settings: true
-
-general:
-  instance_name: "Agent Harness Local Search"
-  enable_metrics: false
-
-search:
-  safe_search: 1
-  autocomplete: ""
-  formats:
-    - json
-
-server:
-  port: 8080
-  bind_address: "0.0.0.0"
-  secret_key: "local-agent-harness-searxng"
-  limiter: false
-  image_proxy: false
-  method: "GET"
-
-outgoing:
-  request_timeout: 4.0
-  max_request_timeout: 8.0
-  useragent_suffix: "temporal-agent-harness-local"
-```
-
-Mount that config directory when you start the SearXNG container:
-
-```bash
-docker run --rm --name agent-harness-searxng \
-  -p 8080:8080 \
-  -e SEARXNG_BASE_URL=http://127.0.0.1:8080/ \
-  -e SEARXNG_PORT=8080 \
-  -e SEARXNG_BIND_ADDRESS=0.0.0.0 \
-  -v "$PWD/.local/searxng/config:/etc/searxng" \
-  -v "$PWD/.local/searxng/cache:/var/cache/searxng" \
-  ghcr.io/searxng/searxng:latest
-```
-
-In your repo-root `.env`, set:
-
-```bash
-SIMPLE_CHAT_SEARXNG_BASE_URL=http://127.0.0.1:8080
-```
-
-Restart both the API and worker after changing the value. The API uses it to
-advertise `search_web` in the Tools window, and the worker uses it when the
-agent actually calls the tool.
-
-You can sanity-check the local SearXNG instance before restarting the app:
-
-```bash
-curl 'http://127.0.0.1:8080/search?q=temporal&format=json'
-```
-
-## Install Dependencies
-
-From the repo root:
-
-```bash
-uv sync
-```
-
-Build the frontend once so the API can serve it:
-
-```bash
-cd simple_chat_agent/frontend
-npm ci
-npm run build
-cd ../..
-```
-
-## Start Temporal
-
-In one terminal:
-
-```bash
-temporal server start-dev
-```
-
-Temporal Web will usually be available at `http://localhost:8233`.
-
-## Start The Worker
-
-In a second terminal:
-
-```bash
-uv run python -m simple_chat_agent.worker.main
-```
-
-The worker also starts a Temporal Web codec server at `http://127.0.0.1:8001`
-by default. If you inspect claim-checked payloads in Temporal Web, configure
-Temporal Web to use that codec endpoint.
-
-## Start The API
-
-In a third terminal:
-
-```bash
-uv run python -m simple_chat_agent.api.main
-```
-
-Open `http://127.0.0.1:8000`. With the local auth settings above, the login
-screen shows a local username/password form. The default credentials are
-`demo` / `demo`.
-
-## Storage Defaults
-
-When S3 and DynamoDB environment variables are unset, the app uses local
-file/SQLite storage for claim-checks, artifacts, attachments, and OAuth records.
-That is enough for local development and avoids requiring AWS credentials.
-
-Local storage is not a production durability boundary. Deleting local state or
-resetting the Temporal dev server can orphan old browser-selected chat ids; use
-New Chat if that happens.
+- **The worker exits with "No LLM provider keys are configured".** Run `scripts/dev-secrets.sh`, or put a key in `.env.local`.
+- **The executor's `/healthz` fails with "No permissions to create a new namespace".** Run the container with `--security-opt seccomp=unconfined` (see [the executor README](../simple_chat_agent/worker/sandbox/README.md)).
+- **The executor's `/healthz` fails its environment check.** It saw a provider or cloud key. Pass it only `WORKSPACE_EXECUTOR_TOKEN` and `WORKSPACE_EXECUTOR_ROOT`.
+- **`make crash-worker` says no worker is running.** It matches `simple_chat_agent.agent.dev_worker`; start the worker with `make dev-worker`.
+- **The `temporal` CLI talks to the wrong server.** A profile in your CLI config can point it at Temporal Cloud. Pass `--address 127.0.0.1:7244`, or `--disable-config-file --disable-config-env`.
+- **Sessions vanished from the sidebar after Redis was flushed.** The API rebuilds the list from Temporal Visibility through the `CodingAgentOwner` search attribute. Start the dev server with `--search-attribute CodingAgentOwner=Keyword`.
