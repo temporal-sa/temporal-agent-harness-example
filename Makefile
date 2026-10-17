@@ -7,6 +7,8 @@
 #   make dev-stack     print the commands that start the local stack
 #   make dev-worker    run the dev worker (uses .env.local)
 #   make dev-api       run the API without provider keys (uses .env.local)
+#   make image         build the app image (API + worker + executor; builds the web app inside)
+#   make executor-image  build the local-development executor image
 #
 # .env.local holds keys: it is sourced, never printed. Recipes that read it start with `@`.
 
@@ -29,16 +31,25 @@ TASK_QUEUE ?= coding-agent-dev
 # Load .env.local into the recipe's shell without echoing it (set -a exports every assignment).
 LOAD_ENV := if [ -f "$(ENV_FILE)" ]; then set -a; . "$(ENV_FILE)"; set +a; else echo "note: $(ENV_FILE) not found" >&2; fi
 
-.PHONY: help web web-dev gen crash-worker dev-stack dev-worker dev-api
+.PHONY: help web web-dev gen crash-worker dev-stack dev-worker dev-api image executor-image
 
 help:
-	@sed -n '2,10p' $(ROOT)/Makefile | sed 's/^# \{0,1\}//'
+	@sed -n '2,12p' $(ROOT)/Makefile | sed 's/^# \{0,1\}//'
 
 web:
 	cd "$(WEB)" && npm ci && npm run build
 
 web-dev:
 	cd "$(WEB)" && AGENT_API_URL="http://127.0.0.1:$(API_PORT)" npm run dev
+
+IMAGE ?= advanced-ai-agent:dev
+EXECUTOR_IMAGE ?= agent-executor:dev
+
+image:
+	docker build --platform linux/amd64 -f "$(ROOT)/simple_chat_agent/Dockerfile" -t "$(IMAGE)" "$(ROOT)"
+
+executor-image:
+	docker build -f "$(ROOT)/simple_chat_agent/worker/sandbox/Dockerfile.executor" -t "$(EXECUTOR_IMAGE)" "$(ROOT)"
 
 gen:
 	cd "$(WEB)" && node scripts/gen.mjs
@@ -79,7 +90,7 @@ dev-stack:
 	@echo "     --log-level warn --search-attribute UserEmail=Keyword --search-attribute CodingAgentOwner=Keyword"
 	@echo
 	@echo "3. Sandbox executor on $(EXECUTOR_PORT) (see simple_chat_agent/worker/sandbox/README.md):"
-	@echo "   docker build -f simple_chat_agent/worker/sandbox/Dockerfile.executor -t agent-executor:dev ."
+	@echo "   make executor-image"
 	@echo "   (set -a; . ./.env.local; set +a; docker run -d --name agent-executor -p 127.0.0.1:$(EXECUTOR_PORT):8082 \\"
 	@echo "     -e WORKSPACE_EXECUTOR_TOKEN -e WORKSPACE_EXECUTOR_ROOT=/workspaces \\"
 	@echo "     --security-opt seccomp=unconfined --security-opt apparmor=unconfined \\"

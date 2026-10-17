@@ -12,12 +12,15 @@
 **/__pycache__/
 *.py[cod]
 
-# Local runtime data (sqlite, claim-check store, streams, replay)
+# Local runtime data (sqlite, claim-check store, replay)
 .simple_chat_agent/
-.simple_chat_streams/
 .replay/
-.lambda-build/
-simple_chat_agent/frontend/static/dist/
+
+# The web app is built inside the image; never copy a local build or test output.
+simple_chat_agent/web/dist/
+simple_chat_agent/web/e2e/.results*/
+simple_chat_agent/web/e2e/.report/
+**/test-results/
 
 # VCS / IDE / OS
 .git
