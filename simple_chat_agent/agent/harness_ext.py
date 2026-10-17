@@ -49,9 +49,11 @@ from temporal_agent_harness.ai_sdks.pydantic_ai_harness import (
     _tool_schema,
 )
 from temporal_agent_harness.harness.agent_protocol import (
+    PROVIDE_CALLBACK_RESULT_UPDATE,
     SEND_AGENT_MESSAGE_UPDATE,
     TOOL_APPROVAL_UPDATE,
     AgentMessage,
+    CallbackResult,
     ToolApprovalPolicy,
     MidTurn,
     ModelInteractionStarted,
@@ -486,6 +488,10 @@ _REJECTION_CODES = {
     "UnknownFunction": "unknown_function",
     "MalformedMessage": "malformed_message",
     "MidTurnRejected": "busy",
+    "UnknownCallback": "unknown_callback",
+    "CallbackAlreadyResolved": "already_resolved",
+    "MalformedCallbackResult": "invalid_result",
+    "InvalidCallbackResult": "invalid_answer",
 }
 _REJECTION_REASONS = {
     "unknown_approval": "No approval is waiting for this tool call. Its turn may have been stopped.",
@@ -494,6 +500,8 @@ _REJECTION_REASONS = {
     "malformed_message": "The agent couldn't read this message.",
     "busy": "The agent is busy and doesn't accept this message mid-turn.",
     "session_closed": "The session closed.",
+    "unknown_callback": "Nothing is waiting for this answer. The question may have timed out or its turn was stopped.",
+    # invalid_result / invalid_answer: the validator's own message says what was wrong.
 }
 
 
@@ -513,7 +521,7 @@ def describe_rejection(exc: ApplicationError | None) -> tuple[str, str, str | No
 def publish_rejection(
     runner: AgentWorkflowRunner,
     *,
-    kind: typing.Literal["message", "approval"],
+    kind: typing.Literal["message", "approval", "callback"],
     request_id: str,
     exc: ApplicationError | None,
     tool_id: str | None = None,
@@ -526,7 +534,7 @@ def publish_rejection(
 
     * for a message, ``message_accepted`` then ``message_handler_error`` under the message's
       own id (``message_text``), so a harness client marks that pending message as failed;
-    * for both kinds, one ``message_handler_error`` under ``REJECTION_MESSAGE_PREFIX +
+    * for every kind (message, approval, callback), one ``message_handler_error`` under ``REJECTION_MESSAGE_PREFIX +
       request_id`` whose text is the rejection as JSON. A harness client ignores it (an error
       for an unknown message id); the bridge replaces it with an ``x_rejected`` frame.
     """
@@ -630,6 +638,59 @@ def admit_message(runner: AgentWorkflowRunner, message: AgentMessage, *, message
         MessageAccepted(handler=message.type, payload=message.payload, disposition=disposition),
         message_id=message_id,
     )
+
+
+CallbackCheck = Callable[[str, dict[str, Any], Any], None]
+
+
+def _check_callback(runner: AgentWorkflowRunner, result: Any, check: CallbackCheck) -> None:
+    """The harness's own checks (``_validate_provide_callback_result``: unknown id, already
+    resolved, result type), then ``check(tool_name, tool_input, result)`` on a result."""
+    runner._validate_provide_callback_result(result)
+    if result.error is None:
+        entry = runner._status.callback_entry(result.tool_id)
+        assert entry is not None  # the harness validator refused unknown ids
+        check(entry.tool_name, entry.tool_input, result.result)
+
+
+async def admit_callback_result(
+    runner: AgentWorkflowRunner, tool_id: str, result: Any, error: str | None, check: CallbackCheck
+) -> None:
+    """Apply a browser's callback answer as the ``provide_callback_result`` Update would
+    (``_validate_provide_callback_result`` / ``_handle_provide_callback_result``), with
+    ``check`` added. Raises ApplicationError when refused; nothing is consumed then."""
+    payload = CallbackResult(tool_id=tool_id, result=result, error=error)
+    _check_callback(runner, payload, check)
+    await runner._handle_provide_callback_result(payload)
+
+
+def guard_callback_result(
+    runner: AgentWorkflowRunner, check: CallbackCheck, on_update: Callable[[], None] = lambda: None
+) -> None:
+    """Re-register the harness ``provide_callback_result`` Update with ``check`` in its
+    validator, so the Update path refuses the same answers as the Signal front door."""
+    def validator(result: CallbackResult) -> None:
+        _check_callback(runner, result, check)
+
+    async def handler(result: CallbackResult) -> Any:
+        on_update()
+        return await runner._handle_provide_callback_result(result)
+
+    workflow.set_update_handler(PROVIDE_CALLBACK_RESULT_UPDATE, handler, validator=validator)
+
+
+def fail_pending_callbacks(runner: AgentWorkflowRunner, *, turn_id: str, reason: str) -> int:
+    """Resolve every callback still waiting in ``turn_id`` as an error and publish
+    ``callback_resolved``. Like approvals, a cancelled wait leaves its entry PENDING forever
+    (agent_workflow.py ``await_callback_result``), which would also block continue-as-new."""
+    failed = 0
+    for pending in runner._status.pending_callbacks():
+        entry = runner._status.callback_entry(pending.tool_id)
+        if entry is not None and entry.turn_id == turn_id:
+            runner._status.resolve_callback(pending.tool_id, outcome="error", result=None, error=reason)
+            runner._publish_callback_resolved(pending.tool_id)
+            failed += 1
+    return failed
 
 
 async def admit_approval(runner: AgentWorkflowRunner, decision: ToolApprovalDecision) -> None:

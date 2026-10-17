@@ -21,6 +21,8 @@ Posture = Literal["ask_everything", "trust_safe", "auto", "never_ask"]
 # the agent admits them into the harness runner when it next runs.
 ENQUEUE_MESSAGE_SIGNAL = "enqueue_message"
 ENQUEUE_APPROVAL_SIGNAL = "enqueue_approval"
+# The answer to a browser callback tool (ask_user, pick_files; PRD A12).
+ENQUEUE_CALLBACK_SIGNAL = "enqueue_callback_result"
 # The Redis bridge reports the highest stream offset it has stored, once per turn end. The
 # agent then trims only what the bridge holds when it continues as new (P2 decision 4).
 STREAM_ACKED_SIGNAL = "stream_acked"
@@ -196,6 +198,47 @@ class StreamAck(BaseModel):
     """Payload of the stream_acked signal."""
 
     offset: int
+
+
+class FrontDoorCallbackResult(BaseModel):
+    """Payload of the enqueue_callback_result signal: the browser's answer to a pending
+    callback tool call. Exactly one of ``result`` / ``error`` is meaningful."""
+
+    request_id: str
+    tool_id: str
+    result: Any = None
+    error: str | None = None
+
+
+# -- Browser callback tools (PRD A12) --------------------------------------------------------
+
+# pick_files limits, enforced by the upload route (size, count, names) and again by the agent
+# (count and path shape) when the answer arrives.
+PICK_MAX_FILES = 10
+PICK_MAX_FILE_BYTES = 5 * 1024 * 1024  # the executor's per-write cap
+PICK_MAX_NAME_CHARS = 100
+PICK_UPLOAD_DIR = "uploads"
+ASK_MAX_OPTIONS = 6
+
+
+class ChoiceOption(BaseModel):
+    """One choice card."""
+
+    id: str = Field(description="Short stable id for this option, e.g. 'a' or 'keep'.")
+    label: str = Field(description="What the card says.")
+    description: str = Field("", description="One optional line under the label.")
+
+
+class AskUserAnswer(BaseModel):
+    """The option the user chose (one of the offered ids)."""
+
+    option_id: str
+
+
+class PickedFiles(BaseModel):
+    """Workspace paths of the files the user chose, uploaded under ``uploads/``."""
+
+    paths: list[str] = Field(default_factory=list)
 
 
 class FrontDoorApproval(BaseModel):

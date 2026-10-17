@@ -37,6 +37,7 @@ with workflow.unsafe.imports_passed_through():
         AGENT_WORKFLOW_TYPE,
         CARRIED_STATE_VERSION,
         ENQUEUE_APPROVAL_SIGNAL,
+        ENQUEUE_CALLBACK_SIGNAL,
         ENQUEUE_MESSAGE_SIGNAL,
         STREAM_ACKED_SIGNAL,
         Ack,
@@ -47,6 +48,7 @@ with workflow.unsafe.imports_passed_through():
         ChatReply,
         CodingAgentInit,
         FrontDoorApproval,
+        FrontDoorCallbackResult,
         ForgetAlwaysAllowed,
         FrontDoorMessage,
         InterruptRequest,
@@ -79,6 +81,7 @@ with workflow.unsafe.imports_passed_through():
         subagent_tools,
     )
     from simple_chat_agent.agent.tools.artifacts import ARTIFACT_TOOLS
+    from simple_chat_agent.agent.tools.callbacks import CALLBACK_TOOLS, check_callback_result
     from simple_chat_agent.agent.tools.code_mode import build_code_mode_tool
     from simple_chat_agent.agent.tools.workspace import TEST_TOOLS, WORKSPACE_TOOLS
 
@@ -222,6 +225,9 @@ class CodingAgent:
         )
         self._updates_this_run = 0
         harness_ext.guard_tool_approval(self._runner, self._limit_remember, on_update=self._count_update)
+        # Browser callback answers (PRD A12) are checked against the question they answer, on
+        # the Signal front door and on the harness Update alike.
+        harness_ext.guard_callback_result(self._runner, check_callback_result, on_update=self._count_update)
         harness_ext.restore_turn_counter(self._runner, carried.turn_counter)
         self._history: list[ModelMessage] = ModelMessagesTypeAdapter.validate_python(
             carried.conversation
@@ -435,6 +441,28 @@ class CodingAgent:
                 exc=exc,
             )
 
+    @workflow.signal(name=ENQUEUE_CALLBACK_SIGNAL)
+    async def enqueue_callback_result(self, answer: FrontDoorCallbackResult) -> None:
+        """The browser's answer to ask_user / pick_files (PRD A12). A refused answer (unknown
+        or resolved call, wrong shape, an id that wasn't offered) consumes nothing and is
+        reported as x_rejected; the question stays open."""
+        self._signals_this_run += 1
+        if self._is_duplicate(answer.request_id):
+            return
+        try:
+            await harness_ext.admit_callback_result(
+                self._runner, answer.tool_id, answer.result, answer.error, check_callback_result
+            )
+        except ApplicationError as exc:
+            self._reject(answer.request_id, exc)
+            harness_ext.publish_rejection(
+                self._runner,
+                kind="callback",
+                request_id=answer.request_id,
+                tool_id=answer.tool_id,
+                exc=exc,
+            )
+
     def _admit(self, message: FrontDoorMessage) -> None:
         try:
             harness_ext.admit_message(
@@ -545,7 +573,9 @@ class CodingAgent:
 
     def _tools(self) -> list[Any]:
         research = [t for t in RESEARCH_TOOLS if t.__name__ in set(self._data.research_tools)]
-        tools: list[Any] = [*WORKSPACE_TOOLS, *research, *ARTIFACT_TOOLS, *STATE_TOOLS, self._code_mode]
+        tools: list[Any] = [
+            *WORKSPACE_TOOLS, *research, *ARTIFACT_TOOLS, *STATE_TOOLS, self._code_mode, *CALLBACK_TOOLS
+        ]
         if self._data.depth == 0:
             tools += subagent_tools(
                 task_queue=workflow.info().task_queue,
@@ -784,6 +814,8 @@ class CodingAgent:
         declined = harness_ext.decline_pending_approvals(
             self._runner, turn_id=turn_id, reason=msg.reason
         )
+        # Open questions and file requests in the turn fail too (their cards close).
+        harness_ext.fail_pending_callbacks(self._runner, turn_id=turn_id, reason=msg.reason)
         self._interrupted = True
         task.cancel()
         return Ack(detail=f"Stopped. Declined {declined} pending approval(s).")

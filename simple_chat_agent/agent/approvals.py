@@ -106,6 +106,9 @@ TOOL_RISK_CLASSES: dict[str, str] = {
     # Its host calls run under the script's approval, never their own gate.
     "run_script": READ_ONLY,
     **{f"fs_{op}": READ_ONLY for op in ("seed", "stat", "read", "list")},
+    # Browser callbacks (PRD A12): the person answers, nothing runs.
+    "ask_user": READ_ONLY,
+    "pick_files": READ_ONLY,
     # Test-only (test_tools): external so it is never judge-approvable, never "always
     # allowed", and asks under every posture but never_ask.
     "gated_echo": EXTERNAL_SIDE_EFFECT,

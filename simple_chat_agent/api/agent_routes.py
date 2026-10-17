@@ -70,7 +70,12 @@ from simple_chat_agent.agent.approvals import DEFAULT_JUDGE_MODEL, JUDGE_MODEL_E
 from simple_chat_agent.agent.contracts import (
     AGENT_WORKFLOW_TYPE,
     ENQUEUE_APPROVAL_SIGNAL,
+    ENQUEUE_CALLBACK_SIGNAL,
     ENQUEUE_MESSAGE_SIGNAL,
+    PICK_MAX_FILE_BYTES,
+    PICK_MAX_FILES,
+    PICK_MAX_NAME_CHARS,
+    PICK_UPLOAD_DIR,
     Ack,
     AlwaysAllowedForgotten,
     ChatMessage,
@@ -79,6 +84,7 @@ from simple_chat_agent.agent.contracts import (
     Findings,
     ForgetAlwaysAllowed,
     FrontDoorApproval,
+    FrontDoorCallbackResult,
     FrontDoorMessage,
     InterruptRequest,
     Question,
@@ -127,6 +133,10 @@ _ATTACHMENT_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _MIME_TYPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,63}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}$")
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 TITLE_MAX = 200
+# Browser callbacks (PRD A12): tool ids we accept, the answer's size, and an error note's length.
+_TOOL_ID = re.compile(r"^[A-Za-z0-9_.:/-]{1,200}$")
+CALLBACK_RESULT_MAX_BYTES = 16 * 1024
+CALLBACK_ERROR_MAX = 500
 # How long a subagent tool approval waits for a worker to take the harness Update.
 CHILD_APPROVAL_TIMEOUT = timedelta(seconds=10)
 # The envelope allows for multipart framing around the largest allowed attachment.
@@ -412,7 +422,8 @@ class HarnessErrorRoute(APIRoute):
     def get_route_handler(self) -> Callable[[Request], Awaitable[Response]]:
         handler = super().get_route_handler()
 
-        multipart = self.path.endswith("/attachments")
+        # Session attachments and pick_files uploads are the only multipart routes.
+        multipart = self.path.endswith("/attachments") or self.path.endswith("/files")
 
         async def wrapped(request: Request) -> Response:
             if request.method in _UNSAFE_METHODS:
@@ -527,7 +538,8 @@ class CallbackResult(BaseModel):
     session_id: str
     tool_id: str
     result: Any = None
-    error: str | None = None
+    error: str | None = Field(default=None, max_length=CALLBACK_ERROR_MAX)
+    request_id: str | None = None
 
 
 class Rename(BaseModel):
@@ -1024,6 +1036,60 @@ async def closed_flags(store: AgentStore, session_ids: list[str]) -> list[bool]:
 
 SeedFn = Callable[[str, str], Awaitable[Any]]
 ReadLogFn = Callable[..., Awaitable[dict[str, Any]]]
+# Writes one picked file into a workspace: (workspace_id, path, content) -> None. Raises
+# FileExistsError when the path is taken.
+WriteUploadFn = Callable[[str, str, bytes], Awaitable[None]]
+
+
+async def _default_write_upload(workspace_id: str, path: str, content: bytes) -> None:
+    import base64
+
+    from temporalio.exceptions import ApplicationError
+
+    from simple_chat_agent.agent.tools.workspace import _files_call
+
+    try:
+        await _files_call(
+            "write",
+            {
+                "workspace_id": workspace_id,
+                "path": path,
+                "content": base64.b64encode(content).decode("ascii"),
+                "encoding": "base64",
+                "create_parents": True,
+                "overwrite": False,
+            },
+        )
+    except ApplicationError as exc:
+        if exc.type == "Workspace_exists":
+            raise FileExistsError(path) from None
+        raise
+
+
+_UNSAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def upload_file_name(raw: str | None) -> str:
+    """A browser file name made safe for ``uploads/<name>``: its last path component, runs of
+    other characters as ``_``, no leading dots or dashes, at most PICK_MAX_NAME_CHARS (keeping
+    the extension), ``file`` when nothing is left."""
+    base = (raw or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = _UNSAFE_NAME_CHARS.sub("_", base).lstrip("._-")
+    if len(name) > PICK_MAX_NAME_CHARS:
+        stem, dot, ext = name.rpartition(".")
+        ext = ext[:16] if dot and stem else ""
+        name = name[: PICK_MAX_NAME_CHARS - (len(ext) + 1 if ext else 0)].rstrip("._-")
+        name = f"{name}.{ext}" if ext else name
+    return name or "file"
+
+
+def _numbered(name: str, n: int) -> str:
+    stem, dot, ext = name.rpartition(".")
+    if not (dot and stem):
+        stem, ext = name, ""
+    suffix = f"-{n}"
+    stem = stem[: PICK_MAX_NAME_CHARS - len(suffix) - (len(ext) + 1 if ext else 0)]
+    return f"{stem}{suffix}.{ext}" if ext else f"{stem}{suffix}"
 
 
 async def _default_seed(workspace_id: str, fixture: str) -> Any:
@@ -1066,6 +1132,7 @@ def create_agent_router(
     app_store: Callable[[], Any] | None = None,
     seed: SeedFn | None = None,
     read_log: ReadLogFn | None = None,
+    write_upload: WriteUploadFn | None = None,
 ) -> APIRouter:
     """The agent routes. Mount with ``prefix="/api/agent"``.
 
@@ -1077,6 +1144,7 @@ def create_agent_router(
     sessions = directory or SessionDirectory(store.r, temporal=None, task_queue=task_queue, sync_workflow=False)
     seed_fn = seed or _default_seed
     read_log_fn = read_log if read_log is not None else _default_read_log()
+    write_upload_fn = write_upload or _default_write_upload
 
     def user_id(request: Request) -> str:
         return current_user(request).user_id
@@ -1616,10 +1684,87 @@ def create_agent_router(
             raise
         await _wake(await bridge(), root)
 
+    def upload_key(session_id: str, tool_id: str) -> str:
+        # Which uploads/ paths this tool call's picker wrote: a pick_files answer may name only these.
+        return f"{prefix()}:cb-uploads:{session_id}:{hashlib.sha256(tool_id.encode()).hexdigest()[:32]}"
+
+    def check_tool_id(tool_id: str) -> None:
+        if not _TOOL_ID.fullmatch(tool_id or ""):
+            raise HarnessError(422, "invalid_tool_id", "tool_id must be 1-200 of [A-Za-z0-9_.:/-].")
+
+    @router.post("/sessions/{session_id}/callbacks/{tool_id}/files")
+    async def upload_picked_file(
+        session_id: str, tool_id: str, file: UploadFile = File(...), uid: str = Depends(user_id)
+    ):
+        """One file the user chose for a ``pick_files`` call: written into the session's
+        workspace as ``uploads/<safe name>`` (never overwriting; ``-1``, ``-2``... on a clash).
+        At most PICK_MAX_FILES per call and PICK_MAX_FILE_BYTES each. Returns the path, which
+        the browser then sends back in the callback result."""
+        check_tool_id(tool_id)
+        root = await require_root(session_id, uid)
+        content = await file.read(PICK_MAX_FILE_BYTES + 1)
+        if len(content) > PICK_MAX_FILE_BYTES:
+            raise HarnessError(413, "too_large", f"Each file is limited to {PICK_MAX_FILE_BYTES} bytes.")
+        key = upload_key(root, tool_id)
+        if await store.r.scard(key) >= PICK_MAX_FILES:
+            raise HarnessError(409, "too_many_files", f"At most {PICK_MAX_FILES} files can be picked at once.")
+        name = upload_file_name(file.filename)
+        for attempt in range(10):
+            path = f"{PICK_UPLOAD_DIR}/{name if attempt == 0 else _numbered(name, attempt)}"
+            try:
+                await write_upload_fn(root, path, content)
+                break
+            except FileExistsError:
+                continue
+            except Exception:  # noqa: BLE001 - executor refused or unreachable
+                log.exception("pick_files upload to %s failed", root)
+                raise HarnessError(502, "upload_failed", "Couldn't put the file in the workspace. Try again.") from None
+        else:
+            raise HarnessError(409, "name_taken", "Too many files with that name; rename it and try again.")
+        await store.r.sadd(key, path)
+        await store.r.expire(key, session_ttl_seconds())
+        return JSONResponse(
+            {"path": path, "name": (file.filename or "")[:PICK_MAX_NAME_CHARS * 2], "size": len(content)},
+            headers=NO_STORE,
+        )
+
     @router.post("/callback-result")
     async def callback_result(body: CallbackResult, uid: str = Depends(user_id)):
-        await require(body.session_id, uid)
-        raise HarnessError(501, "not_implemented", "Callback tools arrive in P4.")
+        """The browser's answer to an ``ask_user`` / ``pick_files`` call, through the Signal
+        front door (lands with or without a worker). The agent checks it against the question
+        (offered option ids; picked paths and count) and refuses a bad one as ``x_rejected``
+        (kind ``callback``); the card stays open."""
+        check_request_id(body.request_id)
+        check_tool_id(body.tool_id)
+        root = await require(body.session_id, uid)
+        if root != body.session_id:
+            raise HarnessError(409, "not_supported", "Callback answers go to the session, not to a subagent.")
+        if len(json.dumps(body.result, default=str)) > CALLBACK_RESULT_MAX_BYTES:
+            raise HarnessError(413, "too_large", "That answer is too large.")
+        error = _CONTROL_CHARS.sub(" ", body.error).strip() or "The user declined." if body.error is not None else None
+        if error is None and isinstance(body.result, dict) and "paths" in body.result:
+            # A pick_files answer names only files this call's picker uploaded.
+            paths = body.result.get("paths")
+            if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+                raise HarnessError(422, "invalid_result", "paths must be a list of strings.")
+            uploaded = await store.r.smembers(upload_key(root, body.tool_id)) if paths else set()
+            if any(p not in uploaded for p in paths):
+                raise HarnessError(422, "unknown_upload", "Every path must be a file uploaded for this request.")
+        request_id = body.request_id or str(uuid.uuid4())
+        handle = (await temporal()).get_workflow_handle(body.session_id)
+        try:
+            await handle.signal(
+                ENQUEUE_CALLBACK_SIGNAL,
+                FrontDoorCallbackResult(
+                    request_id=request_id, tool_id=body.tool_id, result=body.result, error=error
+                ),
+            )
+        except RPCError as exc:
+            if exc.status == RPCStatusCode.NOT_FOUND:
+                raise not_found("The session has ended.") from None
+            raise
+        await _wake(await bridge(), body.session_id)
+        return JSONResponse({"tool_id": body.tool_id, "accepted": True, "request_id": request_id}, headers=NO_STORE)
 
     @router.get("/status/{session_id}")
     async def status(session_id: str, uid: str = Depends(user_id)):

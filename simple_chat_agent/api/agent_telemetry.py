@@ -12,7 +12,8 @@ frame before it (``x_rejected``: at the position of the stream event it replaces
                 identity and the previous attempt's failure). Also for ``run_command`` reattach.
 ``x_worker``    "is a worker answering" hints while a turn is open and the stream is silent,
                 from Describe and DescribeTaskQueue (no worker needed, not Queries).
-``x_rejected``  a front-door Signal (``enqueue_message`` / ``enqueue_approval``) the agent
+``x_rejected``  a front-door Signal (``enqueue_message`` / ``enqueue_approval`` /
+                ``enqueue_callback_result``) the agent
                 refused: unknown or already-resolved approval, unknown or malformed message,
                 session closed. The workflow publishes it on its own event stream (a
                 ``message_handler_error`` whose ``message_id`` starts with
@@ -1011,7 +1012,7 @@ def rejected_frame(data: dict[str, Any], *, root_agent_id: str | None = None) ->
             raise ValueError("not an object")
     except ValueError:
         detail = {"reason": data.get("message")}
-    kind = detail.get("kind") if detail.get("kind") in ("message", "approval") else None
+    kind = detail.get("kind") if detail.get("kind") in ("message", "approval", "callback") else None
     return X_REJECTED, {
         "id": f"rejected:{request_id}",
         "agent_id": data.get("agent_id") or root_agent_id,
