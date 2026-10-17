@@ -56,6 +56,7 @@ with workflow.unsafe.imports_passed_through():
         SettingsAck,
         SetModel,
         SetPosture,
+        SetWebSearch,
         SteerMessage,
         StreamAck,
     )
@@ -67,6 +68,8 @@ with workflow.unsafe.imports_passed_through():
         CodingDeps,
         is_allowed_model,
         model_settings,
+        web_search_capabilities,
+        web_sources,
     )
     from simple_chat_agent.agent.state import (
         STATE_TOOLS,
@@ -242,6 +245,8 @@ class CodingAgent:
         self._code_mode = build_code_mode_tool(self._workspace_id)
         harness_ext.allow_approved_script_calls(self._runner)
         self._turns_this_run = 0
+        # Web pages the provider's search returned during the turn in flight (ChatReply.sources).
+        self._turn_sources: list[Any] = []
         self._continuing = False
         # Interrupt bookkeeping for the turn in flight.
         self._run_task: asyncio.Task[str] | None = None
@@ -515,13 +520,15 @@ class CodingAgent:
             # The model left this worker's allowlist (config change or a different deploy).
             self._model = DEFAULT_MODEL
         self._turns_this_run += 1
+        self._turn_sources = []
         self._interrupted = False
         self._snapshot = None
         self._run_turn_id = ctx.turn_id
         task = asyncio.ensure_future(self._run_turn(user_prompt(msg.text, msg.attachments)))
         self._run_task = task
         try:
-            return ChatReply(text=await task)
+            text = await task
+            return ChatReply(text=text, sources=self._turn_sources)
         except harness_ext.CheckpointNeeded as cp:
             # Keep the work so far and hand off to a fresh run; the user continues from there.
             if self._snapshot is not None:
@@ -654,14 +661,22 @@ class CodingAgent:
             ),
             message_history=self._history,
             model=choice.registry_key,
-            model_settings=model_settings(choice, session_id=self._data.session_id),
+            model_settings=model_settings(choice, session_id=self._data.session_id, web_search=self._web_search_on()),
             # MCP tools (PRD A8; local sessions with MCP on): agent/mcp.py.
             toolsets=[toolset, *await mcp.toolsets_for_run(self._data, is_interrupted=lambda: self._interrupted)],
             # ContextFit before Hooks: the snapshot then holds the history as sent.
-            capabilities=[context.ContextFit(budget), hooks],
+            # Provider web search (P4 4.5) only while the session has it on: otherwise the
+            # model has no search tool at all.
+            capabilities=[
+                context.ContextFit(budget), hooks, *web_search_capabilities(choice, enabled=self._web_search_on())
+            ],
         )
         self._history = result.all_messages()
+        self._turn_sources = web_sources(result.new_messages())
         return str(result.output)
+
+    def _web_search_on(self) -> bool:
+        return self._data.web_search and self._data.web_search_allowed
 
     async def _before_model_request(self, ctx: Any, request_context: Any) -> Any:
         if self._interrupted:
@@ -785,6 +800,23 @@ class CodingAgent:
         return SettingsAck(
             detail=f"Approvals: {msg.posture.replace('_', ' ')}.", setting="posture", posture=msg.posture
         )
+
+    @agent.accepts(mid_turn=MidTurn.ACCEPT, model_callable=False)
+    async def set_web_search(self, msg: SetWebSearch) -> SettingsAck:
+        """Turn the model provider's built-in web search on or off. Applies from the next turn."""
+        current = self._web_search_on()
+        if msg.enabled and not self._data.web_search_allowed:
+            return SettingsAck(
+                ok=False, detail="Web search isn't available here.", setting="web_search", web_search=current
+            )
+        self._data = self._data.model_copy(update={"web_search": msg.enabled})
+        when = " from the next message" if self._run_task is not None else ""
+        detail = (
+            f"Web search on{when}. The model provider runs the searches; they aren't approved one by one."
+            if msg.enabled
+            else f"Web search off{when}."
+        )
+        return SettingsAck(detail=detail, setting="web_search", web_search=msg.enabled)
 
     @agent.accepts(mid_turn=MidTurn.ACCEPT, model_callable=False)
     async def forget_always_allowed(self, msg: ForgetAlwaysAllowed) -> AlwaysAllowedForgotten:

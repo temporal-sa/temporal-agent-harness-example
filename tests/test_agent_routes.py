@@ -1030,7 +1030,7 @@ class AgentInterfaceTests(AgentRoutesTestBase):
         r = self.client.get(f"/api/agent/agent-interface/{sid}", headers=A)
         self.assertEqual(r.status_code, 200, r.text)
         names = [f["name"] for f in r.json()]
-        self.assertEqual(names, ["chat", "forget_always_allowed", "interrupt", "set_model", "set_posture", "steer"])
+        self.assertEqual(names, ["chat", "forget_always_allowed", "interrupt", "set_model", "set_posture", "set_web_search", "steer"])
         chat = r.json()[0]
         self.assertEqual((chat["mid_turn"], chat["model_callable"]), ("enqueue", True))
         self.assertIn("text", chat["parameters"]["properties"])

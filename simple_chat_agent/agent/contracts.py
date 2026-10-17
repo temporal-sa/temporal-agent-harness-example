@@ -99,6 +99,11 @@ class CodingAgentInit(BaseModel):
     mcp: bool = False
     system_prompt: str | None = None
     carried: CarriedState | None = None
+    # Provider web search (P4 4.5): whether this session may turn it on (the API decides from
+    # its environment and config; off in the catalog unless configured), and whether it is on.
+    # Off by default. set_web_search changes `web_search`; it is carried with this data.
+    web_search_allowed: bool = False
+    web_search: bool = False
     # Test hooks: force continue-as-new at the next idle point (P0 step 0.5), and offer
     # test-only tools such as wait_seconds.
     force_continue_as_new_after_turns: int | None = None
@@ -129,10 +134,24 @@ class ChatMessage(BaseModel):
     attachments: list[ChatAttachment] = Field(default_factory=list, max_length=MAX_CHAT_ATTACHMENTS)
 
 
+MAX_WEB_SOURCES = 20
+
+
+class WebSource(BaseModel):
+    """One page the provider's web search used for a reply."""
+
+    title: str = ""
+    url: str
+
+
 class ChatReply(BaseModel):
     """The agent's final answer for a turn."""
 
     text: str
+    # Pages the provider's built-in web search returned during this turn (P4 4.5), first seen
+    # first, deduplicated by URL, at most MAX_WEB_SOURCES. Empty when web search is off or
+    # wasn't used. The UI lists them under the reply.
+    sources: list[WebSource] = Field(default_factory=list)
     interrupted: bool = False
     # Set when the turn stopped early to keep the workflow inside Temporal's history limits
     # (PRD A20). The agent continues as new; the user says "continue" to carry on.
@@ -178,10 +197,19 @@ class SettingsAck(Ack):
     the new one when ``ok``, the unchanged one when it refused. The bridge copies it into the
     session list, so the list never shows a setting the agent refused."""
 
-    setting: Literal["model", "posture"]
+    setting: Literal["model", "posture", "web_search"]
     # set_model: the model for the next turn (the current one if the change was refused).
     model: ModelChoice | None = None
     posture: Posture | None = None
+    # set_web_search: whether web search is now on.
+    web_search: bool | None = None
+
+
+class SetWebSearch(BaseModel):
+    """Turn the model provider's built-in web search on or off for this session. Applies from
+    the next turn. Its searches run inside the provider and are not approved one by one."""
+
+    enabled: bool
 
 
 class ForgetAlwaysAllowed(BaseModel):

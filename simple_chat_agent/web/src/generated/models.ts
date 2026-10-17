@@ -383,9 +383,17 @@ export interface ChatMessage {
  */
 export interface ChatReply {
   text: string;
+  sources: WebSource[];
   interrupted: boolean;
   checkpoint: string | null;
   error: string | null;
+}
+/**
+ * One page the provider's web search used for a reply.
+ */
+export interface WebSource {
+  title: string;
+  url: string;
 }
 /**
  * The agent's init data: what a session starts with, plus anything carried across runs.
@@ -403,6 +411,8 @@ export interface CodingAgentInit {
   mcp?: boolean;
   system_prompt?: string | null;
   carried?: CarriedState | null;
+  web_search_allowed?: boolean;
+  web_search?: boolean;
   force_continue_as_new_after_turns?: number | null;
   test_tools?: boolean;
   test_history_event_cap?: number | null;
@@ -521,6 +531,13 @@ export interface SetPosture {
   posture: "ask_everything" | "trust_safe" | "auto" | "never_ask";
 }
 /**
+ * Turn the model provider's built-in web search on or off for this session. Applies from
+ * the next turn. Its searches run inside the provider and are not approved one by one.
+ */
+export interface SetWebSearch {
+  enabled: boolean;
+}
+/**
  * Acknowledgement of ``set_model`` / ``set_posture`` with the value the agent now holds:
  * the new one when ``ok``, the unchanged one when it refused. The bridge copies it into the
  * session list, so the list never shows a setting the agent refused.
@@ -528,9 +545,10 @@ export interface SetPosture {
 export interface SettingsAck {
   ok: boolean;
   detail: string;
-  setting: "model" | "posture";
+  setting: "model" | "posture" | "web_search";
   model: ModelChoiceOutput | null;
   posture: ("ask_everything" | "trust_safe" | "auto" | "never_ask") | null;
+  web_search: boolean | null;
 }
 /**
  * Guidance for the turn in progress, injected before the agent's next model call.

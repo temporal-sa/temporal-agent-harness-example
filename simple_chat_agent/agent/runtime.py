@@ -8,15 +8,17 @@ run supplies its own runner (through deps), tools (per-run toolset) and model (r
 from __future__ import annotations
 
 from datetime import timedelta
+from typing import Any
 
 from pydantic_ai import Agent
+from pydantic_ai.messages import NativeToolReturnPart
 from temporalio.common import RetryPolicy
 from temporalio.workflow import ActivityConfig
 
 from temporal_agent_harness.ai_sdks.pydantic_ai_harness import HarnessDeps
 
 from simple_chat_agent.agent import harness_ext
-from simple_chat_agent.agent.contracts import ModelChoice
+from simple_chat_agent.agent.contracts import MAX_WEB_SOURCES, ModelChoice, WebSource
 from simple_chat_agent.agent.model_registry import build_registry, settings_for
 from simple_chat_agent.agent.tools.research import RESEARCH_TOOLS  # noqa: F401 - re-exported
 
@@ -81,5 +83,67 @@ def is_allowed_model(choice: ModelChoice) -> bool:
     return choice.registry_key in ALLOWED_KEYS
 
 
-def model_settings(choice: ModelChoice, *, session_id: str):
-    return settings_for(choice, session_id=session_id)
+def model_settings(choice: ModelChoice, *, session_id: str, web_search: bool = False):
+    return settings_for(choice, session_id=session_id, web_search=web_search)
+
+
+# -- Provider web search (P4 4.5) -----------------------------------------------------------
+
+# Providers whose models take Pydantic AI's built-in WebSearchTool (Anthropic, OpenAI
+# Responses, Gemini). A session on another provider gets no search even with the setting on.
+WEB_SEARCH_PROVIDERS = frozenset({"anthropic", "openai", "google"})
+
+
+def web_search_capabilities(choice: ModelChoice, *, enabled: bool) -> list[Any]:
+    """The per-run capabilities that turn on the provider's built-in web search: none when
+    the setting is off, so no search can happen."""
+    if not enabled or choice.provider not in WEB_SEARCH_PROVIDERS:
+        return []
+    from pydantic_ai.capabilities import WebSearch
+
+    return [WebSearch()]
+
+
+def _source_items(content: Any) -> list[dict[str, Any]]:
+    """Every dict with a URL in a web-search result, whatever the provider's shape: Anthropic
+    (a list of results with url/title), OpenAI ({"sources": [{"url": ...}]}), Gemini (a list of
+    grounding chunks with uri/title/domain)."""
+    found: list[dict[str, Any]] = []
+
+    def walk(value: Any, depth: int = 0) -> None:
+        if depth > 4:
+            return
+        if isinstance(value, dict):
+            if isinstance(value.get("url") or value.get("uri"), str):
+                found.append(value)
+                return
+            for v in value.values():
+                walk(v, depth + 1)
+        elif isinstance(value, list):
+            for v in value:
+                walk(v, depth + 1)
+
+    walk(content)
+    return found
+
+
+def web_sources(messages: list[Any]) -> list[WebSource]:
+    """The web pages the provider's search returned in ``messages`` (Pydantic AI
+    ``NativeToolReturnPart`` with tool name ``web_search``), in order, deduplicated by URL, at
+    most MAX_WEB_SOURCES. Only http(s) URLs; titles fall back to the domain or the URL."""
+    sources: list[WebSource] = []
+    seen: set[str] = set()
+    for message in messages:
+        for part in getattr(message, "parts", []):
+            if not isinstance(part, NativeToolReturnPart) or part.tool_name != "web_search":
+                continue
+            for item in _source_items(getattr(part, "content", None)):
+                url = str(item.get("url") or item.get("uri") or "").strip()
+                if not url.lower().startswith(("https://", "http://")) or url in seen or len(url) > 2000:
+                    continue
+                seen.add(url)
+                title = str(item.get("title") or item.get("domain") or url).strip()[:300]
+                sources.append(WebSource(title=title, url=url))
+                if len(sources) >= MAX_WEB_SOURCES:
+                    return sources
+    return sources

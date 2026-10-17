@@ -58,6 +58,16 @@
         "$ref": "#/$defs/SettingsAck"
       }
     },
+    "set_web_search": {
+      "description": "Turn the model provider's built-in web search on or off. Applies from the next turn.",
+      "mid_turn": "accept",
+      "input": {
+        "$ref": "#/$defs/SetWebSearch"
+      },
+      "output": {
+        "$ref": "#/$defs/SettingsAck"
+      }
+    },
     "steer": {
       "description": "Guide the turn in progress. The text reaches the agent before its next model call.",
       "mid_turn": "accept",
@@ -363,6 +373,13 @@
           "title": "Text",
           "type": "string"
         },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/WebSource"
+          },
+          "title": "Sources",
+          "type": "array"
+        },
         "interrupted": {
           "default": false,
           "title": "Interrupted",
@@ -395,6 +412,7 @@
       },
       "required": [
         "text",
+        "sources",
         "interrupted",
         "checkpoint",
         "error"
@@ -491,6 +509,16 @@
             }
           ],
           "default": null
+        },
+        "web_search_allowed": {
+          "default": false,
+          "title": "Web Search Allowed",
+          "type": "boolean"
+        },
+        "web_search": {
+          "default": false,
+          "title": "Web Search",
+          "type": "boolean"
         },
         "force_continue_as_new_after_turns": {
           "anyOf": [
@@ -774,6 +802,20 @@
       "title": "SetPosture",
       "type": "object"
     },
+    "SetWebSearch": {
+      "description": "Turn the model provider's built-in web search on or off for this session. Applies from\nthe next turn. Its searches run inside the provider and are not approved one by one.",
+      "properties": {
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "title": "SetWebSearch",
+      "type": "object"
+    },
     "SettingsAck": {
       "description": "Acknowledgement of ``set_model`` / ``set_posture`` with the value the agent now holds:\nthe new one when ``ok``, the unchanged one when it refused. The bridge copies it into the\nsession list, so the list never shows a setting the agent refused.",
       "properties": {
@@ -790,7 +832,8 @@
         "setting": {
           "enum": [
             "model",
-            "posture"
+            "posture",
+            "web_search"
           ],
           "title": "Setting",
           "type": "string"
@@ -823,6 +866,18 @@
           ],
           "default": null,
           "title": "Posture"
+        },
+        "web_search": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Web Search"
         }
       },
       "required": [
@@ -830,7 +885,8 @@
         "detail",
         "setting",
         "model",
-        "posture"
+        "posture",
+        "web_search"
       ],
       "title": "SettingsAck",
       "type": "object"
@@ -847,6 +903,26 @@
         "text"
       ],
       "title": "SteerMessage",
+      "type": "object"
+    },
+    "WebSource": {
+      "description": "One page the provider's web search used for a reply.",
+      "properties": {
+        "title": {
+          "default": "",
+          "title": "Title",
+          "type": "string"
+        },
+        "url": {
+          "title": "Url",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "url"
+      ],
+      "title": "WebSource",
       "type": "object"
     },
     "WorkflowStreamState": {

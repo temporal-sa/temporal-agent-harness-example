@@ -109,7 +109,7 @@ def build_registry() -> dict[str, Model]:
     return registry
 
 
-def settings_for(choice: ModelChoice, *, session_id: str) -> ModelSettings:
+def settings_for(choice: ModelChoice, *, session_id: str, web_search: bool = False) -> ModelSettings:
     """Per-provider settings: thinking where supported, and prompt caching.
 
     Anthropic caching is explicit (cache breakpoints on instructions, tools and the moving
@@ -141,5 +141,7 @@ def settings_for(choice: ModelChoice, *, session_id: str) -> ModelSettings:
             thinking=effort,
             openai_reasoning_summary="auto",
             openai_prompt_cache_key=session_id or "coding-agent",
+            # With web search on, ask for the pages it used (the reply's sources list).
+            **({"openai_include_web_search_sources": True} if web_search else {}),
         )
     return ModelSettings(max_tokens=16_000, thinking=effort)

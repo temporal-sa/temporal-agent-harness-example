@@ -96,7 +96,8 @@ function clean(node) {
   if (node === null || typeof node !== "object") return node;
   const out = {};
   for (const [key, value] of Object.entries(node)) {
-    if (key === "title") continue;
+    // The `title` keyword is a string; a property that happens to be named `title` is a schema.
+    if (key === "title" && typeof value === "string") continue;
     if (key === "$ref") {
       out.$ref = `#/definitions/${typeName(refName(value))}`;
       continue;

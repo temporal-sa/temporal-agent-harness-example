@@ -95,6 +95,7 @@ from simple_chat_agent.agent.contracts import (
     SetModel,
     SetPosture,
     SettingsAck,
+    SetWebSearch,
     SteerMessage,
 )
 # Key-free: the executor log reader is a plain HTTP helper (no tools runtime, no LLM keys).
@@ -165,6 +166,18 @@ def offered_research_tools() -> list[str]:
 def agent_environment() -> str:
     """``catalog`` (default, stricter approval rules) or ``local`` for development."""
     return "local" if os.environ.get("AGENT_ENVIRONMENT", "catalog").strip().lower() == "local" else "catalog"
+
+
+def web_search_allowed(environment: str) -> bool:
+    """Whether new sessions may turn on the provider's built-in web search (P4 4.5, PM
+    decision 2). Its queries run inside the provider, where our approval gate can't see them,
+    so: available locally, off in the catalog unless AGENT_WEB_SEARCH_CATALOG=1, and off
+    everywhere with AGENT_WEB_SEARCH=off. Per session it still starts off."""
+    if os.environ.get("AGENT_WEB_SEARCH", "").strip().lower() in ("0", "off", "false", "no"):
+        return False
+    if environment == "local":
+        return True
+    return os.environ.get("AGENT_WEB_SEARCH_CATALOG", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def agent_task_queue() -> str:
@@ -509,6 +522,8 @@ class CreateSession(BaseModel):
     demo: Literal["refund_service"] | None = None
     # Local only: adds the agent's gated test tools (live stacked-approval checks).
     test_tools: bool = False
+    # Start with the provider's web search on (refused where it isn't available).
+    web_search: bool = False
 
 
 class HarnessCreateSession(BaseModel):
@@ -591,6 +606,14 @@ _CODING_AGENT_HANDLERS: tuple[tuple[str, type[BaseModel], type[BaseModel], str, 
         SetPosture,
         SettingsAck,
         "Change how tool calls are approved. Applies to new calls; pending ones stay with you.",
+        MidTurn.ACCEPT,
+        False,
+    ),
+    (
+        "set_web_search",
+        SetWebSearch,
+        SettingsAck,
+        "Turn the model provider's built-in web search on or off. Applies from the next turn.",
         MidTurn.ACCEPT,
         False,
     ),
@@ -1179,6 +1202,8 @@ def create_agent_router(
         # menu, with the reason an option is greyed out.
         body["posture_options"] = posture_options(environment, auto_mode)
         body["auto_mode"] = auto_mode
+        # Provider web search: whether the composer offers the toggle. Sessions start with it off.
+        body["web_search"] = {"available": web_search_allowed(environment), "default": False}
         body["links"] = view_links()
         body.update(tool_risk_info(environment))
         # MCP servers (PRD A8): local development only (D7); the settings dialog reads this.
@@ -1246,6 +1271,8 @@ def create_agent_router(
             raise HarnessError(422, "posture_not_allowed", refusal)
         if body.test_tools and environment != "local":
             raise HarnessError(422, "test_tools_not_allowed", "Test tools are local development only.")
+        if body.web_search and not web_search_allowed(environment):
+            raise HarnessError(422, "web_search_not_allowed", "Web search isn't available here.")
 
         if requested_id is not None:
             # Caller-chosen ids are idempotent per user and can't collide across users: the
@@ -1280,6 +1307,8 @@ def create_agent_router(
             research_tools=offered_research_tools(),
             test_tools=body.test_tools,
             mcp=mcp_enabled(environment),
+            web_search_allowed=web_search_allowed(environment),
+            web_search=body.web_search,
         )
         title = (body.title or "").strip() or (
             agent_models.DEMOS[body.demo] if body.demo else "New session"
@@ -1583,6 +1612,9 @@ def create_agent_router(
             refusal = posture_refusal(payload["posture"], agent_environment(), auto_mode_status(configured_judge_backend()))
             if refusal is not None:
                 raise HarnessError(422, "posture_not_allowed", refusal)
+        elif kind == "set_web_search" and isinstance(payload, dict) and payload.get("enabled") is True:
+            if not web_search_allowed(agent_environment()):
+                raise HarnessError(422, "web_search_not_allowed", "Web search isn't available here.")
         elif kind == "set_model" and isinstance(payload, dict):
             try:
                 new_model = ModelChoice.model_validate(payload.get("model"))
