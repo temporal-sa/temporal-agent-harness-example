@@ -133,7 +133,11 @@ class CallbackRouteTests(AgentRoutesTestBase):
     def setUp(self) -> None:
         self.written: dict[tuple[str, str], bytes] = {}
 
+        self.fail_writes = False
+
         async def write(workspace_id: str, path: str, content: bytes) -> None:
+            if self.fail_writes:
+                raise RuntimeError("executor down")
             if (workspace_id, path) in self.written:
                 raise FileExistsError(path)
             self.written[(workspace_id, path)] = content
@@ -187,6 +191,23 @@ class CallbackRouteTests(AgentRoutesTestBase):
             self.assertEqual(self.upload(sid, "a.csv").status_code, 200)
             self.assertEqual(self.upload(sid, "b.csv").status_code, 200)
             self.assertEqual(self.upload(sid, "c.csv").status_code, 409)
+
+    def test_upload_session_caps_span_tool_ids(self) -> None:
+        # P4 review: a fresh tool id must not lift the cap; a failed write releases its slot.
+        sid = self.create()["session_id"]
+        with mock.patch.object(agent_routes, "PICK_SESSION_MAX_FILES", 2):
+            self.assertEqual(self.upload(sid, "a.csv", tool_id="t1").status_code, 200)
+            self.assertEqual(self.upload(sid, "b.csv", tool_id="t2").status_code, 200)
+            r = self.upload(sid, "c.csv", tool_id="t3")
+            self.assertEqual((r.status_code, r.json()["error"]), (409, "session_upload_limit"))
+        with mock.patch.object(agent_routes, "PICK_SESSION_MAX_BYTES", 10):
+            self.assertEqual(self.upload(sid, "d.csv", b"x" * 20, tool_id="t4").status_code, 409)
+
+        self.fail_writes = True
+        self.assertEqual(self.upload(sid, "e.csv", tool_id="t5").status_code, 502)
+        self.fail_writes = False
+        with mock.patch.object(agent_routes, "PICK_SESSION_MAX_FILES", 3):
+            self.assertEqual(self.upload(sid, "f.csv", tool_id="t6").status_code, 200)
 
     def test_ask_user_answer_and_decline_go_through_the_front_door(self) -> None:
         sid = self.create()["session_id"]

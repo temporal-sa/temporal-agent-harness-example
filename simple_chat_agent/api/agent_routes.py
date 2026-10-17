@@ -137,6 +137,10 @@ TITLE_MAX = 200
 # Browser callbacks (PRD A12): tool ids we accept, the answer's size, and an error note's length.
 _TOOL_ID = re.compile(r"^[A-Za-z0-9_.:/-]{1,200}$")
 CALLBACK_RESULT_MAX_BYTES = 16 * 1024
+# Per-session caps on pick_files uploads, across all tool ids (P4 review: the route can't
+# prove a pick is waiting without a Query, so these bound what one session can write).
+PICK_SESSION_MAX_FILES = 50
+PICK_SESSION_MAX_BYTES = 50 * 1024 * 1024
 CALLBACK_ERROR_MAX = 500
 # How long a subagent tool approval waits for a worker to take the harness Update.
 CHILD_APPROVAL_TIMEOUT = timedelta(seconds=10)
@@ -1737,9 +1741,33 @@ def create_agent_router(
         content = await file.read(PICK_MAX_FILE_BYTES + 1)
         if len(content) > PICK_MAX_FILE_BYTES:
             raise HarnessError(413, "too_large", f"Each file is limited to {PICK_MAX_FILE_BYTES} bytes.")
+        if (await store.meta(root)).closed:
+            raise HarnessError(409, "session_closed", "This session is closed. Start a new one.")
         key = upload_key(root, tool_id)
-        if await store.r.scard(key) >= PICK_MAX_FILES:
-            raise HarnessError(409, "too_many_files", f"At most {PICK_MAX_FILES} files can be picked at once.")
+        # Reserve before writing, atomically (INCR), so parallel uploads can't pass the caps
+        # together. The browser can't prove a pick_files call is waiting (that would take a
+        # Query), so the per-session caps bound what any number of tool ids can write.
+        ttl = session_ttl_seconds()
+        counters = (
+            (f"{key}:n", 1, PICK_MAX_FILES, "too_many_files", f"At most {PICK_MAX_FILES} files can be picked at once."),
+            (f"{prefix()}:cb-uploads-n:{root}", 1, PICK_SESSION_MAX_FILES, "session_upload_limit",
+             f"This session has reached its limit of {PICK_SESSION_MAX_FILES} picked files."),
+            (f"{prefix()}:cb-uploads-bytes:{root}", len(content), PICK_SESSION_MAX_BYTES, "session_upload_limit",
+             "This session has reached its limit for picked files."),
+        )
+        taken: list[tuple[str, int]] = []
+
+        async def release() -> None:
+            for counter, amount in taken:
+                await store.r.decrby(counter, amount)
+
+        for counter, amount, cap, code, message in counters:
+            total = await store.r.incrby(counter, amount)
+            await store.r.expire(counter, ttl)
+            taken.append((counter, amount))
+            if total > cap:
+                await release()
+                raise HarnessError(409, code, message)
         name = upload_file_name(file.filename)
         for attempt in range(10):
             path = f"{PICK_UPLOAD_DIR}/{name if attempt == 0 else _numbered(name, attempt)}"
@@ -1749,12 +1777,14 @@ def create_agent_router(
             except FileExistsError:
                 continue
             except Exception:  # noqa: BLE001 - executor refused or unreachable
+                await release()
                 log.exception("pick_files upload to %s failed", root)
                 raise HarnessError(502, "upload_failed", "Couldn't put the file in the workspace. Try again.") from None
         else:
+            await release()
             raise HarnessError(409, "name_taken", "Too many files with that name; rename it and try again.")
         await store.r.sadd(key, path)
-        await store.r.expire(key, session_ttl_seconds())
+        await store.r.expire(key, ttl)
         return JSONResponse(
             {"path": path, "name": (file.filename or "")[:PICK_MAX_NAME_CHARS * 2], "size": len(content)},
             headers=NO_STORE,
